@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { StringDecoder } from 'string_decoder';
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { AppConfig, GoogleCloudCodePayload, GoogleContent } from '../types.js';
 import { AccountPool } from '../pool/account-pool.js';
@@ -457,6 +458,7 @@ export function registerAnthropicRoutes(
         reply.raw.write(`event: message_start\ndata: ${JSON.stringify(startMsg)}\n\n`);
 
         let buffer = '';
+        const decoder = new StringDecoder('utf-8');
         let totalOutputTokens = 0;
         let currentBlockIndex = 0;
         let isTextBlockOpen = false;
@@ -465,7 +467,7 @@ export function registerAnthropicRoutes(
         const seenToolCalls = new Set<string>();
 
         for await (const chunk of bodyStream) {
-          buffer += chunk.toString('utf-8');
+          buffer += decoder.write(chunk);
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
 
@@ -598,10 +600,11 @@ export function registerAnthropicRoutes(
       const seenToolCalls = new Set<string>();
       let hasToolUse = false;
       let buffer = '';
+      const decoder = new StringDecoder('utf-8');
 
       try {
         for await (const chunk of bodyStream) {
-          buffer += chunk.toString('utf-8');
+          buffer += decoder.write(chunk);
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
 

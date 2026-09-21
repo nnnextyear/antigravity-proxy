@@ -10,9 +10,10 @@ export function extractFromWindowsCredential(): {
   const psPath = path.resolve(process.cwd(), 'scripts', 'read-cred.ps1');
 
   try {
-    const output = execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${psPath}"`, {
+    const output = execSync(`powershell -NoProfile -ExecutionPolicy Bypass -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; & '${psPath}'"`, {
       encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'ignore']
+      stdio: ['pipe', 'pipe', 'ignore'],
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
     }).trim();
 
     if (!output) return null;

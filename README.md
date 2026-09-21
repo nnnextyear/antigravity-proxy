@@ -181,7 +181,7 @@ flowchart TD
 
 ---
 
-## 🚀 快速开���与部署
+## 🚀 快速开始与部署
 
 ### 1. 运行环境要求
 - **Node.js**: `v20.0.0` 或更高版本（推荐 Node 22+）
@@ -228,7 +228,7 @@ cp .env.example .env
 }
 ```
 
-#### 步骤三：启动��务
+#### 步骤三：启动服务
 ```bash
 # 启动生产代理服务
 npm start
@@ -289,7 +289,7 @@ docker run -d \
 ### 4. 服务入口与默认凭证
 
 服务启动成功后：
-- 🌐 **Web 管理���制台**：`http://localhost:3000/admin` （默认密码：`admin123`）
+- 🌐 **Web 管理控制台**：`http://localhost:3000/admin` （默认密码：`admin123`）
 - 🔌 **OpenAI 兼容端点**：`http://localhost:3000/v1/chat/completions`
 - 📨 **Anthropic 兼容端点**：`http://localhost:3000/v1/messages`
 - 📋 **模型列表端点**：`http://localhost:3000/v1/models`

@@ -3,6 +3,7 @@ import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
 import path from 'path';
 import crypto from 'crypto';
+import { StringDecoder } from 'string_decoder';
 import { AppConfig, OpenAIChatCompletionRequest } from '../types.js';
 import { AccountPool } from '../pool/account-pool.js';
 import { TokenRefresher } from '../pool/refresher.js';
@@ -63,10 +64,17 @@ export async function createServer(
   await app.register(fastifyStatic, {
     root: publicDir,
     prefix: '/admin/',
-    setHeaders: (res) => {
+    setHeaders: (res, pathName) => {
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('Expires', '0');
+      if (pathName.endsWith('.html')) {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      } else if (pathName.endsWith('.js')) {
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+      } else if (pathName.endsWith('.css')) {
+        res.setHeader('Content-Type', 'text/css; charset=utf-8');
+      }
     }
   });
 
@@ -267,6 +275,7 @@ export async function createServer(
       reply.raw.setHeader('X-Accel-Buffering', 'no');
 
       let buffer = '';
+      const decoder = new StringDecoder('utf-8');
 
       const cleanup = () => {
         pool.releaseAccount(accountUsed.id);
@@ -276,7 +285,7 @@ export async function createServer(
 
       try {
         for await (const chunk of bodyStream) {
-          buffer += chunk.toString('utf-8');
+          buffer += decoder.write(chunk);
           const lines = buffer.split('\n');
           // 保留最后一行（可能不完整）
           buffer = lines.pop() || '';
@@ -299,6 +308,7 @@ export async function createServer(
             }
           }
         }
+        buffer += decoder.end();
 
         // 发送终止标志
         reply.raw.write('data: [DONE]\n\n');
@@ -312,10 +322,11 @@ export async function createServer(
       // 非流式，聚合文本一次性返回
       let fullText = '';
       let buffer = '';
+      const decoder = new StringDecoder('utf-8');
 
       try {
         for await (const chunk of bodyStream) {
-          buffer += chunk.toString('utf-8');
+          buffer += decoder.write(chunk);
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
 
@@ -331,6 +342,7 @@ export async function createServer(
             }
           }
         }
+        buffer += decoder.end();
 
         pool.releaseAccount(accountUsed.id);
 
