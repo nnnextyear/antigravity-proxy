@@ -1,0 +1,16 @@
+services:
+  antigravity-proxy:
+    build: .
+    image: antigravity-proxy:latest
+    container_name: antigravity-proxy
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - HOST=0.0.0.0
+      - API_MASTER_KEY=sk-antigravity
+      - ADMIN_PASSWORD=admin123
+    volumes:
+      - ./data:/app/data
+      - ./config.json:/app/config.json

@@ -1,0 +1,18 @@
+[
+  {
+    "id": "acc_example123",
+    "email": "user@example.com",
+    "refreshToken": "1//your_refresh_token_here",
+    "accessToken": "",
+    "accessTokenExpiresAt": 0,
+    "status": "active",
+    "cooldownUntil": 0,
+    "activeConcurrency": 0,
+    "maxConcurrency": 5,
+    "totalRequests": 0,
+    "failedRequests": 0,
+    "lastUsedAt": 0,
+    "createdAt": 1700000000000,
+    "proxyUrl": ""
+  }
+]

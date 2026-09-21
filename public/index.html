@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Antigravity Proxy 管理控制台</title>
+  <link rel="stylesheet" href="/admin/style.css?v=2.1">
+</head>
+<body>
+  <div id="login-overlay" class="overlay">
+    <div class="modal login-box">
+      <h2>Antigravity 控制台登录</h2>
+      <p class="subtitle">请输入管理员管理密码访问系统</p>
+      <div class="form-group">
+        <label>Admin Password</label>
+        <input type="password" id="admin-pass-input" placeholder="输入管理密码（默认 admin123）" />
+      </div>
+      <button id="btn-login" class="btn btn-primary btn-block">登录进入控制台</button>
+      <p id="login-error" class="error-msg"></p>
+    </div>
+  </div>
+
+  <div class="app-container">
+    <header class="navbar">
+      <div class="brand">
+        <span class="logo-icon">⚡</span>
+        <span class="brand-text">Antigravity Proxy <span>Console</span></span>
+      </div>
+      <div class="nav-actions">
+        <div class="badge-chip" id="api-endpoint-badge" title="复制 API 端点">
+          <span>API: </span><code id="api-endpoint-text">/v1/chat/completions</code>
+        </div>
+        <div class="strategy-selector-box" title="账号调度策略：智能零浪费（防 Cache 穿透 + 临期抢救 + 流水线永动机）">
+          <span style="font-size: 11px; color: var(--text-muted);">调度:</span>
+          <select id="select-strategy" class="strategy-select">
+            <option value="zero-waste">🚀 智能零浪费 (推荐)</option>
+            <option value="sequential-drain">🔄 流水线顺序耗尽</option>
+            <option value="round-robin">⚖️ 传统均衡轮询</option>
+          </select>
+        </div>
+        <button id="btn-sync-local" class="btn btn-outline" style="border-color: #059669; color: #34d399;" title="自动读取当前系统已登录的 Antigravity 账号">⚡ 一键同步本机账号</button>
+        <button id="btn-sync-all-quota" class="btn btn-outline" style="border-color: #3b82f6; color: #60a5fa;" title="立即调用 Google 官方接口拉取所有账号的 Claude 与 Gemini 真实额度">📊 刷新全部额度</button>
+        <button id="btn-refresh-data" class="btn btn-outline">🔄 刷新</button>
+        <button id="btn-add-account-modal" class="btn btn-primary">+ 手动添加</button>
+        <button id="btn-logout" class="btn btn-danger-outline">退出</button>
+      </div>
+    </header>
+
+    <main class="content">
+      <!-- 统计指标卡片 -->
+      <section class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">总账号池</div>
+          <div class="stat-value" id="stat-total">0</div>
+          <div class="stat-sub">当前纳入轮询的所有凭据</div>
+        </div>
+        <div class="stat-card success">
+          <div class="stat-label">正常可用 (Active)</div>
+          <div class="stat-value text-success" id="stat-active">0</div>
+          <div class="stat-sub">正在承接请求并待命</div>
+        </div>
+        <div class="stat-card" style="border-left: 4px solid #8b5cf6;">
+          <div class="stat-label">Claude / GPT 周额度</div>
+          <div class="stat-value" id="stat-claude-weekly" style="color: #a78bfa;">--%</div>
+          <div class="stat-sub" id="stat-claude-weekly-sub">账号每周可用额度</div>
+        </div>
+        <div class="stat-card" style="border-left: 4px solid #3b82f6;">
+          <div class="stat-label">Gemini 5小时额度</div>
+          <div class="stat-value" id="stat-gemini-5h" style="color: #60a5fa;">--%</div>
+          <div class="stat-sub" id="stat-gemini-5h-sub">5小时滚动平滑限额</div>
+        </div>
+        <div class="stat-card" style="border-left: 4px solid #93c5fd;">
+          <div class="stat-label">Gemini 周期总额度</div>
+          <div class="stat-value" id="stat-gemini-weekly" style="color: #93c5fd;">--%</div>
+          <div class="stat-sub" id="stat-gemini-weekly-sub">账号每周可用额度</div>
+        </div>
+        <div class="stat-card warning">
+          <div class="stat-label">冷却中 (Cooldown)</div>
+          <div class="stat-value text-warning" id="stat-cooldown">0</div>
+          <div class="stat-sub">触发 429 自动进入隔离</div>
+        </div>
+        <div class="stat-card danger">
+          <div class="stat-label">失效账号 (Dead)</div>
+          <div class="stat-value text-danger" id="stat-dead">0</div>
+          <div class="stat-sub">401/403 认证或权限失效</div>
+        </div>
+        <div class="stat-card info">
+          <div class="stat-label">当前活跃并发</div>
+          <div class="stat-value text-info" id="stat-concurrency">0</div>
+          <div class="stat-sub">进行中的实时 HTTP 请求</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">累计服务请求</div>
+          <div class="stat-value" id="stat-requests">0</div>
+          <div class="stat-sub">启动至今已处理调用量</div>
+        </div>
+      </section>
+
+      <!-- 账号管理列表 -->
+      <section class="table-container">
+        <div class="table-header">
+          <h3>账号列表与额度监控</h3>
+          <span class="table-tip">实时监控 Google 官方 Claude & Gemini 额度，额度用尽或 429 自动无感换号</span>
+        </div>
+        <div class="table-responsive">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>账号信息</th>
+                <th>运行状态</th>
+                <th>实时剩余额度 (Google 上游)</th>
+                <th>并发限制</th>
+                <th>出口代理 (Proxy)</th>
+                <th>调用计数</th>
+                <th>Token 状态</th>
+                <th>管理操作</th>
+              </tr>
+            </thead>
+            <tbody id="accounts-tbody">
+              <tr><td colspan="8" class="text-center loading">加载中...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <!-- 添加账号 Modal -->
+    <div id="add-modal" class="overlay modal-overlay" style="display: none;">
+      <div class="modal">
+        <div class="modal-header">
+          <h3>添加 Google 账号凭据</h3>
+          <button class="close-modal" id="btn-close-modal">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label>Google 账号邮箱 <span class="req">*</span></label>
+            <input type="email" id="input-acc-email" placeholder="例如: developer@gmail.com" required />
+          </div>
+          <div class="form-group">
+            <label>Google OAuth Refresh Token <span class="req">*</span></label>
+            <textarea id="input-acc-token" rows="3" placeholder="以 1// 开头的 Refresh Token" required></textarea>
+            <small class="hint">可从 Antigravity 登录缓存或 OAuth 抓包中获得</small>
+          </div>
+          <div class="form-group">
+            <label>独立出口代理 Proxy URL (可选，防关联)</label>
+            <input type="text" id="input-acc-proxy" placeholder="如 http://user:pass@127.0.0.1:7890 或 socks5://..." />
+            <small class="hint">每个账号绑定独立 IP，避免多账号同 IP 并发被批量风控</small>
+          </div>
+          <div class="form-group">
+            <label>最大允许并发 (Max Concurrency)</label>
+            <input type="number" id="input-acc-concurrency" value="5" min="1" max="50" />
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-outline" id="btn-cancel-add">取消</button>
+          <button class="btn btn-primary" id="btn-submit-add">保存并加入账号池</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/admin/app.js?v=2.1"></script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "port": 3000,
+  "host": "0.0.0.0",
+  "apiMasterKey": "sk-antigravity",
+  "adminPassword": "admin123",
+  "upstreamUrl": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse",
+  "defaultMaxConcurrency": 5,
+  "cooldownSeconds": 60,
+  "tokenRefreshIntervalMs": 180000,
+  "routingStrategy": "zero-waste",
+  "oauthClientId": "",
+  "oauthClientSecret": ""
+}
