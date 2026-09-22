@@ -82,7 +82,8 @@ export class RequestExecutor {
       }
 
       try {
-        const dispatcher = account.proxyUrl ? new ProxyAgent(account.proxyUrl) : undefined;
+        const effectiveProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+        const dispatcher = effectiveProxy ? new ProxyAgent(effectiveProxy) : undefined;
         const upstreamHeaders: Record<string, string> = {
           'Authorization': `Bearer ${account.accessToken}`,
           'Content-Type': 'application/json',

@@ -1,4 +1,4 @@
-export type AccountStatus = 'active' | 'cooldown' | 'dead';
+export type AccountStatus = 'active' | 'cooldown' | 'dead' | 'disabled';
 export type RoutingStrategy = 'zero-waste' | 'sequential-drain' | 'round-robin';
 
 export interface AccountQuota {
@@ -49,6 +49,7 @@ export interface AppConfig {
   routingStrategy?: RoutingStrategy;
   oauthClientId?: string;
   oauthClientSecret?: string;
+  defaultProxyUrl?: string;       // 全局默认出口代理，如 http://127.0.0.1:7897
 }
 
 export interface OpenAIMessage {

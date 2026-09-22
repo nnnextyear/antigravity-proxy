@@ -82,6 +82,9 @@ export async function createServer(
   app.get('/', async (req, reply) => {
     return reply.redirect('/admin/');
   });
+  app.get('/admin', async (req, reply) => {
+    return reply.redirect('/admin/');
+  });
 
   // 健康探针
   app.get('/health', async () => {

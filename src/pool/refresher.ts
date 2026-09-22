@@ -44,7 +44,7 @@ export class TokenRefresher {
     const tenMinutes = 10 * 60 * 1000;
 
     for (const acc of this.pool.getAllAccounts()) {
-      if (acc.status === 'dead') continue;
+      if (acc.status === 'dead' || acc.status === 'disabled') continue;
       if (!acc.refreshToken) continue;
 
       const needsRefresh = !acc.accessToken || acc.accessTokenExpiresAt - now < tenMinutes;
@@ -73,7 +73,8 @@ export class TokenRefresher {
         if (attempt === 1) {
           console.log(`[TokenRefresher] Refreshing token for account: ${acc.email} (${acc.id})...`);
         }
-        const dispatcher = acc.proxyUrl ? new ProxyAgent(acc.proxyUrl) : undefined;
+        const effectiveProxy = acc.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+        const dispatcher = effectiveProxy ? new ProxyAgent(effectiveProxy) : undefined;
 
         const res = await request(GOOGLE_TOKEN_ENDPOINT, {
           method: 'POST',

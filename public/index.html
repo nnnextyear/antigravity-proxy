@@ -3,167 +3,488 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Antigravity Proxy 管理控制台</title>
-  <link rel="stylesheet" href="/admin/style.css?v=2.3">
+  <title>Antigravity Gateway 控制台</title>
+  <link rel="stylesheet" href="/admin/style.css?v=4.5">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
 <body>
+  <!-- 登录遮罩 -->
   <div id="login-overlay" class="overlay">
     <div class="modal login-box">
-      <h2>Antigravity 控制台登录</h2>
-      <p class="subtitle">请输入管理员管理密码访问系统</p>
+      <div class="login-brand-icon">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+      </div>
+      <h2>Antigravity 控制台</h2>
+      <p class="subtitle">请输入管理密码访问多账号调度集群</p>
       <div class="form-group">
         <label>Admin Password</label>
-        <input type="password" id="admin-pass-input" placeholder="输入管理密码（默认 admin123）" />
+        <input type="password" id="admin-pass-input" placeholder="输入管理密码（默认 admin123）" autofocus />
       </div>
-      <button id="btn-login" class="btn btn-primary btn-block">登录进入控制台</button>
+      <button id="btn-login" class="btn btn-primary btn-block">登 录 进 入</button>
       <p id="login-error" class="error-msg"></p>
     </div>
   </div>
 
-  <div class="app-container">
+  <div class="app-layout">
+    <!-- 顶部导航栏 -->
     <header class="navbar">
-      <div class="brand">
-        <span class="logo-icon">⚡</span>
-        <span class="brand-text">Antigravity Proxy <span>Console</span></span>
+      <div class="nav-left">
+        <div class="brand">
+          <div class="brand-logo">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          </div>
+          <div class="brand-meta">
+            <span class="brand-title">Antigravity <span>Gateway</span></span>
+            <span class="brand-tag">v3.5 Multi-Account</span>
+          </div>
+        </div>
+
+        <div class="quick-connect-group">
+          <!-- API 地址 -->
+          <div class="connect-capsule" id="api-endpoint-badge" title="点击复制 API 端点地址">
+            <span class="capsule-label">BASE URL</span>
+            <code id="api-endpoint-text">/v1</code>
+            <span class="copy-icon">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            </span>
+          </div>
+          <!-- API Key -->
+          <div class="connect-capsule" id="api-key-badge" title="点击复制 API 密钥 (Master Key)">
+            <span class="capsule-label">API KEY</span>
+            <code id="api-key-text">sk-antigravity</code>
+            <span class="copy-icon">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            </span>
+          </div>
+        </div>
       </div>
-      <div class="nav-actions">
-        <div class="badge-chip" id="api-endpoint-badge" title="复制 API 端点">
-          <span>API: </span><code id="api-endpoint-text">/v1/chat/completions</code>
+
+      <div class="nav-right">
+        <!-- 自定义精美调度策略下拉菜单 -->
+        <div class="custom-strategy-dropdown" id="strategy-dropdown">
+          <button type="button" class="strategy-trigger-btn" id="strategy-trigger" aria-haspopup="true" aria-expanded="false" title="切换账号调度算法">
+            <span class="strategy-badge-glow">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            </span>
+            <span class="strategy-active-name" id="strategy-active-name">智能零浪费调度</span>
+            <svg class="strategy-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+          </button>
+
+          <div class="strategy-popover-menu" id="strategy-popover">
+            <div class="popover-header">
+              <span>账号调度算法 (Routing Strategy)</span>
+            </div>
+            
+            <div class="popover-option active" data-strategy="zero-waste">
+              <div class="opt-icon-box opt-icon-violet">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+              </div>
+              <div class="opt-text-group">
+                <div class="opt-title-line">
+                  <span class="opt-name">智能零浪费调度</span>
+                  <span class="opt-tag-recommend">推荐</span>
+                </div>
+                <div class="opt-desc">优先消耗即将刷新的账号，防止额度过期浪费</div>
+              </div>
+              <div class="opt-check-mark">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+              </div>
+            </div>
+
+            <div class="popover-option" data-strategy="sequential-drain">
+              <div class="opt-icon-box opt-icon-amber">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+              </div>
+              <div class="opt-text-group">
+                <div class="opt-title-line">
+                  <span class="opt-name">顺序耗尽模式</span>
+                </div>
+                <div class="opt-desc">集中打满单号 5h 额度后再平滑切换下一可用账号</div>
+              </div>
+              <div class="opt-check-mark">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+              </div>
+            </div>
+
+            <div class="popover-option" data-strategy="round-robin">
+              <div class="opt-icon-box opt-icon-cyan">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+              </div>
+              <div class="opt-text-group">
+                <div class="opt-title-line">
+                  <span class="opt-name">经典负载轮询</span>
+                </div>
+                <div class="opt-desc">请求在所有就绪账号之间均匀分摊调用压力</div>
+              </div>
+              <div class="opt-check-mark">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+              </div>
+            </div>
+          </div>
         </div>
-        <div class="strategy-selector-box" title="账号调度策略：智能零浪费（防 Cache 穿透 + 临期抢救 + 流水线永动机）">
-          <span style="font-size: 11px; color: var(--text-muted);">调度:</span>
-          <select id="select-strategy" class="strategy-select">
-            <option value="zero-waste">🚀 智能零浪费 (推荐)</option>
-            <option value="sequential-drain">🔄 流水线顺序耗尽</option>
-            <option value="round-robin">⚖️ 传统均衡轮询</option>
-          </select>
-        </div>
-        <button id="btn-sync-local" class="btn btn-outline" style="border-color: #059669; color: #34d399;" title="自动读取当前系统已登录的 Antigravity 账号">⚡ 一键同步本机账号</button>
-        <button id="btn-sync-all-quota" class="btn btn-outline" style="border-color: #3b82f6; color: #60a5fa;" title="立即调用 Google 官方接口拉取所有账号的 Claude 与 Gemini 真实额度">📊 刷新全部额度</button>
-        <button id="btn-refresh-data" class="btn btn-outline">🔄 刷新</button>
-        <button id="btn-add-account-modal" class="btn btn-primary">+ 手动添加</button>
-        <button id="btn-logout" class="btn btn-danger-outline">退出</button>
+
+        <button id="btn-sync-local" class="btn btn-secondary btn-sync" title="自动读取当前系统已登录的 Antigravity 凭据">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+          <span>同步本机</span>
+        </button>
+
+        <button id="btn-sync-all-quota" class="btn btn-secondary btn-quota" title="实时向 Google 上游拉取全部真实配额">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>
+          <span>拉取全池额度</span>
+        </button>
+
+        <button id="btn-add-account-modal" class="btn btn-primary btn-add" title="添加新的 Google 凭据">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          <span>添加账号</span>
+        </button>
+
+        <button id="btn-refresh-data" class="btn btn-icon" title="手动刷新当前页面">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        </button>
+
+        <button id="btn-logout" class="btn btn-icon btn-logout" title="退出登录">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        </button>
       </div>
     </header>
 
-    <main class="content">
-      <!-- 统计指标卡片 -->
-      <section class="stats-grid">
+    <main class="main-container">
+      <!-- 顶部仪表总览 (4张高精玻璃质感卡片) -->
+      <section class="stat-deck">
+        <!-- 卡片 1: 账号池状态 -->
         <div class="stat-card">
-          <div class="stat-label">总账号池</div>
-          <div class="stat-value" id="stat-total">0</div>
-          <div class="stat-sub">当前纳入轮询的所有凭据</div>
+          <div class="stat-card-head">
+            <span class="stat-card-title">账号池规模</span>
+            <span class="stat-status-badge badge-green" id="stat-active-badge">
+              <span class="pulse-dot green"></span>
+              <span id="stat-active-badge-text">2 正常</span>
+            </span>
+          </div>
+          <div class="stat-card-val-row">
+            <span class="stat-card-big" id="stat-total">0</span>
+            <span class="stat-card-sub">个账号</span>
+          </div>
+          <div class="stat-card-foot">
+            <span>活跃: <b id="stat-active" class="text-green">0</b></span>
+            <span class="foot-dot">•</span>
+            <span>冷却: <b id="stat-cooldown" class="text-amber">0</b></span>
+            <span class="foot-dot">•</span>
+            <span>失效: <b id="stat-dead" class="text-red">0</b></span>
+          </div>
         </div>
-        <div class="stat-card success">
-          <div class="stat-label">正常可用 (Active)</div>
-          <div class="stat-value text-success" id="stat-active">0</div>
-          <div class="stat-sub">正在承接请求并待命</div>
-        </div>
-        <div class="stat-card" style="border-left: 4px solid #c084fc;">
-          <div class="stat-label">Claude / GPT 5小时额度</div>
-          <div class="stat-value" id="stat-claude-5h" style="color: #c084fc;">--%</div>
-          <div class="stat-sub" id="stat-claude-5h-sub">5小时滚动平滑限额</div>
-        </div>
-        <div class="stat-card" style="border-left: 4px solid #8b5cf6;">
-          <div class="stat-label">Claude / GPT 周期总额度</div>
-          <div class="stat-value" id="stat-claude-weekly" style="color: #a78bfa;">--%</div>
-          <div class="stat-sub" id="stat-claude-weekly-sub">账号每周可用额度</div>
-        </div>
-        <div class="stat-card" style="border-left: 4px solid #3b82f6;">
-          <div class="stat-label">Gemini 5小时额度</div>
-          <div class="stat-value" id="stat-gemini-5h" style="color: #60a5fa;">--%</div>
-          <div class="stat-sub" id="stat-gemini-5h-sub">5小时滚动平滑限额</div>
-        </div>
-        <div class="stat-card" style="border-left: 4px solid #93c5fd;">
-          <div class="stat-label">Gemini 周期总额度</div>
-          <div class="stat-value" id="stat-gemini-weekly" style="color: #93c5fd;">--%</div>
-          <div class="stat-sub" id="stat-gemini-weekly-sub">账号每周可用额度</div>
-        </div>
-        <div class="stat-card warning">
-          <div class="stat-label">冷却中 (Cooldown)</div>
-          <div class="stat-value text-warning" id="stat-cooldown">0</div>
-          <div class="stat-sub">触发 429 自动进入隔离</div>
-        </div>
-        <div class="stat-card danger">
-          <div class="stat-label">失效账号 (Dead)</div>
-          <div class="stat-value text-danger" id="stat-dead">0</div>
-          <div class="stat-sub">401/403 认证或权限失效</div>
-        </div>
-        <div class="stat-card info">
-          <div class="stat-label">当前活跃并发</div>
-          <div class="stat-value text-info" id="stat-concurrency">0</div>
-          <div class="stat-sub">进行中的实时 HTTP 请求</div>
-        </div>
+
+        <!-- 卡片 2: 实时并发 -->
         <div class="stat-card">
-          <div class="stat-label">累计服务请求</div>
-          <div class="stat-value" id="stat-requests">0</div>
-          <div class="stat-sub">启动至今已处理调用量</div>
+          <div class="stat-card-head">
+            <span class="stat-card-title">实时并发吞吐</span>
+            <span class="stat-status-badge badge-blue">
+              <span class="pulse-dot blue"></span>
+              <span>Running</span>
+            </span>
+          </div>
+          <div class="stat-card-val-row">
+            <span class="stat-card-big text-blue" id="stat-concurrency">0</span>
+            <span class="stat-card-sub">路并发中</span>
+          </div>
+          <div class="stat-card-foot">
+            <span>启动至今请求: <b id="stat-requests" class="text-slate">0</b> 次</span>
+          </div>
+        </div>
+
+        <!-- 卡片 3: 全池 Claude / GPT 动态水位舱 -->
+        <div class="stat-card stat-card-liquid card-claude">
+          <div class="liquid-card-body">
+            <!-- 动态波浪流体水位舱 (代表 5h 滚动水位) -->
+            <div class="water-gauge-wrap" title="Claude / GPT 全池 5小时滚动水位">
+              <div class="water-tank" id="stat-claude-tank">
+                <div class="water-level-fill wave-claude" id="stat-claude-wave-fill" style="height: 0%;">
+                  <div class="wave wave-back"></div>
+                  <div class="wave wave-front"></div>
+                </div>
+                <div class="water-tank-glare"></div>
+                <div class="water-tank-meta">
+                  <span class="water-pct text-purple" id="stat-claude-5h">--%</span>
+                  <span class="water-lbl">5h 水位</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 右侧详情: 周度额度与健康状态 (无重复 5h 进度条) -->
+            <div class="liquid-detail-col">
+              <div class="stat-card-head">
+                <span class="model-badge badge-claude">Claude / GPT</span>
+                <span class="water-health-tag" id="stat-claude-health">水位正常</span>
+              </div>
+              <!-- 7d 周期总额度 (最快刷新天数) -->
+              <div class="stat-weekly-group">
+                <div class="stat-weekly-reading">
+                  <div class="stat-weekly-title-group">
+                    <span class="stat-weekly-kicker">7D</span>
+                    <span class="stat-weekly-title">周度额度</span>
+                  </div>
+                  <strong class="stat-weekly-val text-purple" id="stat-claude-weekly">--%</strong>
+                </div>
+                <div class="quota-bar-wrapper">
+                  <div class="quota-bar-fill fill-purple" id="stat-claude-weekly-bar" style="width: 0%;"></div>
+                </div>
+                <span class="stat-weekly-refresh-badge" id="stat-claude-weekly-refresh">--</span>
+              </div>
+              <!-- 底栏状态指标 (5h 最快回满小时数) -->
+              <div class="stat-pool-subrow">
+                <span class="pool-avail-text" id="stat-claude-avail">-- 就绪</span>
+                <span class="pool-reset-hint" id="stat-claude-reset">⏳ 周期中</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 卡片 4: 全池 Google Gemini 动态水位舱 -->
+        <div class="stat-card stat-card-liquid card-gemini">
+          <div class="liquid-card-body">
+            <!-- 动态波浪流体水位舱 (代表 5h 滚动水位) -->
+            <div class="water-gauge-wrap" title="Google Gemini 全池 5小时滚动水位">
+              <div class="water-tank" id="stat-gemini-tank">
+                <div class="water-level-fill wave-gemini" id="stat-gemini-wave-fill" style="height: 0%;">
+                  <div class="wave wave-back"></div>
+                  <div class="wave wave-front"></div>
+                </div>
+                <div class="water-tank-glare"></div>
+                <div class="water-tank-meta">
+                  <span class="water-pct text-cyan" id="stat-gemini-5h">--%</span>
+                  <span class="water-lbl">5h 水位</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 右侧详情: 周度额度与健康状态 (无重复 5h 进度条) -->
+            <div class="liquid-detail-col">
+              <div class="stat-card-head">
+                <span class="model-badge badge-gemini">Google Gemini</span>
+                <span class="water-health-tag" id="stat-gemini-health">水位正常</span>
+              </div>
+              <!-- 7d 周期总额度 (最快刷新天数) -->
+              <div class="stat-weekly-group">
+                <div class="stat-weekly-reading">
+                  <div class="stat-weekly-title-group">
+                    <span class="stat-weekly-kicker">7D</span>
+                    <span class="stat-weekly-title">周度额度</span>
+                  </div>
+                  <strong class="stat-weekly-val text-cyan" id="stat-gemini-weekly">--%</strong>
+                </div>
+                <div class="quota-bar-wrapper">
+                  <div class="quota-bar-fill fill-cyan" id="stat-gemini-weekly-bar" style="width: 0%;"></div>
+                </div>
+                <span class="stat-weekly-refresh-badge" id="stat-gemini-weekly-refresh">--</span>
+              </div>
+              <!-- 底栏状态指标 (5h 最快回满小时数) -->
+              <div class="stat-pool-subrow">
+                <span class="pool-avail-text" id="stat-gemini-avail">-- 就绪</span>
+                <span class="pool-reset-hint" id="stat-gemini-reset">⏳ 周期中</span>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
-      <!-- 账号管理列表 -->
-      <section class="table-container">
-        <div class="table-header">
-          <h3>账号列表与额度监控</h3>
-          <span class="table-tip">实时监控 Google 官方 Claude & Gemini 额度，额度用尽或 429 自动无感换号</span>
+      <!-- 账号矩阵工具条 (搜索、状态过滤与卡片/列表视图切换) -->
+      <section class="section-toolbar">
+        <div class="toolbar-left">
+          <div class="search-input-wrap">
+            <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <input type="text" id="account-search-input" placeholder="搜索账号邮箱或 ID..." />
+          </div>
+
+          <div class="filter-tabs">
+            <button class="filter-tab active" data-filter="all">全部 <span class="tab-count" id="count-all">0</span></button>
+            <button class="filter-tab" data-filter="active">正常 <span class="tab-count" id="count-active">0</span></button>
+            <button class="filter-tab" data-filter="cooldown">冷却 <span class="tab-count" id="count-cooldown">0</span></button>
+            <button class="filter-tab" data-filter="dead">异常 <span class="tab-count" id="count-dead">0</span></button>
+          </div>
         </div>
-        <div class="table-responsive">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>账号信息</th>
-                <th>运行状态</th>
-                <th>实时剩余额度 (Google 上游)</th>
-                <th>并发限制</th>
-                <th>出口代理 (Proxy)</th>
-                <th>调用计数</th>
-                <th>Token 状态</th>
-                <th>管理操作</th>
-              </tr>
-            </thead>
-            <tbody id="accounts-tbody">
-              <tr><td colspan="8" class="text-center loading">加载中...</td></tr>
-            </tbody>
-          </table>
+
+        <div class="toolbar-right">
+          <div class="heartbeat-badge" title="后台自动每 4 秒轮询上游状态">
+            <span class="live-dot"></span>
+            <span>实时同步</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 账号卡片网格容器 -->
+      <section id="accounts-cards-view" class="account-cards-grid">
+        <div class="empty-placeholder">
+          <div class="loading-spinner"></div>
+          <p>正在读取账号池状态...</p>
         </div>
       </section>
     </main>
 
     <!-- 添加账号 Modal -->
     <div id="add-modal" class="overlay modal-overlay" style="display: none;">
-      <div class="modal">
+      <div class="modal add-account-modal">
         <div class="modal-header">
-          <h3>添加 Google 账号凭据</h3>
-          <button class="close-modal" id="btn-close-modal">&times;</button>
+          <div class="modal-title-wrap">
+            <span class="modal-header-icon">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            </span>
+            <h3>添加 Google 凭据</h3>
+          </div>
+          <button type="button" class="close-modal" id="btn-close-modal" title="关闭弹窗" aria-label="关闭添加账号弹窗"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
         </div>
         <div class="modal-body">
+          <div class="oauth-login-panel">
+            <div class="oauth-login-copy">
+              <span class="oauth-login-title">使用 Google 登录</span>
+              <span class="oauth-login-desc">授权完成后，账号会自动加入网关</span>
+            </div>
+            <button type="button" class="btn btn-secondary btn-oauth-login" id="btn-oauth-login">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v6h-6"/></svg>
+              <span>一键授权</span>
+            </button>
+          </div>
+          <div class="form-divider"><span>或手动填写凭据</span></div>
           <div class="form-group">
             <label>Google 账号邮箱 <span class="req">*</span></label>
             <input type="email" id="input-acc-email" placeholder="例如: developer@gmail.com" required />
           </div>
           <div class="form-group">
-            <label>Google OAuth Refresh Token <span class="req">*</span></label>
-            <textarea id="input-acc-token" rows="3" placeholder="以 1// 开头的 Refresh Token" required></textarea>
-            <small class="hint">可从 Antigravity 登录缓存或 OAuth 抓包中获得</small>
+            <label>OAuth 2.0 Refresh Token <span class="req">*</span></label>
+            <textarea id="input-acc-token" rows="3" placeholder="以 1// 开头的 Google Refresh Token" required></textarea>
+            <small class="hint">可使用 Antigravity 登录凭据，或通过 Google OAuth Playground 获得</small>
           </div>
           <div class="form-group">
-            <label>独立出口代理 Proxy URL (可选，防关联)</label>
-            <input type="text" id="input-acc-proxy" placeholder="如 http://user:pass@127.0.0.1:7890 或 socks5://..." />
-            <small class="hint">每个账号绑定独立 IP，避免多账号同 IP 并发被批量风控</small>
+            <label>独立出口代理 Proxy URL (可选)</label>
+            <input type="text" id="input-acc-proxy" placeholder="如 http://user:pass@127.0.0.1:7890 或留空走系统默认" />
+            <small class="hint">留空自动走系统默认代理 (127.0.0.1:7897)，若配置专号专代可物理隔离 IP 防风控</small>
           </div>
           <div class="form-group">
-            <label>最大允许并发 (Max Concurrency)</label>
-            <input type="number" id="input-acc-concurrency" value="5" min="1" max="50" />
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <label style="margin-bottom: 0;">最大允许并发 (Max Concurrency)</label>
+              <span style="font-size: 10px; color: var(--text-muted);">建议 1~10 路</span>
+            </div>
+            <div class="concurrency-stepper-wrap">
+              <div class="stepper-box">
+                <button type="button" class="stepper-step-btn" onclick="stepConcurrency('input-acc-concurrency', -1)" title="减少 1 路并发">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                </button>
+                <div class="stepper-input-container">
+                  <input type="number" id="input-acc-concurrency" class="stepper-number-input" value="5" min="1" max="50" oninput="onConcurrencyInput(this)" />
+                  <span class="stepper-suffix">路并发</span>
+                </div>
+                <button type="button" class="stepper-step-btn" onclick="stepConcurrency('input-acc-concurrency', 1)" title="增加 1 路并发">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                </button>
+              </div>
+              <div class="stepper-presets">
+                <button type="button" class="step-chip" data-target="input-acc-concurrency" data-val="1" onclick="setConcurrency('input-acc-concurrency', 1)">1 (单路)</button>
+                <button type="button" class="step-chip" data-target="input-acc-concurrency" data-val="3" onclick="setConcurrency('input-acc-concurrency', 3)">3</button>
+                <button type="button" class="step-chip active" data-target="input-acc-concurrency" data-val="5" onclick="setConcurrency('input-acc-concurrency', 5)">5 (标准)</button>
+                <button type="button" class="step-chip" data-target="input-acc-concurrency" data-val="10" onclick="setConcurrency('input-acc-concurrency', 10)">10 (高并发)</button>
+                <button type="button" class="step-chip" data-target="input-acc-concurrency" data-val="20" onclick="setConcurrency('input-acc-concurrency', 20)">20 (极速)</button>
+              </div>
+            </div>
           </div>
         </div>
         <div class="modal-footer">
-          <button class="btn btn-outline" id="btn-cancel-add">取消</button>
-          <button class="btn btn-primary" id="btn-submit-add">保存并加入账号池</button>
+          <button type="button" class="btn btn-secondary" id="btn-cancel-add">取消</button>
+          <button type="button" class="btn btn-primary" id="btn-submit-add">保存并接入网关</button>
         </div>
       </div>
     </div>
   </div>
 
-  <script src="/admin/app.js?v=2.3"></script>
+  <!-- 模态弹窗: 配置账号专属出口代理 -->
+  <div id="proxy-modal" class="overlay" style="display: none;">
+    <div class="modal proxy-modal-box">
+      <div class="modal-header">
+        <div class="modal-title-wrap">
+          <span class="modal-header-icon icon-cyan">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+          </span>
+          <div>
+            <h3>配置账号出口代理</h3>
+            <p class="modal-subtitle" id="proxy-modal-email">account@gmail.com</p>
+          </div>
+        </div>
+        <button type="button" class="close-modal" id="btn-close-proxy-modal" title="关闭弹窗" aria-label="关闭代理配置弹窗"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="proxy-modal-acc-id" />
+        <div class="form-group">
+          <label>独立出口代理 (Proxy URL)</label>
+          <input type="text" id="input-edit-proxy" placeholder="如 http://127.0.0.1:7897 或 socks5://127.0.0.1:1080" />
+          <small class="hint">支持 http / https / socks5 协议。留空则代表直连出口。</small>
+        </div>
+
+        <!-- 常用预设快捷按钮 -->
+        <div class="proxy-presets-wrap">
+          <span class="presets-label">快速预设填入:</span>
+          <div class="preset-chips">
+            <button type="button" class="preset-chip chip-clear" id="preset-direct" data-url="" onclick="applyProxyPreset('')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M12 3a15.3 15.3 0 0 1 4 9 15.3 15.3 0 0 1-4 9 15.3 15.3 0 0 1-4-9 15.3 15.3 0 0 1 4-9z"/></svg>直连</button>
+            <button type="button" class="preset-chip" id="preset-clash-7897" data-url="http://127.0.0.1:7897" onclick="applyProxyPreset('http://127.0.0.1:7897')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>Clash 7897</button>
+            <button type="button" class="preset-chip" id="preset-clash-7890" data-url="http://127.0.0.1:7890" onclick="applyProxyPreset('http://127.0.0.1:7890')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>Clash 7890</button>
+            <button type="button" class="preset-chip" id="preset-v2ray-10809" data-url="http://127.0.0.1:10809" onclick="applyProxyPreset('http://127.0.0.1:10809')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>V2Ray 10809</button>
+            <button type="button" class="preset-chip" id="preset-socks-1080" data-url="socks5://127.0.0.1:1080" onclick="applyProxyPreset('socks5://127.0.0.1:1080')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M2 12h20"/><circle cx="12" cy="12" r="4"/></svg>SOCKS5 1080</button>
+          </div>
+        </div>
+
+        <div class="form-group" style="margin-top: 14px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <label style="margin-bottom: 0;">最大允许并发 (Max Concurrency)</label>
+            <span style="font-size: 10px; color: var(--text-muted);">建议 1~10 路</span>
+          </div>
+          <div class="concurrency-stepper-wrap">
+            <div class="stepper-box">
+              <button type="button" class="stepper-step-btn" onclick="stepConcurrency('input-edit-concurrency', -1)" title="减少 1 路并发">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              </button>
+              <div class="stepper-input-container">
+                <input type="number" id="input-edit-concurrency" class="stepper-number-input" value="5" min="1" max="50" oninput="onConcurrencyInput(this)" />
+                <span class="stepper-suffix">路并发</span>
+              </div>
+              <button type="button" class="stepper-step-btn" onclick="stepConcurrency('input-edit-concurrency', 1)" title="增加 1 路并发">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              </button>
+            </div>
+            <div class="stepper-presets">
+              <button type="button" class="step-chip" data-target="input-edit-concurrency" data-val="1" onclick="setConcurrency('input-edit-concurrency', 1)">1 (单路)</button>
+              <button type="button" class="step-chip" data-target="input-edit-concurrency" data-val="3" onclick="setConcurrency('input-edit-concurrency', 3)">3</button>
+              <button type="button" class="step-chip active" data-target="input-edit-concurrency" data-val="5" onclick="setConcurrency('input-edit-concurrency', 5)">5 (标准)</button>
+              <button type="button" class="step-chip" data-target="input-edit-concurrency" data-val="10" onclick="setConcurrency('input-edit-concurrency', 10)">10 (高并发)</button>
+              <button type="button" class="step-chip" data-target="input-edit-concurrency" data-val="20" onclick="setConcurrency('input-edit-concurrency', 20)">20 (极速)</button>
+            </div>
+          </div>
+          <small class="hint">该账号同时允许处理的最大并发请求数，默认 5</small>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" id="btn-cancel-proxy">取消</button>
+        <button type="button" class="btn btn-primary btn-save-proxy" id="btn-submit-proxy">保 存 配 置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态弹窗: 优雅的高级确认弹窗 (彻底替换原生浏览器的 confirm) -->
+  <div id="confirm-modal" class="overlay" style="display: none;">
+    <div class="modal confirm-modal-box">
+      <div class="confirm-modal-body">
+        <div class="confirm-icon-wrap" id="confirm-icon-wrap">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </div>
+        <div class="confirm-text-content">
+          <h3 id="confirm-title">确认操作</h3>
+          <p id="confirm-message" class="confirm-desc">确定要执行此操作吗？</p>
+        </div>
+      </div>
+      <div class="modal-footer confirm-footer">
+        <button type="button" class="btn btn-secondary" id="btn-confirm-cancel">取 消</button>
+        <button type="button" class="btn btn-danger" id="btn-confirm-ok">确 认</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/admin/app.js?v=4.5"></script>
 </body>
 </html>

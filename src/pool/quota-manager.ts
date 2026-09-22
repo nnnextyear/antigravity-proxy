@@ -1,11 +1,14 @@
 import { request, ProxyAgent } from 'undici';
-import { Account, AccountQuota } from '../types.js';
+import { Account, AccountQuota, AppConfig } from '../types.js';
 import { AccountPool } from './account-pool.js';
 
 export class QuotaManager {
   private pollTimer: NodeJS.Timeout | null = null;
 
-  constructor(private pool: AccountPool) {}
+  constructor(
+    private pool: AccountPool,
+    private config?: AppConfig
+  ) {}
 
   /**
    * 从 Google 官方上游 (v1internal:retrieveUserQuotaSummary) 拉取账号实时额度
@@ -14,7 +17,8 @@ export class QuotaManager {
     if (!account.accessToken) return null;
 
     try {
-      const dispatcher = account.proxyUrl ? new ProxyAgent(account.proxyUrl) : undefined;
+      const effectiveProxy = account.proxyUrl || this.config?.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+      const dispatcher = effectiveProxy ? new ProxyAgent(effectiveProxy) : undefined;
     let res: any;
 
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -149,7 +153,7 @@ export class QuotaManager {
   public async fetchAllQuotas(): Promise<void> {
     const accounts = this.pool.getAllAccounts();
     for (const acc of accounts) {
-      if (acc.status === 'dead') continue;
+      if (acc.status === 'dead' || acc.status === 'disabled') continue;
       await this.fetchQuotaForAccount(acc);
       // 适度防抖
       await new Promise(r => setTimeout(r, 600));

@@ -85,24 +85,6 @@ export class AccountPool {
   public saveAccounts(): void {
     try {
       this.isInternalSaving = true;
-      // 在保存前，读取磁盘合并任何由外部 CLI (如 oauth-login) 写入的最新账号，防止覆盖丢失
-      if (fs.existsSync(ACCOUNTS_FILE)) {
-        try {
-          const raw = fs.readFileSync(ACCOUNTS_FILE, 'utf-8');
-          const diskList: Account[] = JSON.parse(raw);
-          for (const dAcc of diskList) {
-            if (!this.accounts.has(dAcc.id)) {
-              const existingByEmail = Array.from(this.accounts.values()).find(a => a.email === dAcc.email);
-              if (!existingByEmail) {
-                dAcc.activeConcurrency = 0;
-                this.accounts.set(dAcc.id, dAcc);
-                console.log(`[AccountPool] Merged external account from disk: ${dAcc.email} (${dAcc.id})`);
-              }
-            }
-          }
-        } catch {}
-      }
-
       const list = Array.from(this.accounts.values()).map(acc => ({
         ...acc,
         activeConcurrency: 0 // 持久化时不保留内存中的并发计数
@@ -111,7 +93,7 @@ export class AccountPool {
     } catch (e) {
       console.error('[AccountPool] Failed to save accounts.json:', e);
     } finally {
-      setTimeout(() => { this.isInternalSaving = false; }, 300);
+      setTimeout(() => { this.isInternalSaving = false; }, 500);
     }
   }
 
@@ -160,6 +142,9 @@ export class AccountPool {
     if (!acc) return null;
 
     Object.assign(acc, updates);
+    if (updates.proxyUrl === undefined && 'proxyUrl' in updates) {
+      delete (acc as any).proxyUrl;
+    }
     this.saveAccounts();
     return acc;
   }
@@ -167,6 +152,11 @@ export class AccountPool {
   public removeAccount(id: string): boolean {
     const deleted = this.accounts.delete(id);
     if (deleted) {
+      for (const [key, val] of this.sessionBindings.entries()) {
+        if (val.accountId === id) {
+          this.sessionBindings.delete(key);
+        }
+      }
       this.saveAccounts();
     }
     return deleted;

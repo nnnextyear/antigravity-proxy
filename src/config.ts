@@ -19,7 +19,8 @@ export const DEFAULT_CONFIG: AppConfig = {
   tokenRefreshIntervalMs: 3 * 60 * 1000, // 3 分钟检查一次
   routingStrategy: (process.env.ROUTING_STRATEGY as any) || 'zero-waste',
   oauthClientId: process.env.OAUTH_CLIENT_ID || DEFAULT_OAUTH_CLIENT_ID,
-  oauthClientSecret: process.env.OAUTH_CLIENT_SECRET || DEFAULT_OAUTH_CLIENT_SECRET
+  oauthClientSecret: process.env.OAUTH_CLIENT_SECRET || DEFAULT_OAUTH_CLIENT_SECRET,
+  defaultProxyUrl: process.env.DEFAULT_PROXY_URL || 'http://127.0.0.1:7897'
 };
 
 export function loadConfig(): AppConfig {

@@ -14,7 +14,7 @@ async function main() {
   const config = loadConfig();
   const pool = new AccountPool(config.routingStrategy || 'zero-waste');
   const refresher = new TokenRefresher(pool, config);
-  const quotaManager = new QuotaManager(pool);
+  const quotaManager = new QuotaManager(pool, config);
   const executor = new RequestExecutor(pool, refresher, config, quotaManager);
 
   // 启动后台 Token 自动保活协程与额度监控协程
