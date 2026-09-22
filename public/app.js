@@ -250,11 +250,20 @@ function renderAccounts(accounts) {
 
   accountsTbody.innerHTML = accounts.map(acc => {
     let statusBadge = `<span class="badge badge-active">Active</span>`;
+    const isClaudeExhausted = acc.quota && acc.quota.claude5hFraction <= 0.01;
+    const isGeminiExhausted = acc.quota && acc.quota.gemini5hFraction <= 0.01;
+
     if (acc.status === 'cooldown') {
       const remainingSec = Math.max(0, Math.ceil((acc.cooldownUntil - Date.now()) / 1000));
       statusBadge = `<span class="badge badge-cooldown">Cooldown (${remainingSec}s)</span>`;
     } else if (acc.status === 'dead') {
       statusBadge = `<span class="badge badge-dead">Dead</span>`;
+    } else if (isClaudeExhausted && !isGeminiExhausted) {
+      statusBadge = `<span class="badge badge-active" style="background: rgba(59, 130, 246, 0.2); color: #93c5fd;" title="Gemini 额度充足可正常调用；Claude 5h额度暂尽等待回满">Active (Gemini可用)</span>`;
+    } else if (!isClaudeExhausted && isGeminiExhausted) {
+      statusBadge = `<span class="badge badge-active" style="background: rgba(168, 85, 247, 0.2); color: #c084fc;" title="Claude 额度充足可正常调用；Gemini 5h额度暂尽等待回满">Active (Claude可用)</span>`;
+    } else if (isClaudeExhausted && isGeminiExhausted) {
+      statusBadge = `<span class="badge" style="background: rgba(245, 158, 11, 0.2); color: #fbbf24;" title="该账号 Claude 与 Gemini 5小时额度均已用完，等待自动回满">双额度暂尽 (等回满)</span>`;
     }
 
     const proxyHtml = acc.proxyUrl 

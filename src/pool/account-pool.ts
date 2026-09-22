@@ -237,11 +237,14 @@ export class AccountPool {
       }
     }
 
-    // 兜底策略：如果受严格额度筛选后无账号，但池内仍有活跃账号，放宽兜底以防额度缓存未及时更新
+    // 兜底策略：只有在账号尚未拉取过额度信息 (!acc.quota) 时才允许兜底尝试，
+    // 如果已知该家族额度已用尽 (如 claude5hFraction <= 0.01 且未到重置时间)，坚决不兜底送去撞 Google 429！
     if (candidates.length === 0 && requiredFamily) {
       for (const acc of this.accounts.values()) {
         if (!excludeIds.has(acc.id) && acc.status === 'active' && acc.activeConcurrency < acc.maxConcurrency) {
-          candidates.push(acc);
+          if (!acc.quota) {
+            candidates.push(acc);
+          }
         }
       }
     }
@@ -365,7 +368,7 @@ export class AccountPool {
   /**
    * 释放借出的账号，并处理错误与状态更新
    */
-  public releaseAccount(accId: string, error?: { code: number; message: string }): void {
+  public releaseAccount(accId: string, error?: { code: number; message: string }, family?: 'claude' | 'gemini'): void {
     const acc = this.accounts.get(accId);
     if (!acc) return;
 
@@ -376,10 +379,32 @@ export class AccountPool {
       acc.lastError = `[HTTP ${error.code}] ${error.message}`;
 
       if (error.code === 429) {
-        // 遇到 429 触发冷却
-        acc.status = 'cooldown';
-        acc.cooldownUntil = Date.now() + 60 * 1000; // 默认冷却 60 秒
-        console.warn(`[CircuitBreaker] Account ${acc.email} entered COOLDOWN for 60s due to 429.`);
+        // 判断是否属于特定模型族的额度用尽 (如 RESOURCE_EXHAUSTED / Quota exceeded / limit)
+        const errMsg = error.message.toLowerCase();
+        const isQuotaExhausted = errMsg.includes('resource_exhausted') ||
+                                 errMsg.includes('quota') ||
+                                 errMsg.includes('exhausted') ||
+                                 errMsg.includes('limit');
+
+        if (isQuotaExhausted && family === 'claude') {
+          // 仅 Claude / 3p 额度耗尽：精准置零 Claude 5h 额度，账号全局状态依然保持 active，Gemini 请求不受任何影响！
+          if (acc.quota) {
+            acc.quota.claude5hFraction = 0.0;
+          }
+          console.warn(`[CircuitBreaker] 账号 ${acc.email} Claude/GPT 5h 额度耗尽，已标记 Claude 耗尽，账号保持 Active 供 Gemini 继续使用。`);
+        } else if (isQuotaExhausted && family === 'gemini') {
+          if (acc.quota) {
+            acc.quota.gemini5hFraction = 0.0;
+          }
+          console.warn(`[CircuitBreaker] 账号 ${acc.email} Gemini 5h 额度耗尽，已标记 Gemini 耗尽，账号保持 Active 供 Claude 继续使用。`);
+        } else {
+          // 通用 RPM 频率限制（非特定模型额度用尽），账号进入 60 秒常规冷却
+          acc.status = 'cooldown';
+          acc.cooldownUntil = Date.now() + 60 * 1000;
+          console.warn(`[CircuitBreaker] 账号 ${acc.email} 触发通用 429 限频，进入冷却 60 秒。`);
+        }
+
+        this.saveAccounts();
 
         // 清理绑定在该账号上的会话粘性，使后续请求自动平滑漂移至健康备用账号
         for (const [sKey, binding] of this.sessionBindings.entries()) {

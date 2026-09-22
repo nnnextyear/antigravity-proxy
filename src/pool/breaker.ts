@@ -38,6 +38,35 @@ export class RequestExecutor {
       const account = this.pool.acquireAccount(triedAccountIds, family, sessionKey);
 
       if (!account) {
+        if (family === 'claude') {
+          let nearestDiff = Infinity;
+          for (const acc of this.pool.getAllAccounts()) {
+            if (acc.quota?.claudeResetTime) {
+              const diff = new Date(acc.quota.claudeResetTime).getTime() - Date.now();
+              if (diff > 0 && diff < nearestDiff) {
+                nearestDiff = diff;
+              }
+            }
+          }
+          const timeHint = nearestDiff !== Infinity
+            ? ` (最近回满倒计时: ${Math.floor(nearestDiff / 3600000)}小时${Math.floor((nearestDiff % 3600000) / 60000)}分)`
+            : '';
+          throw new Error(`当前账号池所有账号的 Claude/GPT 5小时额度均已耗尽${timeHint}。Gemini 额度依然充足可用，建议在客户端切换为 gemini-3.8-flash 等模型，或等待额度自动回满。`);
+        } else if (family === 'gemini') {
+          let nearestDiff = Infinity;
+          for (const acc of this.pool.getAllAccounts()) {
+            if (acc.quota?.geminiResetTime) {
+              const diff = new Date(acc.quota.geminiResetTime).getTime() - Date.now();
+              if (diff > 0 && diff < nearestDiff) {
+                nearestDiff = diff;
+              }
+            }
+          }
+          const timeHint = nearestDiff !== Infinity
+            ? ` (最近回满倒计时: ${Math.floor(nearestDiff / 3600000)}小时${Math.floor((nearestDiff % 3600000) / 60000)}分)`
+            : '';
+          throw new Error(`当前账号池所有账号的 Gemini 5小时额度均已耗尽${timeHint}。Claude / GPT 额度依然充足可用，建议在客户端切换为 claude-3-7-sonnet 等模型，或等待额度自动回满。`);
+        }
         throw new Error('All accounts in the pool are busy, in cooldown, or exhausted.');
       }
 
@@ -47,7 +76,7 @@ export class RequestExecutor {
       if (!account.accessToken || Date.now() >= account.accessTokenExpiresAt) {
         const ok = await this.refresher.refreshSingleAccount(account);
         if (!ok) {
-          this.pool.releaseAccount(account.id, { code: 401, message: 'Initial token refresh failed' });
+          this.pool.releaseAccount(account.id, { code: 401, message: 'Initial token refresh failed' }, family);
           continue; // 换下一个号重试
         }
       }
@@ -84,7 +113,7 @@ export class RequestExecutor {
         if (res.statusCode === 429) {
           const errBody = await res.body.text();
           console.warn(`[Executor] 账号 ${account.email} 触发 429 限频/额度枯竭 (第 ${attempt}/${maxRetries} 次尝试)，正在无感自动换号...:`, errBody.substring(0, 120));
-          this.pool.releaseAccount(account.id, { code: 429, message: errBody });
+          this.pool.releaseAccount(account.id, { code: 429, message: errBody }, family);
           if (this.quotaManager) {
             this.quotaManager.fetchQuotaForAccount(account).catch(() => {});
           }
