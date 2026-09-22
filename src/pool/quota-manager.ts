@@ -15,19 +15,33 @@ export class QuotaManager {
 
     try {
       const dispatcher = account.proxyUrl ? new ProxyAgent(account.proxyUrl) : undefined;
-      const res = await request('https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${account.accessToken}`,
-          'Content-Type': 'application/json',
-          'User-Agent': 'antigravity/2.14.0',
-          'x-goog-api-client': 'gl-node/22.7.0 grpc-web/1.0.0'
-        },
-        body: JSON.stringify({ project: 'aicode-consumers' }),
-        headersTimeout: 15000,
-        bodyTimeout: 15000,
-        dispatcher
-      });
+    let res: any;
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        res = await request('https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${account.accessToken}`,
+            'Content-Type': 'application/json',
+            'User-Agent': 'antigravity/2.14.0',
+            'x-goog-api-client': 'gl-node/22.7.0 grpc-web/1.0.0'
+          },
+          body: JSON.stringify({ project: 'aicode-consumers' }),
+          headersTimeout: 15000,
+          bodyTimeout: 15000,
+          dispatcher
+        });
+        break;
+      } catch (err: any) {
+        if (attempt < 2) {
+          await new Promise(r => setTimeout(r, 1500));
+          continue;
+        }
+        console.warn(`[QuotaManager] Network error fetching quota for ${account.email} (transient socket drop, will retry next cycle):`, err.message);
+        return null;
+      }
+    }
 
       if (res.statusCode !== 200) {
         const errText = await res.body.text();

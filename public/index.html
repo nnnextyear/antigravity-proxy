@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Antigravity Proxy 管理控制台</title>
-  <link rel="stylesheet" href="/admin/style.css?v=2.1">
+  <link rel="stylesheet" href="/admin/style.css?v=2.2">
 </head>
 <body>
   <div id="login-overlay" class="overlay">
@@ -59,8 +59,13 @@
           <div class="stat-value text-success" id="stat-active">0</div>
           <div class="stat-sub">正在承接请求并待命</div>
         </div>
+        <div class="stat-card" style="border-left: 4px solid #c084fc;">
+          <div class="stat-label">Claude / GPT 5小时额度</div>
+          <div class="stat-value" id="stat-claude-5h" style="color: #c084fc;">--%</div>
+          <div class="stat-sub" id="stat-claude-5h-sub">5小时滚动平滑限额</div>
+        </div>
         <div class="stat-card" style="border-left: 4px solid #8b5cf6;">
-          <div class="stat-label">Claude / GPT 周额度</div>
+          <div class="stat-label">Claude / GPT 周期总额度</div>
           <div class="stat-value" id="stat-claude-weekly" style="color: #a78bfa;">--%</div>
           <div class="stat-sub" id="stat-claude-weekly-sub">账号每周可用额度</div>
         </div>
@@ -159,6 +164,6 @@
     </div>
   </div>
 
-  <script src="/admin/app.js?v=2.1"></script>
+  <script src="/admin/app.js?v=2.2"></script>
 </body>
 </html>

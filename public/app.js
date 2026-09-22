@@ -23,6 +23,7 @@ const statCooldown = document.getElementById('stat-cooldown');
 const statDead = document.getElementById('stat-dead');
 const statConcurrency = document.getElementById('stat-concurrency');
 const statRequests = document.getElementById('stat-requests');
+const statClaude5h = document.getElementById('stat-claude-5h');
 const statClaudeWeekly = document.getElementById('stat-claude-weekly');
 const statGemini5h = document.getElementById('stat-gemini-5h');
 const statGeminiWeekly = document.getElementById('stat-gemini-weekly');
@@ -191,17 +192,21 @@ async function loadAllData() {
       selectStrategy.value = stats.routingStrategy;
     }
 
-    // 计算全局平均额度 (Claude 周额度 + Gemini 5h + Gemini 周额度)
-    let cWeeklySum = 0, cCount = 0;
+    // 计算全局平均额度 (Claude 5h + Claude 周额度 + Gemini 5h + Gemini 周额度)
+    let c5hSum = 0, cWeeklySum = 0, cCount = 0;
     let g5hSum = 0, gWeeklySum = 0, gCount = 0;
     for (const acc of accounts) {
       if (acc.quota) {
+        c5hSum += (acc.quota.claude5hFraction ?? 1);
         cWeeklySum += (acc.quota.claudeWeeklyFraction ?? 1);
         cCount++;
         g5hSum += (acc.quota.gemini5hFraction ?? 1);
         gWeeklySum += (acc.quota.geminiWeeklyFraction ?? 1);
         gCount++;
       }
+    }
+    if (statClaude5h) {
+      statClaude5h.innerText = cCount > 0 ? `${(c5hSum / cCount * 100).toFixed(1)}%` : '--%';
     }
     if (statClaudeWeekly) {
       statClaudeWeekly.innerText = cCount > 0 ? `${(cWeeklySum / cCount * 100).toFixed(1)}%` : '--%';
@@ -292,35 +297,50 @@ function renderAccounts(accounts) {
           ${acc.lastError ? `<div style="color: var(--danger); font-size: 10px; max-width: 200px;">${escapeHtml(acc.lastError)}</div>` : ''}
         </div>`;
     } else {
+      const c5h = (acc.quota.claude5hFraction != null) ? (acc.quota.claude5hFraction * 100).toFixed(1) : '100.0';
       const cW = (acc.quota.claudeWeeklyFraction != null) ? (acc.quota.claudeWeeklyFraction * 100).toFixed(1) : '100.0';
       const g5h = (acc.quota.gemini5hFraction != null) ? (acc.quota.gemini5hFraction * 100).toFixed(1) : '100.0';
       const gW = (acc.quota.geminiWeeklyFraction != null) ? (acc.quota.geminiWeeklyFraction * 100).toFixed(1) : '100.0';
 
+      const c5hNum = parseFloat(c5h);
       const cWNum = parseFloat(cW);
       const g5hNum = parseFloat(g5h);
       const gWNum = parseFloat(gW);
 
+      const c5hUsed = Math.max(0, 100 - c5hNum).toFixed(1);
       const cWUsed = Math.max(0, 100 - cWNum).toFixed(1);
       const g5hUsed = Math.max(0, 100 - g5hNum).toFixed(1);
       const gWUsed = Math.max(0, 100 - gWNum).toFixed(1);
 
+      const c5hColor = c5hNum > 50 ? '#c084fc' : (c5hNum > 15 ? '#fbbf24' : '#f87171');
       const cWColor = cWNum > 50 ? '#a78bfa' : (cWNum > 15 ? '#fbbf24' : '#f87171');
       const g5hColor = g5hNum > 50 ? '#60a5fa' : (g5hNum > 15 ? '#fbbf24' : '#f87171');
       const gWColor = gWNum > 50 ? '#93c5fd' : (gWNum > 15 ? '#fbbf24' : '#f87171');
 
+      const cReset5h = formatResetTime(acc.quota.claudeResetTime);
       const cResetW = formatResetTime(acc.quota.claudeWeeklyResetTime);
       const gReset5h = formatResetTime(acc.quota.geminiResetTime);
       const gResetW = formatResetTime(acc.quota.geminiWeeklyResetTime);
 
+      const c5hDesc = acc.quota.claude5hDesc || '5小时平滑滚动窗口配额';
       const cWDesc = acc.quota.claudeWeeklyDesc || '每周账号可用额度上限';
       const g5hDesc = acc.quota.gemini5hDesc || '5小时平滑滚动窗口配额';
       const gWDesc = acc.quota.geminiWeeklyDesc || '每周账号可用额度上限';
 
+      const c5hWidth = Math.min(100, Math.max(0, c5hNum));
       const cWWidth = Math.min(100, Math.max(0, cWNum));
       const g5hWidth = Math.min(100, Math.max(0, g5hNum));
       const gWWidth = Math.min(100, Math.max(0, gWNum));
 
       // 满格与恢复倒计时精准区分
+      const c5hBadge = (c5hNum < 99.9 && cReset5h)
+        ? `<span class="quota-item-time" title="预计回满时间">⏳ ${cReset5h}回满</span>`
+        : `<span class="quota-item-time" style="color: #4ade80;">✅ 满格</span>`;
+
+      const cWBadge = (cWNum < 99.9 && cResetW)
+        ? `<span class="quota-item-time" title="每周重置时间">🔄 ${cResetW}刷新</span>`
+        : `<span class="quota-item-time" style="color: #4ade80;">✅ 满额</span>`;
+
       const g5hBadge = (g5hNum < 99.9 && gReset5h)
         ? `<span class="quota-item-time" title="预计回满时间">⏳ ${gReset5h}回满</span>`
         : `<span class="quota-item-time" style="color: #4ade80;">✅ 满格</span>`;
@@ -329,28 +349,40 @@ function renderAccounts(accounts) {
         ? `<span class="quota-item-time" title="每周重置时间">🔄 ${gResetW}刷新</span>`
         : `<span class="quota-item-time" style="color: #4ade80;">✅ 满额</span>`;
 
-      const cWBadge = cResetW
-        ? `<span class="quota-item-time" title="每周重置时间">🔄 ${cResetW}刷新</span>`
-        : `<span class="quota-item-time" style="color: #4ade80;">✅ 满额</span>`;
-
       quotaHtml = `
         <div class="quota-container">
-          <!-- 1. Claude / GPT 额度监控 (仅周额度) -->
+          <!-- 1. Claude / GPT 额度监控 (5小时 + 周期总额度) -->
           <div class="quota-group-card claude-card">
             <div class="quota-group-title">
               <span style="color: #c4b5fd;">Claude / GPT</span>
-              ${cWBadge}
+            </div>
+
+            <!-- 5小时滚动平滑限流 -->
+            <div class="quota-item-block" title="${escapeHtml(c5hDesc)}">
+              <div class="quota-item-meta">
+                <div class="quota-item-title">
+                  <span class="quota-type-tag">5小时额度:</span>
+                  <span class="quota-rem-val" style="color: ${c5hColor};">${c5h}%</span>
+                  <span class="quota-used-tag">(已用 ${c5hUsed}%)</span>
+                  ${c5hNum <= 0 ? '<span class="quota-exhausted-tag">已用完</span>' : ''}
+                </div>
+                ${c5hBadge}
+              </div>
+              <div class="quota-bar-wrap">
+                <div class="quota-bar-fill" style="width: ${c5hWidth}%; background: ${c5hColor};"></div>
+              </div>
             </div>
 
             <!-- 周度总额度 -->
             <div class="quota-item-block" title="${escapeHtml(cWDesc)}">
               <div class="quota-item-meta">
                 <div class="quota-item-title">
-                  <span class="quota-type-tag">周额度:</span>
+                  <span class="quota-type-tag">周期总额度:</span>
                   <span class="quota-rem-val" style="color: ${cWColor};">${cW}%</span>
                   <span class="quota-used-tag">(已用 ${cWUsed}%)</span>
                   ${cWNum <= 0 ? '<span class="quota-exhausted-tag">已用完</span>' : ''}
                 </div>
+                ${cWBadge}
               </div>
               <div class="quota-bar-wrap">
                 <div class="quota-bar-fill" style="width: ${cWWidth}%; background: ${cWColor};"></div>

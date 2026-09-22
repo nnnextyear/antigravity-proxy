@@ -68,48 +68,59 @@ export class TokenRefresher {
     const clientSecret = this.config.oauthClientSecret || DEFAULT_CLIENT_SECRET;
     bodyParams.append('client_secret', clientSecret);
 
-    try {
-      console.log(`[TokenRefresher] Refreshing token for account: ${acc.email} (${acc.id})...`);
-      const dispatcher = acc.proxyUrl ? new ProxyAgent(acc.proxyUrl) : undefined;
-
-      const res = await request(GOOGLE_TOKEN_ENDPOINT, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        body: bodyParams.toString(),
-        dispatcher
-      });
-
-      if (res.statusCode === 200) {
-        const data = (await res.body.json()) as any;
-        const newAccessToken = data.access_token;
-        const expiresIn = data.expires_in || 3600;
-
-        acc.accessToken = newAccessToken;
-        acc.accessTokenExpiresAt = Date.now() + expiresIn * 1000;
-        if (acc.status === 'dead') {
-          acc.status = 'active';
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        if (attempt === 1) {
+          console.log(`[TokenRefresher] Refreshing token for account: ${acc.email} (${acc.id})...`);
         }
-        acc.lastError = undefined;
-        this.pool.saveAccounts();
+        const dispatcher = acc.proxyUrl ? new ProxyAgent(acc.proxyUrl) : undefined;
 
-        console.log(`[TokenRefresher] Successfully refreshed token for ${acc.email}. Expires in ${expiresIn}s.`);
-        return true;
-      } else {
-        const errText = await res.body.text();
-        console.error(`[TokenRefresher] Failed to refresh token for ${acc.email}, HTTP ${res.statusCode}:`, errText);
-        acc.lastError = `OAuth Refresh Failed (${res.statusCode}): ${errText}`;
-        if (res.statusCode === 400 || res.statusCode === 401) {
-          acc.status = 'dead';
+        const res = await request(GOOGLE_TOKEN_ENDPOINT, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded'
+          },
+          body: bodyParams.toString(),
+          headersTimeout: 15000,
+          bodyTimeout: 15000,
+          dispatcher
+        });
+
+        if (res.statusCode === 200) {
+          const data = (await res.body.json()) as any;
+          const newAccessToken = data.access_token;
+          const expiresIn = data.expires_in || 3600;
+
+          acc.accessToken = newAccessToken;
+          acc.accessTokenExpiresAt = Date.now() + expiresIn * 1000;
+          if (acc.status === 'dead') {
+            acc.status = 'active';
+          }
+          acc.lastError = undefined;
+          this.pool.saveAccounts();
+
+          console.log(`[TokenRefresher] Successfully refreshed token for ${acc.email}. Expires in ${expiresIn}s.`);
+          return true;
+        } else {
+          const errText = await res.body.text();
+          console.error(`[TokenRefresher] Failed to refresh token for ${acc.email}, HTTP ${res.statusCode}:`, errText);
+          acc.lastError = `OAuth Refresh Failed (${res.statusCode}): ${errText}`;
+          if (res.statusCode === 400 || res.statusCode === 401) {
+            acc.status = 'dead';
+          }
+          this.pool.saveAccounts();
+          return false;
         }
-        this.pool.saveAccounts();
+      } catch (e: any) {
+        if (attempt < 2) {
+          await new Promise(r => setTimeout(r, 1500));
+          continue;
+        }
+        console.warn(`[TokenRefresher] Network error refreshing token for ${acc.email} (will retry in next cycle):`, e.message);
+        acc.lastError = `Network error: ${e.message}`;
         return false;
       }
-    } catch (e: any) {
-      console.error(`[TokenRefresher] Network error refreshing token for ${acc.email}:`, e.message);
-      acc.lastError = `Network error: ${e.message}`;
-      return false;
     }
+    return false;
   }
 }
