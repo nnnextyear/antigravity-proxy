@@ -279,12 +279,16 @@ export async function createServer(
 
       let buffer = '';
       const decoder = new StringDecoder('utf-8');
+      let usageMetadata: any = null;
 
-      const cleanup = () => {
-        pool.releaseAccount(accountUsed.id);
+      let released = false;
+      const cleanup = (err?: any) => {
+        if (released) return;
+        released = true;
+        pool.releaseAccount(accountUsed.id, err);
       };
 
-      req.raw.on('close', cleanup);
+      req.raw.on('close', () => cleanup());
 
       try {
         for await (const chunk of bodyStream) {
@@ -300,7 +304,8 @@ export async function createServer(
             const jsonStr = trimmed.substring(5).trim();
             if (!jsonStr || jsonStr === '[DONE]') continue;
 
-            const { text, finishReason } = extractTextFromGoogleChunk(jsonStr);
+            const { text, finishReason, usageMetadata: chunkUsage } = extractTextFromGoogleChunk(jsonStr);
+            if (chunkUsage) usageMetadata = chunkUsage;
             if (text) {
               const sseChunk = createOpenAIChunk(completionId, chatReq.model, text, null);
               reply.raw.write(sseChunk);
@@ -316,6 +321,7 @@ export async function createServer(
         // 发送终止标志
         reply.raw.write('data: [DONE]\n\n');
         reply.raw.end();
+        if (usageMetadata) pool.recordTokenUsage(usageMetadata);
       } catch (e: any) {
         console.error('[Gateway] SSE Streaming error:', e.message);
       } finally {
@@ -326,6 +332,7 @@ export async function createServer(
       let fullText = '';
       let buffer = '';
       const decoder = new StringDecoder('utf-8');
+      let usageMetadata: any = null;
 
       try {
         for await (const chunk of bodyStream) {
@@ -339,7 +346,8 @@ export async function createServer(
             const jsonStr = trimmed.substring(5).trim();
             if (!jsonStr || jsonStr === '[DONE]') continue;
 
-            const { text } = extractTextFromGoogleChunk(jsonStr);
+            const { text, usageMetadata: chunkUsage } = extractTextFromGoogleChunk(jsonStr);
+            if (chunkUsage) usageMetadata = chunkUsage;
             if (text) {
               fullText += text;
             }
@@ -348,6 +356,7 @@ export async function createServer(
         buffer += decoder.end();
 
         pool.releaseAccount(accountUsed.id);
+        if (usageMetadata) pool.recordTokenUsage(usageMetadata);
 
         return reply.send({
           id: completionId,
@@ -365,9 +374,9 @@ export async function createServer(
             }
           ],
           usage: {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0
+            prompt_tokens: usageMetadata?.promptTokenCount || 0,
+            completion_tokens: usageMetadata?.candidatesTokenCount || 0,
+            total_tokens: usageMetadata?.totalTokenCount || 0
           }
         });
       } catch (err: any) {

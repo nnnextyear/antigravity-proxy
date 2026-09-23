@@ -123,6 +123,10 @@ export interface PoolStats {
   deadAccounts: number;
   currentTotalConcurrency: number;
   totalRequestsServed: number;
+  totalPromptTokens: number;
+  totalCompletionTokens: number;
+  totalTokens: number;
+  hasTokenUsage: boolean;
   uptimeSeconds: number;
   routingStrategy: RoutingStrategy;
 }

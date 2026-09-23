@@ -435,10 +435,13 @@ export function registerAnthropicRoutes(
       reply.raw.setHeader('Connection', 'keep-alive');
       reply.raw.setHeader('X-Accel-Buffering', 'no');
 
-      const cleanup = () => {
-        pool.releaseAccount(accountUsed.id);
+      let released = false;
+      const cleanup = (err?: any) => {
+        if (released) return;
+        released = true;
+        pool.releaseAccount(accountUsed.id, err);
       };
-      req.raw.on('close', cleanup);
+      req.raw.on('close', () => cleanup());
 
       try {
         // 1. message_start

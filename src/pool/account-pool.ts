@@ -11,6 +11,10 @@ export class AccountPool {
   private roundRobinCursor = 0;
   private startTime = Date.now();
   private totalRequestsServed = 0;
+  private totalPromptTokens = 0;
+  private totalCompletionTokens = 0;
+  private totalTokens = 0;
+  private hasTokenUsage = false;
   private isInternalSaving = false;
   private reloadDebounceTimer: NodeJS.Timeout | null = null;
   private routingStrategy: RoutingStrategy = 'zero-waste';
@@ -300,6 +304,34 @@ export class AccountPool {
             if (aWeekly <= 0.03 && bWeekly > 0.03) return 1;
             if (bWeekly <= 0.03 && aWeekly > 0.03) return -1;
 
+            // 时间紧迫度优先于“15 分钟主力号”：先消耗更接近周重置的账号，
+            // 防止周期结束时剩余额度被刷新浪费；周重置接近时再比较 5h 重置。
+            const getResetDelay = (account: Account, weekly: boolean): number => {
+              if (!account.quota) return Infinity;
+              const resetTime = weekly
+                ? (requiredFamily === 'claude' ? account.quota.claudeWeeklyResetTime : account.quota.geminiWeeklyResetTime)
+                : (requiredFamily === 'claude' ? account.quota.claudeResetTime : account.quota.geminiResetTime);
+              if (!resetTime) return Infinity;
+              const timestamp = new Date(resetTime).getTime();
+              const delay = timestamp - now;
+              return Number.isFinite(delay) && delay > 0 ? delay : Infinity;
+            };
+
+            if (requiredFamily) {
+              const aWeeklyReset = getResetDelay(a, true);
+              const bWeeklyReset = getResetDelay(b, true);
+              const weeklyResetGap = Math.abs(aWeeklyReset - bWeeklyReset);
+              if (weeklyResetGap > 24 * 60 * 60 * 1000) {
+                return aWeeklyReset - bWeeklyReset;
+              }
+
+              const a5hReset = getResetDelay(a, false);
+              const b5hReset = getResetDelay(b, false);
+              if (a5hReset !== b5hReset) {
+                return a5hReset - b5hReset;
+              }
+            }
+
             // 优先锁定当前主力号（最近有活跃使用 且 5h 剩余 > 5% 且并发未饱和）
             const aIsActiveDrain = (now - a.lastUsedAt < 15 * 60 * 1000) && ((requiredFamily === 'claude' ? a.quota?.claude5hFraction : a.quota?.gemini5hFraction) ?? 1) > 0.05;
             const bIsActiveDrain = (now - b.lastUsedAt < 15 * 60 * 1000) && ((requiredFamily === 'claude' ? b.quota?.claude5hFraction : b.quota?.gemini5hFraction) ?? 1) > 0.05;
@@ -443,8 +475,23 @@ export class AccountPool {
       deadAccounts: dead,
       currentTotalConcurrency: currentConcurrency,
       totalRequestsServed: this.totalRequestsServed,
+      totalPromptTokens: this.totalPromptTokens,
+      totalCompletionTokens: this.totalCompletionTokens,
+      totalTokens: this.totalTokens,
+      hasTokenUsage: this.hasTokenUsage,
       uptimeSeconds: Math.floor((now - this.startTime) / 1000),
       routingStrategy: this.routingStrategy
     };
+  }
+
+  public recordTokenUsage(usage: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number }): void {
+    const prompt = Number(usage.promptTokenCount);
+    const completion = Number(usage.candidatesTokenCount);
+    const total = Number(usage.totalTokenCount);
+    if (![prompt, completion, total].every(Number.isFinite)) return;
+    this.totalPromptTokens += prompt;
+    this.totalCompletionTokens += completion;
+    this.totalTokens += total;
+    this.hasTokenUsage = true;
   }
 }

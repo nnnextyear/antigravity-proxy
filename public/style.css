@@ -1113,6 +1113,11 @@ body {
   color: var(--text-muted);
 }
 
+.stat-card-foot #stat-tokens {
+  color: #a5b4fc;
+  font-family: var(--font-mono);
+}
+
 .search-input-wrap input {
   background: transparent;
   border: none;

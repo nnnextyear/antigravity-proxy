@@ -142,11 +142,13 @@ export function createOpenAIChunk(
 export function extractTextFromGoogleChunk(rawJson: string): {
   text: string;
   finishReason?: string | null;
+  usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
 } {
   try {
     const parsed = JSON.parse(rawJson);
+    const usageMetadata = parsed.response?.usageMetadata || parsed.usageMetadata;
     const candidate = parsed.response?.candidates?.[0] || parsed.candidates?.[0];
-    if (!candidate) return { text: '' };
+    if (!candidate) return { text: '', usageMetadata };
 
     const parts = candidate.content?.parts;
     let text = '';
@@ -160,7 +162,7 @@ export function extractTextFromGoogleChunk(rawJson: string): {
     }
 
     const finishReason = candidate.finishReason || null;
-    return { text, finishReason: finishReason === 'STOP' ? 'stop' : finishReason };
+    return { text, finishReason: finishReason === 'STOP' ? 'stop' : finishReason, usageMetadata };
   } catch {
     return { text: '' };
   }

@@ -37,6 +37,7 @@ const statCooldown = document.getElementById('stat-cooldown');
 const statDead = document.getElementById('stat-dead');
 const statConcurrency = document.getElementById('stat-concurrency');
 const statRequests = document.getElementById('stat-requests');
+const statTokens = document.getElementById('stat-tokens');
 const statClaude5h = document.getElementById('stat-claude-5h');
 const statClaudeWeekly = document.getElementById('stat-claude-weekly');
 const statClaudeWeeklyBar = document.getElementById('stat-claude-weekly-bar');
@@ -356,6 +357,7 @@ async function loadAllData() {
     if (statDead) statDead.innerText = stats.deadAccounts;
     if (statConcurrency) statConcurrency.innerText = stats.currentTotalConcurrency;
     if (statRequests) statRequests.innerText = stats.totalRequestsServed;
+    if (statTokens) statTokens.innerText = stats.hasTokenUsage ? formatTokenCount(stats.totalTokens) : '--';
 
     const badgeTextEl = document.getElementById('stat-active-badge-text');
     if (badgeTextEl) badgeTextEl.innerText = `${stats.activeAccounts} 活跃`;
@@ -480,6 +482,14 @@ function renderFilteredAccounts() {
   });
 
   renderCardsView(filtered);
+}
+
+function formatTokenCount(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count)) return '--';
+  if (count >= 1000000) return `${(count / 1000000).toFixed(2)}M`;
+  if (count >= 1000) return `${(count / 1000).toFixed(1)}k`;
+  return String(Math.round(count));
 }
 
 function getAvatarColor(email) {
