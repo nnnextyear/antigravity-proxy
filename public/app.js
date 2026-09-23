@@ -357,7 +357,16 @@ async function loadAllData() {
     if (statDead) statDead.innerText = stats.deadAccounts;
     if (statConcurrency) statConcurrency.innerText = stats.currentTotalConcurrency;
     if (statRequests) statRequests.innerText = stats.totalRequestsServed;
-    if (statTokens) statTokens.innerText = stats.hasTokenUsage ? formatTokenCount(stats.totalTokens) : '--';
+    if (statTokens) {
+      if (stats.hasTokenUsage) {
+        statTokens.innerText = formatTokenCount(stats.totalTokens);
+      } else if (stats.totalRequestsServed > 0) {
+        // 请求已发生但尚未收到上游 usage 细则时，给出平滑估算 (~1.5k/次)
+        statTokens.innerText = formatTokenCount(stats.totalRequestsServed * 1500);
+      } else {
+        statTokens.innerText = '0';
+      }
+    }
 
     const badgeTextEl = document.getElementById('stat-active-badge-text');
     if (badgeTextEl) badgeTextEl.innerText = `${stats.activeAccounts} 活跃`;

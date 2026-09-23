@@ -34,6 +34,7 @@ interface GoogleParsedChunk {
     args: any;
   }>;
   finishReason?: string | null;
+  usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
 }
 
 // 工具名称规范化：Google/Claude 严格要求 tool name 符合 ^[a-zA-Z0-9_-]{1,128}$
@@ -47,8 +48,9 @@ const thoughtSignatureCache = new Map<string, string>();
 function parseGoogleStreamChunk(jsonStr: string): GoogleParsedChunk {
   try {
     const parsed = JSON.parse(jsonStr);
+    const usageMetadata = parsed.response?.usageMetadata || parsed.usageMetadata;
     const candidate = parsed.response?.candidates?.[0] || parsed.candidates?.[0];
-    if (!candidate) return { text: '', functionCalls: [] };
+    if (!candidate) return { text: '', functionCalls: [], usageMetadata };
 
     const parts = candidate.content?.parts;
     let text = '';
@@ -78,7 +80,7 @@ function parseGoogleStreamChunk(jsonStr: string): GoogleParsedChunk {
     }
 
     const finishReason = candidate.finishReason || null;
-    return { text, functionCalls, finishReason };
+    return { text, functionCalls, finishReason, usageMetadata };
   } catch {
     return { text: '', functionCalls: [] };
   }
@@ -467,6 +469,7 @@ export function registerAnthropicRoutes(
         let isTextBlockOpen = false;
         let textBlockStarted = false;
         let hasToolUse = false;
+        let lastUsageMetadata: any = null;
         const seenToolCalls = new Set<string>();
 
         for await (const chunk of bodyStream) {
@@ -480,7 +483,8 @@ export function registerAnthropicRoutes(
             const jsonStr = trimmed.substring(5).trim();
             if (!jsonStr || jsonStr === '[DONE]') continue;
 
-            const { text, functionCalls } = parseGoogleStreamChunk(jsonStr);
+            const { text, functionCalls, usageMetadata } = parseGoogleStreamChunk(jsonStr);
+            if (usageMetadata) lastUsageMetadata = usageMetadata;
 
             // 处理文本流
             if (text) {
@@ -591,6 +595,16 @@ export function registerAnthropicRoutes(
         // 5. message_stop
         reply.raw.write(`event: message_stop\ndata: {"type":"message_stop"}\n\n`);
         reply.raw.end();
+
+        if (lastUsageMetadata) {
+          pool.recordTokenUsage(lastUsageMetadata);
+        } else {
+          pool.recordTokenUsage({
+            promptTokenCount: 10,
+            candidatesTokenCount: totalOutputTokens,
+            totalTokenCount: 10 + totalOutputTokens
+          });
+        }
       } catch (err: any) {
         console.error('[AnthropicGateway] Stream error:', err.message);
       } finally {
@@ -604,6 +618,7 @@ export function registerAnthropicRoutes(
       let hasToolUse = false;
       let buffer = '';
       const decoder = new StringDecoder('utf-8');
+      let lastUsageMetadata: any = null;
 
       try {
         for await (const chunk of bodyStream) {
@@ -617,7 +632,8 @@ export function registerAnthropicRoutes(
             const jsonStr = trimmed.substring(5).trim();
             if (!jsonStr || jsonStr === '[DONE]') continue;
 
-            const { text, functionCalls } = parseGoogleStreamChunk(jsonStr);
+            const { text, functionCalls, usageMetadata } = parseGoogleStreamChunk(jsonStr);
+            if (usageMetadata) lastUsageMetadata = usageMetadata;
             if (text) fullText += text;
 
             for (const fn of functionCalls) {
@@ -637,6 +653,17 @@ export function registerAnthropicRoutes(
         }
 
         pool.releaseAccount(accountUsed.id);
+
+        const outTokens = Math.ceil((fullText.length + JSON.stringify(contentParts).length) / 4);
+        if (lastUsageMetadata) {
+          pool.recordTokenUsage(lastUsageMetadata);
+        } else {
+          pool.recordTokenUsage({
+            promptTokenCount: 10,
+            candidatesTokenCount: outTokens,
+            totalTokenCount: 10 + outTokens
+          });
+        }
 
         if (fullText) {
           contentParts.unshift({ type: 'text', text: fullText });
