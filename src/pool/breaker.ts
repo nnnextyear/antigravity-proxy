@@ -12,6 +12,32 @@ export interface UpstreamExecutionResult {
   accountUsed: Account;
 }
 
+/** An upstream response that must be returned to the client, never retried on another account. */
+export class UpstreamRequestError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    public readonly upstreamBody: string
+  ) {
+    super(`Google Upstream returned HTTP ${statusCode}: ${upstreamBody}`);
+    this.name = 'UpstreamRequestError';
+  }
+}
+
+export class ContextOverflowError extends UpstreamRequestError {
+  constructor(statusCode: number, upstreamBody: string) {
+    super(statusCode, upstreamBody);
+    this.name = 'ContextOverflowError';
+  }
+}
+
+function isContextOverflow(statusCode: number, body: string): boolean {
+  return statusCode === 400 && (
+    /input token count exceeds the maximum number of tokens/i.test(body) ||
+    /maximum number of tokens allowed/i.test(body) ||
+    /CONTEXT_LENGTH_EXCEEDED/i.test(body)
+  );
+}
+
 export class RequestExecutor {
   constructor(
     private pool: AccountPool,
@@ -165,12 +191,19 @@ export class RequestExecutor {
           continue;
         }
 
-        // 其他上游错误
+        // 400 是请求本身不合法，换账号无意义；尤其不能把上下文超限误报成网络故障。
         const errBody = await res.body.text();
-        this.pool.releaseAccount(account.id, { code: res.statusCode, message: errBody });
-        throw new Error(`Google Upstream returned HTTP ${res.statusCode}: ${errBody}`);
+        this.pool.releaseAccount(account.id);
+        if (isContextOverflow(res.statusCode, errBody)) {
+          throw new ContextOverflowError(res.statusCode, errBody);
+        }
+        throw new UpstreamRequestError(res.statusCode, errBody);
 
       } catch (err: any) {
+        // 协议错误已完成账号释放，不允许被 catch 当成网络异常后再换号。
+        if (err instanceof UpstreamRequestError) {
+          throw err;
+        }
         // 网络层异常（如 Connect Timeout、Socket 掉线等），自动换号继续尝试，不立即中断
         console.error(`[Executor] Network or connection error for account ${account.email} (attempt ${attempt}/${maxRetries}):`, err.message);
         this.pool.releaseAccount(account.id, { code: 500, message: `Network error: ${err.message}` });

@@ -7,12 +7,13 @@ import { StringDecoder } from 'string_decoder';
 import { AppConfig, OpenAIChatCompletionRequest } from '../types.js';
 import { AccountPool } from '../pool/account-pool.js';
 import { TokenRefresher } from '../pool/refresher.js';
-import { RequestExecutor } from '../pool/breaker.js';
+import { ContextOverflowError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
 import { SUPPORTED_MODELS } from './models.js';
 import { convertOpenAIToCloudCode, createOpenAIChunk, extractTextFromGoogleChunk } from './adapter.js';
 import { registerAdminRoutes } from '../admin/routes.js';
 import { registerAnthropicRoutes } from './anthropic.js';
 import { QuotaManager } from '../pool/quota-manager.js';
+import { compactGoogleContents, compactSystemInstruction } from './context-compactor.js';
 
 export async function createServer(
   config: AppConfig,
@@ -263,9 +264,41 @@ export async function createServer(
     try {
       upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey);
     } catch (err: any) {
-      return reply.status(503).send({
-        error: { message: `Antigravity upstream unavailable: ${err.message}`, type: 'api_error' }
-      });
+      if (err instanceof ContextOverflowError) {
+        const compactedContents = compactGoogleContents(payload.request.contents);
+        if (!compactedContents) {
+          return reply.status(400).send({
+            error: { message: 'Request context exceeds the upstream 1,048,576-token limit and contains no compactable message content.', type: 'invalid_request_error' }
+          });
+        }
+        try {
+          payload.request.contents = compactedContents;
+          payload.request.systemInstruction = compactSystemInstruction(payload.request.systemInstruction);
+          console.warn(`[Gateway] Google context overflow confirmed; retrying OpenAI request with compacted history (${compactedContents.length} contents).`);
+          upstreamRes = await executor.executeWithRetry(payload, 1, undefined);
+        } catch (retryErr: any) {
+          const retryStatus = retryErr instanceof UpstreamRequestError ? retryErr.statusCode : 503;
+          return reply.status(retryStatus).send({
+            error: {
+              message: retryErr instanceof ContextOverflowError
+                ? 'Request context exceeds the upstream 1,048,576-token limit even after automatic history compaction. Reduce the latest message or tool result.'
+                : retryErr.message,
+              type: retryStatus === 400 ? 'invalid_request_error' : 'api_error'
+            }
+          });
+        }
+      }
+      // A successful compaction retry sets upstreamRes. Continue into the normal
+      // response streaming path instead of returning the original overflow error.
+      if (!upstreamRes) {
+        const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
+        const message = err instanceof ContextOverflowError
+          ? 'Request context exceeds the upstream 1,048,576-token limit. Reduce the request history and retry.'
+          : `Antigravity upstream unavailable: ${err.message}`;
+        return reply.status(statusCode).send({
+          error: { message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' }
+        });
+      }
     }
 
     const { bodyStream, accountUsed } = upstreamRes;

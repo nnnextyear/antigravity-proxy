@@ -3,8 +3,9 @@ import { StringDecoder } from 'string_decoder';
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { AppConfig, GoogleCloudCodePayload, GoogleContent } from '../types.js';
 import { AccountPool } from '../pool/account-pool.js';
-import { RequestExecutor } from '../pool/breaker.js';
+import { ContextOverflowError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
 import { resolveDynamicUpstreamModel, ThinkingEffort } from './models.js';
+import { compactGoogleContents, compactSystemInstruction, compactTools } from './context-compactor.js';
 
 interface AnthropicMessageParam {
   role: 'user' | 'assistant';
@@ -422,10 +423,48 @@ export function registerAnthropicRoutes(
     try {
       upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey);
     } catch (err: any) {
-      return reply.status(503).send({
-        type: 'error',
-        error: { type: 'api_error', message: `Antigravity upstream unavailable: ${err.message}` }
-      });
+      if (err instanceof ContextOverflowError) {
+        const compactedContents = compactGoogleContents(contents);
+        if (!compactedContents) {
+          return reply.status(400).send({
+            type: 'error',
+            error: { type: 'invalid_request_error', message: 'Request context exceeds the upstream 1,048,576-token limit and contains no compactable message content.' }
+          });
+        }
+        try {
+          // The original request is never changed. Retry only after Google confirms overflow.
+          payload.request.contents = compactedContents;
+          payload.request.systemInstruction = compactSystemInstruction(payload.request.systemInstruction);
+          payload.request.tools = compactTools(payload.request.tools);
+          console.warn(`[AnthropicGateway] Google context overflow confirmed; retrying with compacted history and tool schemas (${contents.length} -> ${compactedContents.length} contents).`);
+          upstreamRes = await executor.executeWithRetry(payload, 1, undefined);
+        } catch (retryErr: any) {
+          if (retryErr instanceof ContextOverflowError) {
+            return reply.status(400).send({
+              type: 'error',
+              error: { type: 'invalid_request_error', message: 'Request context exceeds the upstream 1,048,576-token limit even after automatic history compaction. Split the latest message or tool result into smaller requests.' }
+            });
+          }
+          return reply.status(retryErr instanceof UpstreamRequestError ? retryErr.statusCode : 503).send({
+            type: 'error',
+            error: { type: retryErr instanceof UpstreamRequestError ? 'invalid_request_error' : 'api_error', message: retryErr.message }
+          });
+        }
+      }
+      // A successful compaction retry sets upstreamRes. Continue into the normal
+      // response streaming path instead of returning the original overflow error.
+      if (!upstreamRes) {
+        const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
+        const message = err instanceof ContextOverflowError
+          ? 'Request context exceeds the upstream 1,048,576-token limit. Reduce the request history and retry.'
+          : err instanceof UpstreamRequestError
+            ? err.message
+            : `Antigravity upstream unavailable: ${err.message}`;
+        return reply.status(statusCode).send({
+          type: 'error',
+          error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message }
+        });
+      }
     }
 
     const { bodyStream, accountUsed } = upstreamRes;
@@ -457,14 +496,13 @@ export function registerAnthropicRoutes(
             model: body.model,
             stop_reason: null,
             stop_sequence: null,
-            usage: { input_tokens: 10, output_tokens: 0 }
+          usage: { input_tokens: 0, output_tokens: 0 }
           }
         };
         reply.raw.write(`event: message_start\ndata: ${JSON.stringify(startMsg)}\n\n`);
 
         let buffer = '';
         const decoder = new StringDecoder('utf-8');
-        let totalOutputTokens = 0;
         let currentBlockIndex = 0;
         let isTextBlockOpen = false;
         let textBlockStarted = false;
@@ -498,7 +536,6 @@ export function registerAnthropicRoutes(
                 textBlockStarted = true;
               }
 
-              totalOutputTokens += Math.ceil(text.length / 4);
               reply.raw.write(`event: content_block_delta\ndata: ${JSON.stringify({
                 type: 'content_block_delta',
                 index: currentBlockIndex,
@@ -553,7 +590,6 @@ export function registerAnthropicRoutes(
                   index: toolBlockIndex
                 })}\n\n`);
 
-                totalOutputTokens += Math.ceil(argsJson.length / 4);
               }
             }
           }
@@ -588,7 +624,7 @@ export function registerAnthropicRoutes(
             stop_reason: hasToolUse ? 'tool_use' : 'end_turn',
             stop_sequence: null
           },
-          usage: { output_tokens: Math.max(1, totalOutputTokens) }
+          usage: { output_tokens: lastUsageMetadata?.candidatesTokenCount ?? 0 }
         };
         reply.raw.write(`event: message_delta\ndata: ${JSON.stringify(msgDelta)}\n\n`);
 
@@ -596,15 +632,7 @@ export function registerAnthropicRoutes(
         reply.raw.write(`event: message_stop\ndata: {"type":"message_stop"}\n\n`);
         reply.raw.end();
 
-        if (lastUsageMetadata) {
-          pool.recordTokenUsage(lastUsageMetadata);
-        } else {
-          pool.recordTokenUsage({
-            promptTokenCount: 10,
-            candidatesTokenCount: totalOutputTokens,
-            totalTokenCount: 10 + totalOutputTokens
-          });
-        }
+        if (lastUsageMetadata) pool.recordTokenUsage(lastUsageMetadata);
       } catch (err: any) {
         console.error('[AnthropicGateway] Stream error:', err.message);
       } finally {
@@ -654,16 +682,7 @@ export function registerAnthropicRoutes(
 
         pool.releaseAccount(accountUsed.id);
 
-        const outTokens = Math.ceil((fullText.length + JSON.stringify(contentParts).length) / 4);
-        if (lastUsageMetadata) {
-          pool.recordTokenUsage(lastUsageMetadata);
-        } else {
-          pool.recordTokenUsage({
-            promptTokenCount: 10,
-            candidatesTokenCount: outTokens,
-            totalTokenCount: 10 + outTokens
-          });
-        }
+        if (lastUsageMetadata) pool.recordTokenUsage(lastUsageMetadata);
 
         if (fullText) {
           contentParts.unshift({ type: 'text', text: fullText });
@@ -682,8 +701,8 @@ export function registerAnthropicRoutes(
           stop_reason: hasToolUse ? 'tool_use' : 'end_turn',
           stop_sequence: null,
           usage: {
-            input_tokens: 10,
-            output_tokens: Math.ceil((fullText.length + JSON.stringify(contentParts).length) / 4)
+            input_tokens: lastUsageMetadata?.promptTokenCount ?? 0,
+            output_tokens: lastUsageMetadata?.candidatesTokenCount ?? 0
           }
         });
       } catch (err: any) {

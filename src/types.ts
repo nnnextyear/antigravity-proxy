@@ -112,7 +112,10 @@ export interface GoogleCloudCodePayload {
       temperature?: number;
       topP?: number;
       maxOutputTokens?: number;
+      thinkingConfig?: Record<string, unknown>;
     };
+    tools?: any[];
+    toolConfig?: Record<string, unknown>;
   };
 }
 
