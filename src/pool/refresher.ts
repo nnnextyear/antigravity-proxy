@@ -74,7 +74,10 @@ export class TokenRefresher {
           console.log(`[TokenRefresher] Refreshing token for account: ${acc.email} (${acc.id})...`);
         }
         const effectiveProxy = acc.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-        const dispatcher = effectiveProxy ? new ProxyAgent(effectiveProxy) : undefined;
+        const dispatcher = effectiveProxy ? new ProxyAgent({
+          uri: effectiveProxy,
+          connect: { timeout: 30000 }
+        }) : undefined;
 
         const res = await request(GOOGLE_TOKEN_ENDPOINT, {
           method: 'POST',
@@ -82,8 +85,8 @@ export class TokenRefresher {
             'Content-Type': 'application/x-www-form-urlencoded'
           },
           body: bodyParams.toString(),
-          headersTimeout: 15000,
-          bodyTimeout: 15000,
+          headersTimeout: 30000,
+          bodyTimeout: 30000,
           dispatcher
         });
 

@@ -83,7 +83,12 @@ export class RequestExecutor {
 
       try {
         const effectiveProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-        const dispatcher = effectiveProxy ? new ProxyAgent(effectiveProxy) : undefined;
+        const dispatcher = effectiveProxy ? new ProxyAgent({
+          uri: effectiveProxy,
+          connect: {
+            timeout: 60000 // 放宽底层 TCP/TLS 握手及代理建连超时至 60 秒，完美承载几兆的大 Prompt 上下文
+          }
+        }) : undefined;
         const upstreamHeaders: Record<string, string> = {
           'Authorization': `Bearer ${account.accessToken}`,
           'Content-Type': 'application/json',
@@ -166,9 +171,9 @@ export class RequestExecutor {
         throw new Error(`Google Upstream returned HTTP ${res.statusCode}: ${errBody}`);
 
       } catch (err: any) {
-        // 网络层异常
-        console.error(`[Executor] Network or connection error for account ${account.email}:`, err.message);
-        this.pool.releaseAccount(account.id, { code: 500, message: err.message });
+        // 网络层异常（如 Connect Timeout、Socket 掉线等），自动换号继续尝试，不立即中断
+        console.error(`[Executor] Network or connection error for account ${account.email} (attempt ${attempt}/${maxRetries}):`, err.message);
+        this.pool.releaseAccount(account.id, { code: 500, message: `Network error: ${err.message}` });
         if (attempt === maxRetries) {
           throw err;
         }

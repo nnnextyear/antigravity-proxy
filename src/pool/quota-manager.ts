@@ -18,7 +18,10 @@ export class QuotaManager {
 
     try {
       const effectiveProxy = account.proxyUrl || this.config?.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-      const dispatcher = effectiveProxy ? new ProxyAgent(effectiveProxy) : undefined;
+      const dispatcher = effectiveProxy ? new ProxyAgent({
+        uri: effectiveProxy,
+        connect: { timeout: 30000 }
+      }) : undefined;
     let res: any;
 
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -32,8 +35,8 @@ export class QuotaManager {
             'x-goog-api-client': 'gl-node/22.7.0 grpc-web/1.0.0'
           },
           body: JSON.stringify({ project: 'aicode-consumers' }),
-          headersTimeout: 15000,
-          bodyTimeout: 15000,
+          headersTimeout: 30000,
+          bodyTimeout: 30000,
           dispatcher
         });
         break;
