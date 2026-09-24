@@ -13,6 +13,9 @@ export class AccountPool {
   private totalRequestsServed = 0;
   private totalPromptTokens = 0;
   private totalCompletionTokens = 0;
+  private totalCachedTokens = 0;
+  private totalCacheCreationTokens = 0;
+  private totalCacheReadTokens = 0;
   private totalTokens = 0;
   private hasTokenUsage = false;
   private isInternalSaving = false;
@@ -477,6 +480,9 @@ export class AccountPool {
       totalRequestsServed: this.totalRequestsServed,
       totalPromptTokens: this.totalPromptTokens,
       totalCompletionTokens: this.totalCompletionTokens,
+      totalCachedTokens: this.totalCachedTokens,
+      totalCacheCreationTokens: this.totalCacheCreationTokens,
+      totalCacheReadTokens: this.totalCacheReadTokens,
       totalTokens: this.totalTokens,
       hasTokenUsage: this.hasTokenUsage,
       uptimeSeconds: Math.floor((now - this.startTime) / 1000),
@@ -484,13 +490,32 @@ export class AccountPool {
     };
   }
 
-  public recordTokenUsage(usage: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number }): void {
-    const prompt = Number(usage.promptTokenCount);
-    const completion = Number(usage.candidatesTokenCount);
-    const total = Number(usage.totalTokenCount);
-    if (![prompt, completion, total].every(Number.isFinite)) return;
+  public recordTokenUsage(usage: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+    cachedContentTokenCount?: number;
+    cacheReadInputTokenCount?: number;
+    cacheCreationInputTokenCount?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  }): void {
+    const readNumber = (...values: unknown[]) => {
+      const value = values.map(Number).find(Number.isFinite);
+      return value ?? 0;
+    };
+    const prompt = readNumber(usage.promptTokenCount);
+    const completion = readNumber(usage.candidatesTokenCount);
+    const total = readNumber(usage.totalTokenCount) || prompt + completion;
+    const cacheRead = readNumber(usage.cachedContentTokenCount, usage.cacheReadInputTokenCount, usage.cache_read_input_tokens);
+    const cacheCreation = readNumber(usage.cacheCreationInputTokenCount, usage.cache_creation_input_tokens);
+    const hasAnyUsage = [usage.promptTokenCount, usage.candidatesTokenCount, usage.totalTokenCount, usage.cachedContentTokenCount, usage.cacheReadInputTokenCount, usage.cacheCreationInputTokenCount, usage.cache_read_input_tokens, usage.cache_creation_input_tokens].some(value => Number.isFinite(Number(value)));
+    if (!hasAnyUsage) return;
     this.totalPromptTokens += prompt;
     this.totalCompletionTokens += completion;
+    this.totalCachedTokens += cacheRead;
+    this.totalCacheReadTokens += cacheRead;
+    this.totalCacheCreationTokens += cacheCreation;
     this.totalTokens += total;
     this.hasTokenUsage = true;
   }

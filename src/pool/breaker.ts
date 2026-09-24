@@ -12,6 +12,11 @@ export interface UpstreamExecutionResult {
   accountUsed: Account;
 }
 
+export interface UpstreamTokenCountResult {
+  totalTokens: number;
+  accountUsed: Account;
+}
+
 /** An upstream response that must be returned to the client, never retried on another account. */
 export class UpstreamRequestError extends Error {
   constructor(
@@ -45,6 +50,79 @@ export class RequestExecutor {
     private config: AppConfig,
     private quotaManager?: QuotaManager
   ) {}
+
+  /** Uses Google's countTokens endpoint so Claude Code can run its own compaction logic. */
+  public async countTokens(
+    payload: GoogleCloudCodePayload,
+    maxRetries = 3,
+    sessionKey?: string
+  ): Promise<UpstreamTokenCountResult> {
+    const triedAccountIds = new Set<string>();
+    const model = (payload.model || '').toLowerCase();
+    const family: 'claude' | 'gemini' = (model.includes('claude') || model.includes('opus') || model.includes('sonnet') || model.includes('gpt') || model.includes('oss'))
+      ? 'claude'
+      : 'gemini';
+    const countUrl = this.config.upstreamUrl
+      .replace(/streamGenerateContent/i, 'countTokens')
+      .replace(/[?&]alt=sse\b/i, '')
+      .replace(/[?&]$/, '');
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const account = this.pool.acquireAccount(triedAccountIds, family, sessionKey);
+      if (!account) throw new Error(`No available ${family} account for token counting.`);
+      triedAccountIds.add(account.id);
+
+      if (!account.accessToken || Date.now() >= account.accessTokenExpiresAt) {
+        const ok = await this.refresher.refreshSingleAccount(account);
+        if (!ok) {
+          this.pool.releaseAccount(account.id, { code: 401, message: 'Token refresh failed during countTokens' }, family);
+          continue;
+        }
+      }
+
+      try {
+        const effectiveProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+        const dispatcher = effectiveProxy ? new ProxyAgent({ uri: effectiveProxy, connect: { timeout: 60000 } }) : undefined;
+        const res = await request(countUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${account.accessToken}`,
+            'Content-Type': 'application/json',
+            'User-Agent': 'antigravity/2.14.0',
+            'x-goog-api-client': 'gl-node/22.7.0 grpc-web/1.0.0'
+          },
+          // countTokens accepts the request envelope, without Cloud Code's
+          // project/model wrapper fields.
+          body: JSON.stringify({ request: payload.request }),
+          headersTimeout: 120000,
+          bodyTimeout: 120000,
+          dispatcher
+        });
+        const body = await res.body.text();
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          const parsed = JSON.parse(body);
+          const totalTokens = Number(
+            parsed.totalTokens ?? parsed.total_tokens ?? parsed.promptTokenCount ?? parsed.usageMetadata?.promptTokenCount
+          );
+          if (Number.isFinite(totalTokens)) {
+            this.pool.releaseAccount(account.id);
+            return { totalTokens, accountUsed: account };
+          }
+          throw new Error(`countTokens response did not include totalTokens: ${body.slice(0, 300)}`);
+        }
+        this.pool.releaseAccount(account.id);
+        if (res.statusCode >= 400 && res.statusCode < 500) {
+          throw new UpstreamRequestError(res.statusCode, body);
+        }
+        throw new Error(`countTokens upstream HTTP ${res.statusCode}: ${body}`);
+      } catch (err: any) {
+        if (err instanceof UpstreamRequestError) throw err;
+        this.pool.releaseAccount(account.id, { code: 500, message: `countTokens network error: ${err.message}` }, family);
+        if (attempt === maxRetries) throw err;
+      }
+    }
+    throw new Error('Failed to count tokens after retries.');
+  }
 
   /**
    * 携带重试与熔断的执行器 (支持模型族群额度感知与智能无感换号)

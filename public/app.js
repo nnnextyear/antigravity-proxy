@@ -38,6 +38,11 @@ const statDead = document.getElementById('stat-dead');
 const statConcurrency = document.getElementById('stat-concurrency');
 const statRequests = document.getElementById('stat-requests');
 const statTokens = document.getElementById('stat-tokens');
+const statTokensTotal = document.getElementById('stat-tokens-total');
+const statTokensInput = document.getElementById('stat-tokens-input');
+const statTokensOutput = document.getElementById('stat-tokens-output');
+const statTokensCacheRead = document.getElementById('stat-tokens-cache-read');
+const statTokensCacheWrite = document.getElementById('stat-tokens-cache-write');
 const statClaude5h = document.getElementById('stat-claude-5h');
 const statClaudeWeekly = document.getElementById('stat-claude-weekly');
 const statClaudeWeeklyBar = document.getElementById('stat-claude-weekly-bar');
@@ -360,13 +365,15 @@ async function loadAllData() {
     if (statTokens) {
       if (stats.hasTokenUsage) {
         statTokens.innerText = formatTokenCount(stats.totalTokens);
-      } else if (stats.totalRequestsServed > 0) {
-        // 请求已发生但尚未收到上游 usage 细则时，给出平滑估算 (~1.5k/次)
-        statTokens.innerText = formatTokenCount(stats.totalRequestsServed * 1500);
       } else {
-        statTokens.innerText = '0';
+        statTokens.innerText = '--';
       }
     }
+    if (statTokensTotal) statTokensTotal.innerText = stats.hasTokenUsage ? formatTokenCount(stats.totalTokens) : '--';
+    if (statTokensInput) statTokensInput.innerText = stats.hasTokenUsage ? formatTokenCount(stats.totalPromptTokens) : '--';
+    if (statTokensOutput) statTokensOutput.innerText = stats.hasTokenUsage ? formatTokenCount(stats.totalCompletionTokens) : '--';
+    if (statTokensCacheRead) statTokensCacheRead.innerText = stats.hasTokenUsage ? formatTokenCount(stats.totalCacheReadTokens ?? stats.totalCachedTokens) : '--';
+    if (statTokensCacheWrite) statTokensCacheWrite.innerText = stats.hasTokenUsage ? formatTokenCount(stats.totalCacheCreationTokens) : '--';
 
     const badgeTextEl = document.getElementById('stat-active-badge-text');
     if (badgeTextEl) badgeTextEl.innerText = `${stats.activeAccounts} 活跃`;

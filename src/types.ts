@@ -128,6 +128,9 @@ export interface PoolStats {
   totalRequestsServed: number;
   totalPromptTokens: number;
   totalCompletionTokens: number;
+  totalCachedTokens: number;
+  totalCacheCreationTokens: number;
+  totalCacheReadTokens: number;
   totalTokens: number;
   hasTokenUsage: boolean;
   uptimeSeconds: number;

@@ -35,7 +35,16 @@ interface GoogleParsedChunk {
     args: any;
   }>;
   finishReason?: string | null;
-  usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+    cachedContentTokenCount?: number;
+    cacheReadInputTokenCount?: number;
+    cacheCreationInputTokenCount?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  };
 }
 
 // 工具名称规范化：Google/Claude 严格要求 tool name 符合 ^[a-zA-Z0-9_-]{1,128}$
@@ -297,6 +306,43 @@ export function registerAnthropicRoutes(
   executor: RequestExecutor,
   verifyAuth: (req: FastifyRequest, reply: FastifyReply) => void
 ) {
+  // Claude Code calls this before /messages to decide when its own native
+  // compaction should run. Return Google's real count instead of estimating.
+  const handleAnthropicCountTokens = async (req: FastifyRequest, reply: FastifyReply) => {
+    verifyAuth(req, reply);
+    if (reply.sent) return;
+    const body = req.body as AnthropicMessageRequest;
+    if (!body || !Array.isArray(body.messages)) {
+      return reply.status(400).send({ type: 'error', error: { type: 'invalid_request_error', message: 'messages is required and must be an array' } });
+    }
+
+    const modelDef = resolveDynamicUpstreamModel(body.model || 'claude-sonnet-4-6', 'high');
+    const converted = convertAnthropicMessages(body.messages, modelDef.upstreamModel.startsWith('gemini'));
+    const systemTexts = [...converted.systemFromMessages];
+    if (body.system) {
+      systemTexts.push(typeof body.system === 'string'
+        ? body.system
+        : body.system.map((part: any) => typeof part === 'string' ? part : part.text || '').join('\n'));
+    }
+    const request: any = { contents: converted.contents };
+    if (systemTexts.length) request.systemInstruction = { parts: [{ text: systemTexts.join('\n\n') }] };
+    if (Array.isArray(body.tools) && body.tools.length) {
+      request.tools = [{ functionDeclarations: body.tools.map((tool: any) => ({
+        name: sanitizeToolName(tool.name),
+        description: tool.description || '',
+        parameters: sanitizeGoogleSchema(tool.input_schema || tool.parameters || { type: 'object', properties: {} })
+      })) }];
+    }
+
+    try {
+      const counted = await executor.countTokens({ project: 'aicode-consumers', model: modelDef.upstreamModel, request }, 3);
+      return reply.send({ input_tokens: counted.totalTokens });
+    } catch (err: any) {
+      const statusCode = err.statusCode && err.statusCode >= 400 && err.statusCode < 500 ? err.statusCode : 503;
+      return reply.status(statusCode).send({ type: 'error', error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message: `Unable to count request tokens: ${err.message}` } });
+    }
+  };
+
   const handleAnthropicMessages = async (req: FastifyRequest, reply: FastifyReply) => {
     verifyAuth(req, reply);
     if (reply.sent) return;
@@ -496,7 +542,7 @@ export function registerAnthropicRoutes(
             model: body.model,
             stop_reason: null,
             stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 }
+            usage: { input_tokens: 0, output_tokens: 0 }
           }
         };
         reply.raw.write(`event: message_start\ndata: ${JSON.stringify(startMsg)}\n\n`);
@@ -624,7 +670,13 @@ export function registerAnthropicRoutes(
             stop_reason: hasToolUse ? 'tool_use' : 'end_turn',
             stop_sequence: null
           },
-          usage: { output_tokens: lastUsageMetadata?.candidatesTokenCount ?? 0 }
+          // Google only emits usageMetadata in the terminal stream chunk. Include the
+          // real prompt count here so clients that update usage at message_delta time
+          // can adjust their own automatic compaction threshold.
+          usage: {
+            input_tokens: lastUsageMetadata?.promptTokenCount ?? 0,
+            output_tokens: lastUsageMetadata?.candidatesTokenCount ?? 0
+          }
         };
         reply.raw.write(`event: message_delta\ndata: ${JSON.stringify(msgDelta)}\n\n`);
 
@@ -719,4 +771,7 @@ export function registerAnthropicRoutes(
   app.post('/v1/messages', handleAnthropicMessages);
   app.post('/messages', handleAnthropicMessages);
   app.post('/v1/v1/messages', handleAnthropicMessages);
+  app.post('/v1/messages/count_tokens', handleAnthropicCountTokens);
+  app.post('/messages/count_tokens', handleAnthropicCountTokens);
+  app.post('/v1/v1/messages/count_tokens', handleAnthropicCountTokens);
 }

@@ -142,7 +142,16 @@ export function createOpenAIChunk(
 export function extractTextFromGoogleChunk(rawJson: string): {
   text: string;
   finishReason?: string | null;
-  usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+    cachedContentTokenCount?: number;
+    cacheReadInputTokenCount?: number;
+    cacheCreationInputTokenCount?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  };
 } {
   try {
     const parsed = JSON.parse(rawJson);
