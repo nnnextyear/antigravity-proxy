@@ -335,7 +335,14 @@ export function registerAnthropicRoutes(
     }
 
     try {
-      const counted = await executor.countTokens({ project: 'aicode-consumers', model: modelDef.upstreamModel, request }, 3);
+      const headerSession = (req.headers['x-session-id'] || req.headers['session-id'] || req.headers['conversation-id'] || (body as any).metadata?.user_id) as string | undefined;
+      let sessionKey = headerSession;
+      if (!sessionKey && body.messages.length > 0) {
+        const firstUser = body.messages.find(m => m.role === 'user');
+        const userKey = typeof firstUser?.content === 'string' ? firstUser.content : JSON.stringify(firstUser?.content || '');
+        sessionKey = crypto.createHash('md5').update(`anthropic_${userKey.substring(0, 200)}`).digest('hex');
+      }
+      const counted = await executor.countTokens({ project: 'aicode-consumers', model: modelDef.upstreamModel, request }, 3, sessionKey);
       return reply.send({ input_tokens: counted.totalTokens });
     } catch (err: any) {
       const statusCode = err.statusCode && err.statusCode >= 400 && err.statusCode < 500 ? err.statusCode : 503;
@@ -483,7 +490,7 @@ export function registerAnthropicRoutes(
           payload.request.systemInstruction = compactSystemInstruction(payload.request.systemInstruction);
           payload.request.tools = compactTools(payload.request.tools);
           console.warn(`[AnthropicGateway] Google context overflow confirmed; retrying with compacted history and tool schemas (${contents.length} -> ${compactedContents.length} contents).`);
-          upstreamRes = await executor.executeWithRetry(payload, 1, undefined);
+          upstreamRes = await executor.executeWithRetry(payload, 1, sessionKey);
         } catch (retryErr: any) {
           if (retryErr instanceof ContextOverflowError) {
             return reply.status(400).send({

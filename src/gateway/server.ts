@@ -275,7 +275,7 @@ export async function createServer(
           payload.request.contents = compactedContents;
           payload.request.systemInstruction = compactSystemInstruction(payload.request.systemInstruction);
           console.warn(`[Gateway] Google context overflow confirmed; retrying OpenAI request with compacted history (${compactedContents.length} contents).`);
-          upstreamRes = await executor.executeWithRetry(payload, 1, undefined);
+          upstreamRes = await executor.executeWithRetry(payload, 1, sessionKey);
         } catch (retryErr: any) {
           const retryStatus = retryErr instanceof UpstreamRequestError ? retryErr.statusCode : 503;
           return reply.status(retryStatus).send({
