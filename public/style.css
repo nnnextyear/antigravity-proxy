@@ -1120,7 +1120,7 @@ body {
 
 .token-stat-inline {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 12px;
   margin-top: 9px;
   padding-top: 9px;

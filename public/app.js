@@ -43,6 +43,7 @@ const statTokensInput = document.getElementById('stat-tokens-input');
 const statTokensOutput = document.getElementById('stat-tokens-output');
 const statTokensCacheRead = document.getElementById('stat-tokens-cache-read');
 const statTokensCacheWrite = document.getElementById('stat-tokens-cache-write');
+const statTokensCacheHit = document.getElementById('stat-tokens-cache-hit');
 const statClaude5h = document.getElementById('stat-claude-5h');
 const statClaudeWeekly = document.getElementById('stat-claude-weekly');
 const statClaudeWeeklyBar = document.getElementById('stat-claude-weekly-bar');
@@ -372,8 +373,14 @@ async function loadAllData() {
     if (statTokensTotal) statTokensTotal.innerText = stats.hasTokenUsage ? formatTokenCount(stats.totalTokens) : '--';
     if (statTokensInput) statTokensInput.innerText = stats.hasTokenUsage ? formatTokenCount(stats.totalPromptTokens) : '--';
     if (statTokensOutput) statTokensOutput.innerText = stats.hasTokenUsage ? formatTokenCount(stats.totalCompletionTokens) : '--';
-    if (statTokensCacheRead) statTokensCacheRead.innerText = stats.hasTokenUsage ? formatTokenCount(stats.totalCacheReadTokens ?? stats.totalCachedTokens) : '--';
+    const cacheReadTokens = Number(stats.totalCacheReadTokens ?? stats.totalCachedTokens);
+    const promptTokens = Number(stats.totalPromptTokens);
+    const cacheHitRate = stats.hasTokenUsage && promptTokens > 0 && Number.isFinite(cacheReadTokens)
+      ? `${Math.min(100, Math.max(0, cacheReadTokens / promptTokens * 100)).toFixed(1)}%`
+      : '--';
+    if (statTokensCacheRead) statTokensCacheRead.innerText = stats.hasTokenUsage ? formatTokenCount(cacheReadTokens) : '--';
     if (statTokensCacheWrite) statTokensCacheWrite.innerText = stats.hasTokenUsage ? formatTokenCount(stats.totalCacheCreationTokens) : '--';
+    if (statTokensCacheHit) statTokensCacheHit.innerText = cacheHitRate;
 
     const badgeTextEl = document.getElementById('stat-active-badge-text');
     if (badgeTextEl) badgeTextEl.innerText = `${stats.activeAccounts} 活跃`;
