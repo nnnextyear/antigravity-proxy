@@ -83,38 +83,52 @@ export class RequestExecutor {
       try {
         const effectiveProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
         const dispatcher = effectiveProxy ? new ProxyAgent({ uri: effectiveProxy, connect: { timeout: 60000 } }) : undefined;
-        const res = await request(countUrl, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${account.accessToken}`,
-            'Content-Type': 'application/json',
-            'User-Agent': 'antigravity/2.14.0',
-            'x-goog-api-client': 'gl-node/22.7.0 grpc-web/1.0.0'
-          },
-          // countTokens accepts the request envelope, without Cloud Code's
-          // project/model wrapper fields.
-          body: JSON.stringify({ request: payload.request }),
-          headersTimeout: 120000,
-          bodyTimeout: 120000,
-          dispatcher
-        });
-        const body = await res.body.text();
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          const parsed = JSON.parse(body);
-          const totalTokens = Number(
-            parsed.totalTokens ?? parsed.total_tokens ?? parsed.promptTokenCount ?? parsed.usageMetadata?.promptTokenCount
-          );
-          if (Number.isFinite(totalTokens)) {
-            this.pool.releaseAccount(account.id);
-            return { totalTokens, accountUsed: account };
+        // CloudCode deployments have used both envelopes over time. Count the
+        // exact generation payload first, then the bare request envelope as a
+        // compatibility fallback. Returning the larger successful result avoids
+        // silently under-counting wrappers/tools that one endpoint ignores.
+        const requestBodies = [JSON.stringify(payload), JSON.stringify({ request: payload.request })];
+        let countedTokens: number | undefined;
+        let lastFailure = '';
+        for (const requestBody of requestBodies) {
+          const res = await request(countUrl, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${account.accessToken}`,
+              'Content-Type': 'application/json',
+              'User-Agent': 'antigravity/2.14.0',
+              'x-goog-api-client': 'gl-node/22.7.0 grpc-web/1.0.0'
+            },
+            body: requestBody,
+            headersTimeout: 120000,
+            bodyTimeout: 120000,
+            dispatcher
+          });
+          const body = await res.body.text();
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            const parsed = JSON.parse(body);
+            const totalTokens = Number(
+              parsed.totalTokens ?? parsed.total_tokens ?? parsed.promptTokenCount ?? parsed.usageMetadata?.promptTokenCount
+            );
+            if (Number.isFinite(totalTokens)) {
+              countedTokens = Math.max(countedTokens ?? 0, totalTokens);
+              continue;
+            }
+            lastFailure = `countTokens response did not include totalTokens: ${body.slice(0, 300)}`;
+            continue;
           }
-          throw new Error(`countTokens response did not include totalTokens: ${body.slice(0, 300)}`);
+          lastFailure = `countTokens upstream HTTP ${res.statusCode}: ${body}`;
+          if (res.statusCode === 401 || res.statusCode === 403) {
+            this.pool.releaseAccount(account.id);
+            throw new UpstreamRequestError(res.statusCode, body);
+          }
+        }
+        if (countedTokens !== undefined) {
+          this.pool.releaseAccount(account.id);
+          return { totalTokens: countedTokens, accountUsed: account };
         }
         this.pool.releaseAccount(account.id);
-        if (res.statusCode >= 400 && res.statusCode < 500) {
-          throw new UpstreamRequestError(res.statusCode, body);
-        }
-        throw new Error(`countTokens upstream HTTP ${res.statusCode}: ${body}`);
+        throw new Error(lastFailure || 'countTokens request failed');
       } catch (err: any) {
         if (err instanceof UpstreamRequestError) throw err;
         this.pool.releaseAccount(account.id, { code: 500, message: `countTokens network error: ${err.message}` }, family);

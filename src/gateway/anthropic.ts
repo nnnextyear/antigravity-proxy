@@ -5,7 +5,6 @@ import { AppConfig, GoogleCloudCodePayload, GoogleContent } from '../types.js';
 import { AccountPool } from '../pool/account-pool.js';
 import { ContextOverflowError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
 import { resolveDynamicUpstreamModel, ThinkingEffort } from './models.js';
-import { compactGoogleContents, compactSystemInstruction, compactTools } from './context-compactor.js';
 
 interface AnthropicMessageParam {
   role: 'user' | 'assistant';
@@ -472,52 +471,37 @@ export function registerAnthropicRoutes(
       sessionKey = crypto.createHash('md5').update(`anthropic_${sysKey.substring(0, 200)}_${userKey.substring(0, 200)}`).digest('hex');
     }
 
+    // Anthropic clients use message_start.usage.input_tokens to decide when to
+    // run their native context compaction. Count the exact Google request before
+    // generation so custom endpoints get the same signal as api.anthropic.com.
+    let inputTokenCount = 0;
+    try {
+      const counted = await executor.countTokens(payload, 3, sessionKey);
+      inputTokenCount = counted.totalTokens;
+      console.info(`[AnthropicGateway] Preflight countTokens: ${inputTokenCount} input tokens (session ${sessionKey || 'none'})`);
+    } catch (countErr: any) {
+      console.warn(`[AnthropicGateway] Preflight countTokens unavailable; continuing with upstream generation: ${countErr.message}`);
+    }
+
     let upstreamRes: any;
     try {
       upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey);
     } catch (err: any) {
       if (err instanceof ContextOverflowError) {
-        const compactedContents = compactGoogleContents(contents);
-        if (!compactedContents) {
-          return reply.status(400).send({
-            type: 'error',
-            error: { type: 'invalid_request_error', message: 'Request context exceeds the upstream 1,048,576-token limit and contains no compactable message content.' }
-          });
-        }
-        try {
-          // The original request is never changed. Retry only after Google confirms overflow.
-          payload.request.contents = compactedContents;
-          payload.request.systemInstruction = compactSystemInstruction(payload.request.systemInstruction);
-          payload.request.tools = compactTools(payload.request.tools);
-          console.warn(`[AnthropicGateway] Google context overflow confirmed; retrying with compacted history and tool schemas (${contents.length} -> ${compactedContents.length} contents).`);
-          upstreamRes = await executor.executeWithRetry(payload, 1, sessionKey);
-        } catch (retryErr: any) {
-          if (retryErr instanceof ContextOverflowError) {
-            return reply.status(400).send({
-              type: 'error',
-              error: { type: 'invalid_request_error', message: 'Request context exceeds the upstream 1,048,576-token limit even after automatic history compaction. Split the latest message or tool result into smaller requests.' }
-            });
-          }
-          return reply.status(retryErr instanceof UpstreamRequestError ? retryErr.statusCode : 503).send({
-            type: 'error',
-            error: { type: retryErr instanceof UpstreamRequestError ? 'invalid_request_error' : 'api_error', message: retryErr.message }
-          });
-        }
-      }
-      // A successful compaction retry sets upstreamRes. Continue into the normal
-      // response streaming path instead of returning the original overflow error.
-      if (!upstreamRes) {
-        const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
-        const message = err instanceof ContextOverflowError
-          ? 'Request context exceeds the upstream 1,048,576-token limit. Reduce the request history and retry.'
-          : err instanceof UpstreamRequestError
-            ? err.message
-            : `Antigravity upstream unavailable: ${err.message}`;
-        return reply.status(statusCode).send({
+        // Claude Code owns conversation compaction. Never rewrite the history
+        // here: returning the native upstream error lets the client compact its
+        // local transcript and issue the next request with the compacted state.
+        return reply.status(400).send({
           type: 'error',
-          error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message }
+          error: { type: 'invalid_request_error', message: 'Request context exceeds the upstream limit. Claude Code must compact the conversation and retry.' }
         });
       }
+      const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
+      const message = err instanceof UpstreamRequestError ? err.message : `Antigravity upstream unavailable: ${err.message}`;
+      return reply.status(statusCode).send({
+        type: 'error',
+        error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message }
+      });
     }
 
     const { bodyStream, accountUsed } = upstreamRes;
@@ -549,7 +533,7 @@ export function registerAnthropicRoutes(
             model: body.model,
             stop_reason: null,
             stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 }
+            usage: { input_tokens: inputTokenCount, output_tokens: 0 }
           }
         };
         reply.raw.write(`event: message_start\ndata: ${JSON.stringify(startMsg)}\n\n`);
@@ -677,13 +661,7 @@ export function registerAnthropicRoutes(
             stop_reason: hasToolUse ? 'tool_use' : 'end_turn',
             stop_sequence: null
           },
-          // Google only emits usageMetadata in the terminal stream chunk. Include the
-          // real prompt count here so clients that update usage at message_delta time
-          // can adjust their own automatic compaction threshold.
-          usage: {
-            input_tokens: lastUsageMetadata?.promptTokenCount ?? 0,
-            output_tokens: lastUsageMetadata?.candidatesTokenCount ?? 0
-          }
+          usage: { output_tokens: lastUsageMetadata?.candidatesTokenCount ?? 0 }
         };
         reply.raw.write(`event: message_delta\ndata: ${JSON.stringify(msgDelta)}\n\n`);
 

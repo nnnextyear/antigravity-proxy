@@ -264,7 +264,27 @@ export class AccountPool {
           // 检查该粘性账号是否健康且配额没有到达警戒线 (< 3%)
           const isLowQuota = (requiredFamily === 'claude' && candidateAcc.quota && candidateAcc.quota.claude5hFraction < 0.03) ||
                              (requiredFamily === 'gemini' && candidateAcc.quota && candidateAcc.quota.gemini5hFraction < 0.03);
-          if (!isLowQuota) {
+          // Cache affinity is valuable, but it must yield to a materially more
+          // urgent reset. This prevents one recently-used account from being
+          // pinned for 15 minutes while another account's weekly/5h quota is
+          // about to expire and be discarded.
+          const family5h = requiredFamily === 'claude' ? candidateAcc.quota?.claudeResetTime : candidateAcc.quota?.geminiResetTime;
+          const familyWeekly = requiredFamily === 'claude' ? candidateAcc.quota?.claudeWeeklyResetTime : candidateAcc.quota?.geminiWeeklyResetTime;
+          const bound5h = family5h ? new Date(family5h).getTime() - now : Infinity;
+          const boundWeekly = familyWeekly ? new Date(familyWeekly).getTime() - now : Infinity;
+          const hasMoreUrgentCandidate = candidates.some(candidate => {
+            if (candidate.id === candidateAcc.id || !candidate.quota) return false;
+            const reset5h = requiredFamily === 'claude' ? candidate.quota.claudeResetTime : candidate.quota.geminiResetTime;
+            const resetWeekly = requiredFamily === 'claude' ? candidate.quota.claudeWeeklyResetTime : candidate.quota.geminiWeeklyResetTime;
+            const candidate5h = reset5h ? new Date(reset5h).getTime() - now : Infinity;
+            const candidateWeekly = resetWeekly ? new Date(resetWeekly).getTime() - now : Infinity;
+            const fraction = requiredFamily === 'claude' ? candidate.quota.claude5hFraction : candidate.quota.gemini5hFraction;
+            const imminent5h = candidate5h > 0 && candidate5h <= 45 * 60 * 1000 && fraction > 0.08;
+            const weeklyUrgency = candidateWeekly > 0 && candidateWeekly + 24 * 60 * 60 * 1000 < boundWeekly;
+            const fiveHourUrgency = candidate5h > 0 && candidate5h + 5 * 60 * 1000 < bound5h;
+            return imminent5h || weeklyUrgency || fiveHourUrgency;
+          });
+          if (!isLowQuota && !hasMoreUrgentCandidate) {
             sessionStickyAccount = candidateAcc;
           }
         }
@@ -335,17 +355,17 @@ export class AccountPool {
               }
             }
 
-            // 优先锁定当前主力号（最近有活跃使用 且 5h 剩余 > 5% 且并发未饱和）
-            const aIsActiveDrain = (now - a.lastUsedAt < 15 * 60 * 1000) && ((requiredFamily === 'claude' ? a.quota?.claude5hFraction : a.quota?.gemini5hFraction) ?? 1) > 0.05;
-            const bIsActiveDrain = (now - b.lastUsedAt < 15 * 60 * 1000) && ((requiredFamily === 'claude' ? b.quota?.claude5hFraction : b.quota?.gemini5hFraction) ?? 1) > 0.05;
-
-            if (aIsActiveDrain && !bIsActiveDrain) return -1;
-            if (bIsActiveDrain && !aIsActiveDrain) return 1;
-
-            // 多个同类候选时，优先并发小的
+            // 多个同类候选时，先按并发数均衡。主力号优先不能压过
+            // least-connections，否则第二个并发请求会继续锁在同一账号。
             if (a.activeConcurrency !== b.activeConcurrency) {
               return a.activeConcurrency - b.activeConcurrency;
             }
+
+            // 并发相同且额度状态相近时，再保留主力号的缓存粘性。
+            const aIsActiveDrain = (now - a.lastUsedAt < 15 * 60 * 1000) && ((requiredFamily === 'claude' ? a.quota?.claude5hFraction : a.quota?.gemini5hFraction) ?? 1) > 0.05;
+            const bIsActiveDrain = (now - b.lastUsedAt < 15 * 60 * 1000) && ((requiredFamily === 'claude' ? b.quota?.claude5hFraction : b.quota?.gemini5hFraction) ?? 1) > 0.05;
+            if (aIsActiveDrain && !bIsActiveDrain) return -1;
+            if (bIsActiveDrain && !aIsActiveDrain) return 1;
 
             // 5h 额度充裕的优先接棒
             const a5h = (requiredFamily === 'claude' ? a.quota?.claude5hFraction : a.quota?.gemini5hFraction) ?? 1;

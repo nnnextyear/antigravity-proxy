@@ -56,6 +56,12 @@ export interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string | any[];
   name?: string;
+  tool_call_id?: string;
+  tool_calls?: Array<{
+    id?: string;
+    type?: 'function';
+    function: { name: string; arguments: string };
+  }>;
 }
 
 export interface OpenAIChatCompletionRequest {
@@ -74,6 +80,11 @@ export interface OpenAIChatCompletionRequest {
   };
   thinking_budget?: number;
   thinkingBudget?: number;
+  tools?: Array<{ type: 'function'; function: { name: string; description?: string; parameters?: any } }>;
+  tool_choice?: any;
+  parallel_tool_calls?: boolean;
+  user?: string;
+  stream_options?: { include_usage?: boolean };
 }
 
 export interface OpenAIChatCompletionChunk {
@@ -86,6 +97,12 @@ export interface OpenAIChatCompletionChunk {
     delta: {
       role?: string;
       content?: string;
+      tool_calls?: Array<{
+        index: number;
+        id?: string;
+        type?: 'function';
+        function?: { name?: string; arguments?: string };
+      }>;
     };
     finish_reason: string | null;
   }[];
@@ -93,6 +110,9 @@ export interface OpenAIChatCompletionChunk {
 
 export interface GooglePart {
   text?: string;
+  functionCall?: { id?: string; name: string; args?: any };
+  functionResponse?: { id?: string; name: string; response: { output: string } };
+  thoughtSignature?: string;
 }
 
 export interface GoogleContent {

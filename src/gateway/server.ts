@@ -13,7 +13,6 @@ import { convertOpenAIToCloudCode, createOpenAIChunk, extractTextFromGoogleChunk
 import { registerAdminRoutes } from '../admin/routes.js';
 import { registerAnthropicRoutes } from './anthropic.js';
 import { QuotaManager } from '../pool/quota-manager.js';
-import { compactGoogleContents, compactSystemInstruction } from './context-compactor.js';
 
 export async function createServer(
   config: AppConfig,
@@ -37,8 +36,11 @@ export async function createServer(
   });
 
   // 请求日志
-  app.addHook('onRequest', async (req) => {
-    console.log(`[HTTP ${new Date().toLocaleTimeString()}] ${req.method} ${req.url}`);
+  app.addHook('onRequest', async (req, reply) => {
+    // Fastify assigns a stable request id; expose it to clients so upstream
+    // failures can be correlated across retries and account rotations.
+    reply.header('x-request-id', req.id);
+    console.log(`[HTTP ${new Date().toLocaleTimeString()}] [${req.id}] ${req.method} ${req.url}`);
   });
 
   // 允许空的 application/json 请求体，避免 Fastify 抛出 "Body cannot be empty"
@@ -121,9 +123,10 @@ export async function createServer(
 
   // ===================== OpenAI / CC Switch 模型查询路由 =====================
 
-  // GET /v1/models 以及 GET /models (支持 CC Switch 及各类第三方客户端无门槛发现模型列表)
+  // GET /v1/models 以及 GET /models (支持 CC Switch 及各类第三方客户端发现模型列表)
   const handleGetModels = async (req: FastifyRequest, reply: FastifyReply) => {
-    // 允许免密查询模型目录，提升客户端兼容性
+    verifyClientAuth(req, reply);
+    if (reply.sent) return;
     return {
       object: 'list',
       data: SUPPORTED_MODELS.map(m => ({
@@ -265,40 +268,15 @@ export async function createServer(
       upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey);
     } catch (err: any) {
       if (err instanceof ContextOverflowError) {
-        const compactedContents = compactGoogleContents(payload.request.contents);
-        if (!compactedContents) {
-          return reply.status(400).send({
-            error: { message: 'Request context exceeds the upstream 1,048,576-token limit and contains no compactable message content.', type: 'invalid_request_error' }
-          });
-        }
-        try {
-          payload.request.contents = compactedContents;
-          payload.request.systemInstruction = compactSystemInstruction(payload.request.systemInstruction);
-          console.warn(`[Gateway] Google context overflow confirmed; retrying OpenAI request with compacted history (${compactedContents.length} contents).`);
-          upstreamRes = await executor.executeWithRetry(payload, 1, sessionKey);
-        } catch (retryErr: any) {
-          const retryStatus = retryErr instanceof UpstreamRequestError ? retryErr.statusCode : 503;
-          return reply.status(retryStatus).send({
-            error: {
-              message: retryErr instanceof ContextOverflowError
-                ? 'Request context exceeds the upstream 1,048,576-token limit even after automatic history compaction. Reduce the latest message or tool result.'
-                : retryErr.message,
-              type: retryStatus === 400 ? 'invalid_request_error' : 'api_error'
-            }
-          });
-        }
-      }
-      // A successful compaction retry sets upstreamRes. Continue into the normal
-      // response streaming path instead of returning the original overflow error.
-      if (!upstreamRes) {
-        const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
-        const message = err instanceof ContextOverflowError
-          ? 'Request context exceeds the upstream 1,048,576-token limit. Reduce the request history and retry.'
-          : `Antigravity upstream unavailable: ${err.message}`;
-        return reply.status(statusCode).send({
-          error: { message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' }
+        return reply.status(400).send({
+          error: { message: 'Request context exceeds the upstream limit. The client must compact its conversation and retry.', type: 'invalid_request_error' }
         });
       }
+      const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
+      const message = err instanceof UpstreamRequestError ? err.message : `Antigravity upstream unavailable: ${err.message}`;
+      return reply.status(statusCode).send({
+        error: { message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' }
+      });
     }
 
     const { bodyStream, accountUsed } = upstreamRes;
@@ -313,6 +291,7 @@ export async function createServer(
       let buffer = '';
       const decoder = new StringDecoder('utf-8');
       let usageMetadata: any = null;
+      const toolCalls: Array<{ id?: string; name: string; arguments: string }> = [];
 
       let released = false;
       const cleanup = (err?: any) => {
@@ -337,14 +316,23 @@ export async function createServer(
             const jsonStr = trimmed.substring(5).trim();
             if (!jsonStr || jsonStr === '[DONE]') continue;
 
-            const { text, finishReason, usageMetadata: chunkUsage } = extractTextFromGoogleChunk(jsonStr);
+            const { text, functionCalls = [], finishReason, usageMetadata: chunkUsage } = extractTextFromGoogleChunk(jsonStr);
             if (chunkUsage) usageMetadata = chunkUsage;
             if (text) {
               const sseChunk = createOpenAIChunk(completionId, chatReq.model, text, null);
               reply.raw.write(sseChunk);
             }
+            for (const call of functionCalls) {
+              const toolCall = {
+                id: call.id || `call_${completionId}_${toolCalls.length}`,
+                name: call.name,
+                arguments: JSON.stringify(call.args || {})
+              };
+              toolCalls.push(toolCall);
+              reply.raw.write(createOpenAIChunk(completionId, chatReq.model, '', null, [{ index: toolCalls.length - 1, ...toolCall }]));
+            }
             if (finishReason) {
-              const sseChunk = createOpenAIChunk(completionId, chatReq.model, '', finishReason);
+              const sseChunk = createOpenAIChunk(completionId, chatReq.model, '', toolCalls.length ? 'tool_calls' : finishReason);
               reply.raw.write(sseChunk);
             }
           }
@@ -366,6 +354,7 @@ export async function createServer(
       let buffer = '';
       const decoder = new StringDecoder('utf-8');
       let usageMetadata: any = null;
+      const toolCalls: Array<{ id?: string; name: string; arguments: string }> = [];
 
       try {
         for await (const chunk of bodyStream) {
@@ -379,10 +368,17 @@ export async function createServer(
             const jsonStr = trimmed.substring(5).trim();
             if (!jsonStr || jsonStr === '[DONE]') continue;
 
-            const { text, usageMetadata: chunkUsage } = extractTextFromGoogleChunk(jsonStr);
+            const { text, functionCalls = [], usageMetadata: chunkUsage } = extractTextFromGoogleChunk(jsonStr);
             if (chunkUsage) usageMetadata = chunkUsage;
             if (text) {
               fullText += text;
+            }
+            for (const call of functionCalls) {
+              toolCalls.push({
+                id: call.id || `call_${completionId}_${toolCalls.length}`,
+                name: call.name,
+                arguments: JSON.stringify(call.args || {})
+              });
             }
           }
         }
@@ -401,9 +397,16 @@ export async function createServer(
               index: 0,
               message: {
                 role: 'assistant',
-                content: fullText
+                content: fullText || null,
+                ...(toolCalls.length ? {
+                  tool_calls: toolCalls.map(call => ({
+                    id: call.id,
+                    type: 'function' as const,
+                    function: { name: call.name, arguments: call.arguments }
+                  }))
+                } : {})
               },
-              finish_reason: 'stop'
+              finish_reason: toolCalls.length ? 'tool_calls' : 'stop'
             }
           ],
           usage: {
