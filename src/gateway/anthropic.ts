@@ -24,6 +24,10 @@ interface AnthropicMessageRequest {
   };
   tools?: any[];
   tool_choice?: any;
+  output_config?: {
+    effort?: string;
+    format?: { type: string; schema?: Record<string, unknown> };
+  };
 }
 
 interface GoogleParsedChunk {
@@ -391,6 +395,21 @@ export function registerAnthropicRoutes(
       generationConfig.thinkingConfig = {
         thinkingBudget: budgetTokens
       };
+    }
+
+    // Claude Code uses this for its built-in /goal Stop hook. The hook expects
+    // a JSON verdict; silently dropping the format makes it return prose and
+    // then fail JSON validation in the client.
+    const outputFormat = body.output_config?.format;
+    if (outputFormat) {
+      if (outputFormat.type !== 'json_schema' || !outputFormat.schema || typeof outputFormat.schema !== 'object' || Array.isArray(outputFormat.schema)) {
+        return reply.status(400).send({
+          type: 'error',
+          error: { type: 'invalid_request_error', message: 'Unsupported output_config.format; expected json_schema with an object schema' }
+        });
+      }
+      generationConfig.responseMimeType = 'application/json';
+      generationConfig.responseSchema = sanitizeGoogleSchema(outputFormat.schema);
     }
 
     const innerRequest: any = {
