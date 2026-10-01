@@ -39,6 +39,7 @@
    - **工具名双向映射**：自动转换带冒号的工具名（如 `default_api:Write` $\leftrightarrow$ `default_api_Write`），满足 Claude 严格正则命名规范。
 3. **⚡ 标准 OpenAI & Anthropic 双协议全兼容**
    - 完整支持 `POST /v1/chat/completions`（毫秒级 **SSE 流式**与非流式响应）。
+   - 支持 OpenAI Responses API `POST /v1/responses`，可直接用于新版 Codex。
    - 原生兼容 Anthropic `POST /v1/messages` 接口（Claude Code 官方通信协议）。
    - 完整支持 `GET /v1/models`，供 CC Switch、OneAPI 等客户端免密一键拉取模型列表。
 4. **🧠 纯净官方模型名 + 框架动态思考调控**
@@ -291,6 +292,7 @@ docker run -d \
 服务启动成功后：
 - 🌐 **Web 管理控制台**：`http://localhost:3000/admin` （默认密码：`admin123`）
 - 🔌 **OpenAI 兼容端点**：`http://localhost:3000/v1/chat/completions`
+- 🔌 **Responses API 端点**：`http://localhost:3000/v1/responses`（新版 Codex）
 - 📨 **Anthropic 兼容端点**：`http://localhost:3000/v1/messages`
 - 📋 **模型列表端点**：`http://localhost:3000/v1/models`
 - 🔑 **默认客户端 API Key**：`sk-antigravity`
@@ -394,6 +396,8 @@ claude
 - **Base URL**：`http://127.0.0.1:3000/v1`
 - **API Key**：`sk-antigravity`
 - **Model ID**：填写 `claude-3-7-sonnet` 或 `gemini-3.8-flash`
+
+新版 Codex 默认使用 Responses API，代理已原生兼容 `/v1/responses`，无需切换协议。
 
 ### 4. NextChat / Cherry Studio / OneAPI
 - **接口地址**：`http://127.0.0.1:3000/v1`

@@ -85,6 +85,10 @@ export interface OpenAIChatCompletionRequest {
   parallel_tool_calls?: boolean;
   user?: string;
   stream_options?: { include_usage?: boolean };
+  response_format?: {
+    type?: string;
+    json_schema?: { name?: string; description?: string; schema?: any; strict?: boolean };
+  };
 }
 
 export interface OpenAIChatCompletionChunk {

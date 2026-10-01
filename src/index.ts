@@ -36,6 +36,7 @@ async function main() {
     console.log(`   🔑 Default Admin Password: ${config.adminPassword}`);
     console.log(`\n📌 [OpenAI Compatible Endpoints]:`);
     console.log(`   👉 Chat Completions: http://localhost:${config.port}/v1/chat/completions`);
+    console.log(`   👉 Responses API:    http://localhost:${config.port}/v1/responses`);
     console.log(`   👉 Model List:       http://localhost:${config.port}/v1/models`);
     console.log(`   🔑 Client API Key:   ${config.apiMasterKey}`);
     console.log('\n====================================================\n');

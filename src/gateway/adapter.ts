@@ -52,6 +52,7 @@ export function convertOpenAIToCloudCode(req: OpenAIChatCompletionRequest): {
   }
 
   const modelDef = resolveDynamicUpstreamModel(req.model, effort);
+  const isGemini = modelDef.upstreamModel.startsWith('gemini');
   const contents: GoogleContent[] = [];
   let systemInstruction: { parts: { text: string }[] } | undefined = undefined;
   const toolCallIds = new Map<string, string>();
@@ -92,7 +93,16 @@ export function convertOpenAIToCloudCode(req: OpenAIChatCompletionRequest): {
         toolCallIds.set(id, name);
         let args: any = {};
         try { args = JSON.parse(call.function?.arguments || '{}'); } catch { args = { raw_arguments: call.function?.arguments || '' }; }
-        parts.push({ functionCall: { id, name, args } });
+        // Gemini 3.x rejects a functionCall in a later turn unless the part
+        // carries the thought signature from the original model response.
+        // OpenAI/Codex does not expose that field in its chat-shaped history,
+        // so retain a supplied signature when available and otherwise use the
+        // documented compatibility sentinel accepted by CloudCode.
+        const thoughtSignature = (call as any).thought_signature || (call as any).thoughtSignature;
+        parts.push({
+          functionCall: { id, name, args },
+          ...(isGemini ? { thoughtSignature: thoughtSignature || 'skip_thought_signature_validator' } : {})
+        });
       }
       contents.push({
         role: 'model',
@@ -124,13 +134,24 @@ export function convertOpenAIToCloudCode(req: OpenAIChatCompletionRequest): {
     });
   }
 
-  const isGemini = modelDef.upstreamModel.startsWith('gemini');
   const defaultMaxOutput = isGemini ? 65536 : 8192;
   const generationConfig: any = {
     temperature: req.temperature ?? 0.7,
     topP: req.top_p ?? 0.95,
     maxOutputTokens: req.max_tokens ? Math.min(req.max_tokens, defaultMaxOutput) : defaultMaxOutput
   };
+
+  // Responses API structured output, used by Codex's automatic approval
+  // reviewer, maps to Gemini's JSON MIME type and response schema.
+  if (req.response_format?.type === 'json_schema' && req.response_format.json_schema) {
+    generationConfig.responseMimeType = 'application/json';
+    generationConfig.responseSchema = sanitizeGoogleSchema(req.response_format.json_schema.schema || {
+      type: 'object',
+      properties: {}
+    });
+  } else if (req.response_format?.type === 'json_object') {
+    generationConfig.responseMimeType = 'application/json';
+  }
 
   // 如果客户端指定了具体的思考 Token 预算，透传给上游
   if (budgetTokens !== undefined && budgetTokens > 0) {

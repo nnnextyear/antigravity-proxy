@@ -428,5 +428,243 @@ export async function createServer(
   app.post('/chat/completions', handleChatCompletions);
   app.post('/v1/v1/chat/completions', handleChatCompletions);
 
+  // OpenAI Responses API compatibility for Codex and newer OpenAI clients.
+  // The upstream executor remains Chat Completions-shaped internally; this
+  // adapter only translates the public request and response envelopes.
+  const handleResponses = async (req: FastifyRequest, reply: FastifyReply) => {
+    verifyClientAuth(req, reply);
+    if (reply.sent) return;
+
+    const input = req.body as any;
+    if (!input || !input.model) {
+      return reply.status(400).send({
+        error: { message: 'Invalid request: model is required', type: 'invalid_request_error' }
+      });
+    }
+
+    const messages: any[] = [];
+    if (typeof input.instructions === 'string' && input.instructions.trim()) {
+      messages.push({ role: 'system', content: input.instructions });
+    }
+    const responseInput = input.input;
+    const items = Array.isArray(responseInput) ? responseInput : [{ role: 'user', content: responseInput ?? '' }];
+    for (const item of items) {
+      if (typeof item === 'string') {
+        messages.push({ role: 'user', content: item });
+      } else if (item?.type === 'message' || item?.role) {
+        const role = item.role === 'developer' ? 'system' : (item.role || 'user');
+        const content = Array.isArray(item.content)
+          ? item.content.map((part: any) => part?.text ?? part?.input_text ?? part?.output_text ?? '').join('\n')
+          : (item.content ?? '');
+        messages.push({ role, content });
+      } else if (item?.type === 'function_call_output') {
+        messages.push({ role: 'tool', tool_call_id: item.call_id, content: typeof item.output === 'string' ? item.output : JSON.stringify(item.output ?? '') });
+      } else if (item?.type === 'function_call') {
+        messages.push({
+          role: 'assistant',
+          content: '',
+          tool_calls: [{ id: item.call_id, type: 'function', function: { name: item.name, arguments: item.arguments || '{}' } }]
+        });
+      }
+    }
+    if (!messages.length) messages.push({ role: 'user', content: '' });
+
+    const responseReq: OpenAIChatCompletionRequest = {
+      model: input.model,
+      messages,
+      stream: Boolean(input.stream),
+      temperature: input.temperature,
+      max_tokens: input.max_output_tokens,
+      reasoning_effort: input.reasoning?.effort || input.reasoning_effort,
+      tools: Array.isArray(input.tools)
+        ? input.tools.filter((t: any) => t?.type === 'function' && t.name).map((t: any) => ({
+          type: 'function' as const,
+          function: { name: t.name, description: t.description, parameters: t.parameters }
+        }))
+        : undefined,
+      tool_choice: input.tool_choice
+    };
+    const responseFormat = input.text?.format;
+    if (responseFormat?.type === 'json_schema') {
+      responseReq.response_format = {
+        type: 'json_schema',
+        json_schema: {
+          name: responseFormat.name,
+          description: responseFormat.description,
+          schema: responseFormat.schema,
+          strict: responseFormat.strict
+        }
+      };
+    } else if (responseFormat?.type === 'json_object') {
+      responseReq.response_format = { type: 'json_object' };
+    }
+
+    const { payload } = convertOpenAIToCloudCode(responseReq);
+    const responseId = `resp_${crypto.randomBytes(12).toString('hex')}`;
+    const headerSession = (req.headers['x-session-id'] || req.headers['session-id'] || input.user) as string | undefined;
+    const sessionKey = headerSession || crypto.createHash('md5').update(`responses_${JSON.stringify(messages.slice(0, 2))}`).digest('hex');
+
+    let upstreamRes: any;
+    try {
+      upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey);
+    } catch (err: any) {
+      if (err instanceof ContextOverflowError) {
+        return reply.status(400).send({ error: { message: 'Request context exceeds the upstream limit.', type: 'invalid_request_error' } });
+      }
+      const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
+      return reply.status(statusCode).send({ error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' } });
+    }
+
+    const { bodyStream, accountUsed } = upstreamRes;
+    let fullText = '';
+    let buffer = '';
+    const decoder = new StringDecoder('utf-8');
+    let usageMetadata: any = null;
+    const toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
+    const responseObject = (status: string, output: any[] = []) => ({
+      id: responseId,
+      object: 'response',
+      created_at: Math.floor(Date.now() / 1000),
+      status,
+      incomplete_details: null,
+      model: input.model,
+      output,
+      instructions: input.instructions ?? null,
+      tools: input.tools || [],
+      tool_choice: input.tool_choice || 'auto',
+      temperature: input.temperature ?? 1,
+      top_p: input.top_p ?? 1,
+      max_output_tokens: input.max_output_tokens ?? null,
+      previous_response_id: input.previous_response_id ?? null,
+      reasoning: input.reasoning || { effort: null, summary: null },
+      text: input.text || { format: { type: 'text' } },
+      parallel_tool_calls: input.parallel_tool_calls !== false,
+      metadata: input.metadata || {},
+      usage: usageMetadata ? {
+        input_tokens: usageMetadata.promptTokenCount || 0,
+        output_tokens: usageMetadata.candidatesTokenCount || 0,
+        total_tokens: usageMetadata.totalTokenCount || 0
+      } : null
+    });
+    const writeResponseEvent = (type: string, data: any) => {
+      reply.raw.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
+    };
+    const buildOutput = (messageId: string) => {
+      const output: any[] = [];
+      if (fullText || !toolCalls.length) {
+        output.push({
+          type: 'message',
+          id: messageId,
+          status: 'completed',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: fullText, annotations: [] }]
+        });
+      }
+      for (const call of toolCalls) {
+        output.push({
+          type: 'function_call',
+          id: call.id,
+          call_id: call.id,
+          name: call.name,
+          arguments: call.arguments,
+          status: 'completed'
+        });
+      }
+      return output;
+    };
+    const consumeChunk = (jsonStr: string) => {
+      const parsed = extractTextFromGoogleChunk(jsonStr);
+      if (parsed.usageMetadata) usageMetadata = parsed.usageMetadata;
+      if (parsed.text) fullText += parsed.text;
+      for (const call of parsed.functionCalls || []) {
+        toolCalls.push({ id: call.id || `call_${responseId}_${toolCalls.length}`, name: call.name, arguments: JSON.stringify(call.args || {}) });
+      }
+      return parsed.text || '';
+    };
+
+    if (input.stream) {
+      reply.raw.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      reply.raw.setHeader('Cache-Control', 'no-cache, no-transform');
+      reply.raw.setHeader('Connection', 'keep-alive');
+      reply.raw.flushHeaders?.();
+      writeResponseEvent('response.created', { response: responseObject('in_progress') });
+      writeResponseEvent('response.in_progress', { response: responseObject('in_progress') });
+      const messageId = `msg_${responseId}`;
+      writeResponseEvent('response.output_item.added', {
+        output_index: 0,
+        item: { id: messageId, type: 'message', status: 'in_progress', role: 'assistant', content: [] }
+      });
+      writeResponseEvent('response.content_part.added', {
+        item_id: messageId,
+        output_index: 0,
+        content_index: 0,
+        part: { type: 'output_text', text: '', annotations: [] }
+      });
+      try {
+        for await (const chunk of bodyStream) {
+          buffer += decoder.write(chunk);
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data:')) continue;
+            const jsonStr = trimmed.substring(5).trim();
+            if (!jsonStr || jsonStr === '[DONE]') continue;
+            const delta = consumeChunk(jsonStr);
+            if (delta) writeResponseEvent('response.output_text.delta', { response_id: responseId, item_id: messageId, output_index: 0, content_index: 0, delta });
+          }
+        }
+        buffer += decoder.end();
+        pool.releaseAccount(accountUsed.id);
+        if (usageMetadata) pool.recordTokenUsage(usageMetadata);
+        const output = buildOutput(messageId);
+        if (fullText || !toolCalls.length) {
+          writeResponseEvent('response.output_text.done', { response_id: responseId, item_id: messageId, output_index: 0, content_index: 0, text: fullText });
+          writeResponseEvent('response.content_part.done', { response_id: responseId, item_id: messageId, output_index: 0, content_index: 0, part: { type: 'output_text', text: fullText, annotations: [] } });
+        }
+        if (output[0]?.type === 'message') writeResponseEvent('response.output_item.done', { output_index: 0, item: output[0] });
+        for (let i = output[0]?.type === 'message' ? 1 : 0; i < output.length; i++) {
+          writeResponseEvent('response.output_item.added', { output_index: i, item: { ...output[i], status: 'in_progress', arguments: '' } });
+          writeResponseEvent('response.function_call_arguments.delta', { item_id: output[i].id, output_index: i, delta: output[i].arguments });
+          writeResponseEvent('response.function_call_arguments.done', { item_id: output[i].id, output_index: i, arguments: output[i].arguments });
+          writeResponseEvent('response.output_item.done', { output_index: i, item: output[i] });
+        }
+        writeResponseEvent('response.completed', { response: responseObject('completed', output) });
+        reply.raw.write('data: [DONE]\n\n');
+        reply.raw.end();
+      } catch (err: any) {
+        pool.releaseAccount(accountUsed.id, { code: 500, message: err.message });
+        reply.raw.end();
+      }
+      return;
+    }
+
+    try {
+      for await (const chunk of bodyStream) {
+        buffer += decoder.write(chunk);
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('data:')) {
+            const jsonStr = trimmed.substring(5).trim();
+            if (jsonStr && jsonStr !== '[DONE]') consumeChunk(jsonStr);
+          }
+        }
+      }
+      pool.releaseAccount(accountUsed.id);
+      if (usageMetadata) pool.recordTokenUsage(usageMetadata);
+      const output = buildOutput(`msg_${responseId}`);
+      return reply.send({ ...responseObject('completed', output), output_text: fullText });
+    } catch (err: any) {
+      pool.releaseAccount(accountUsed.id, { code: 500, message: err.message });
+      return reply.status(500).send({ error: { message: `Stream parsing error: ${err.message}`, type: 'api_error' } });
+    }
+  };
+
+  app.post('/v1/responses', handleResponses);
+  app.post('/responses', handleResponses);
+  app.post('/v1/v1/responses', handleResponses);
+
   return app;
 }
