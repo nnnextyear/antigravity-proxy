@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { StringDecoder } from 'string_decoder';
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { AppConfig, GoogleCloudCodePayload, GoogleContent } from '../types.js';
-import { AccountPool } from '../pool/account-pool.js';
+import { AccountPool, mergeUsageMetadata } from '../pool/account-pool.js';
 import { ContextOverflowError, LocationNotSupportedError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
 import { resolveDynamicUpstreamModel, ThinkingEffort } from './models.js';
 
@@ -587,7 +587,7 @@ export function registerAnthropicRoutes(
             if (!jsonStr || jsonStr === '[DONE]') continue;
 
             const { text, functionCalls, usageMetadata } = parseGoogleStreamChunk(jsonStr);
-            if (usageMetadata) lastUsageMetadata = usageMetadata;
+            if (usageMetadata) lastUsageMetadata = mergeUsageMetadata(lastUsageMetadata, usageMetadata);
 
             // 处理文本流
             if (text) {
@@ -726,7 +726,7 @@ export function registerAnthropicRoutes(
             if (!jsonStr || jsonStr === '[DONE]') continue;
 
             const { text, functionCalls, usageMetadata } = parseGoogleStreamChunk(jsonStr);
-            if (usageMetadata) lastUsageMetadata = usageMetadata;
+            if (usageMetadata) lastUsageMetadata = mergeUsageMetadata(lastUsageMetadata, usageMetadata);
             if (text) fullText += text;
 
             for (const fn of functionCalls) {

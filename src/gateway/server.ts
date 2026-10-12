@@ -5,7 +5,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { StringDecoder } from 'string_decoder';
 import { AppConfig, OpenAIChatCompletionRequest } from '../types.js';
-import { AccountPool } from '../pool/account-pool.js';
+import { AccountPool, mergeUsageMetadata } from '../pool/account-pool.js';
 import { TokenRefresher } from '../pool/refresher.js';
 import { ContextOverflowError, LocationNotSupportedError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
 import { SUPPORTED_MODELS } from './models.js';
@@ -325,7 +325,7 @@ export async function createServer(
             if (!jsonStr || jsonStr === '[DONE]') continue;
 
             const { text, functionCalls = [], finishReason, usageMetadata: chunkUsage } = extractTextFromGoogleChunk(jsonStr);
-            if (chunkUsage) usageMetadata = chunkUsage;
+            if (chunkUsage) usageMetadata = mergeUsageMetadata(usageMetadata, chunkUsage);
             if (text) {
               const sseChunk = createOpenAIChunk(completionId, chatReq.model, text, null);
               reply.raw.write(sseChunk);
@@ -377,7 +377,7 @@ export async function createServer(
             if (!jsonStr || jsonStr === '[DONE]') continue;
 
             const { text, functionCalls = [], usageMetadata: chunkUsage } = extractTextFromGoogleChunk(jsonStr);
-            if (chunkUsage) usageMetadata = chunkUsage;
+            if (chunkUsage) usageMetadata = mergeUsageMetadata(usageMetadata, chunkUsage);
             if (text) {
               fullText += text;
             }
@@ -590,7 +590,7 @@ export async function createServer(
     };
     const consumeChunk = (jsonStr: string) => {
       const parsed = extractTextFromGoogleChunk(jsonStr);
-      if (parsed.usageMetadata) usageMetadata = parsed.usageMetadata;
+      if (parsed.usageMetadata) usageMetadata = mergeUsageMetadata(usageMetadata, parsed.usageMetadata);
       if (parsed.text) fullText += parsed.text;
       for (const call of parsed.functionCalls || []) {
         toolCalls.push({ id: call.id || `call_${responseId}_${toolCalls.length}`, name: call.name, arguments: JSON.stringify(call.args || {}) });

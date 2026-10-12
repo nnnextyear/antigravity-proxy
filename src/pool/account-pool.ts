@@ -6,6 +6,53 @@ import { Account, PoolStats, AccountStatus, RoutingStrategy } from '../types.js'
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const ACCOUNTS_FILE = path.resolve(DATA_DIR, 'accounts.json');
 
+/**
+ * Google may expose the same cache metric under different field names, and
+ * streaming responses do not always repeat every usage field in every chunk.
+ * Keep the richest value seen so one sparse final chunk cannot erase an
+ * earlier cache count.
+ */
+export function mergeUsageMetadata<T extends Record<string, any>>(
+  previous: T | null | undefined,
+  next: T
+): T {
+  const merged: Record<string, any> = { ...(previous || {}), ...next };
+  const finiteValues = (...values: unknown[]) => values
+    .map(Number)
+    .filter(Number.isFinite) as number[];
+  const maxValue = (...values: unknown[]) => {
+    const numbers = finiteValues(...values);
+    return numbers.length ? Math.max(...numbers) : undefined;
+  };
+
+  const cacheRead = maxValue(
+    previous?.cachedContentTokenCount,
+    previous?.cacheReadInputTokenCount,
+    previous?.cache_read_input_tokens,
+    next.cachedContentTokenCount,
+    next.cacheReadInputTokenCount,
+    next.cache_read_input_tokens
+  );
+  if (cacheRead !== undefined) {
+    merged.cachedContentTokenCount = cacheRead;
+    merged.cacheReadInputTokenCount = cacheRead;
+    merged.cache_read_input_tokens = cacheRead;
+  }
+
+  const cacheCreation = maxValue(
+    previous?.cacheCreationInputTokenCount,
+    previous?.cache_creation_input_tokens,
+    next.cacheCreationInputTokenCount,
+    next.cache_creation_input_tokens
+  );
+  if (cacheCreation !== undefined) {
+    merged.cacheCreationInputTokenCount = cacheCreation;
+    merged.cache_creation_input_tokens = cacheCreation;
+  }
+
+  return merged as T;
+}
+
 export class AccountPool {
   private accounts: Map<string, Account> = new Map();
   private roundRobinCursor = 0;
@@ -521,8 +568,8 @@ export class AccountPool {
     cache_creation_input_tokens?: number;
   }): void {
     const readNumber = (...values: unknown[]) => {
-      const value = values.map(Number).find(Number.isFinite);
-      return value ?? 0;
+      const numbers = values.map(Number).filter(Number.isFinite) as number[];
+      return numbers.length ? Math.max(...numbers) : 0;
     };
     const prompt = readNumber(usage.promptTokenCount);
     const completion = readNumber(usage.candidatesTokenCount);
