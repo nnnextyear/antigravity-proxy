@@ -7,7 +7,7 @@ import { StringDecoder } from 'string_decoder';
 import { AppConfig, OpenAIChatCompletionRequest } from '../types.js';
 import { AccountPool } from '../pool/account-pool.js';
 import { TokenRefresher } from '../pool/refresher.js';
-import { ContextOverflowError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
+import { ContextOverflowError, LocationNotSupportedError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
 import { SUPPORTED_MODELS } from './models.js';
 import { convertOpenAIToCloudCode, createOpenAIChunk, extractTextFromGoogleChunk } from './adapter.js';
 import { registerAdminRoutes } from '../admin/routes.js';
@@ -272,6 +272,14 @@ export async function createServer(
           error: { message: 'Request context exceeds the upstream limit. The client must compact its conversation and retry.', type: 'invalid_request_error' }
         });
       }
+      if (err instanceof LocationNotSupportedError) {
+        return reply.status(400).send({
+          error: {
+            message: 'Google Upstream 拒绝访问：当前代理出口 IP 地区不受支持 (User location is not supported for the API use)。请在代理软件（如 Clash）中将节点切换至美国(US)、日本(JP)、新加坡(SG)等 Google 支持的地区，避免使用香港(HK)节点或直连。',
+            type: 'invalid_request_error'
+          }
+        });
+      }
       const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
       const message = err instanceof UpstreamRequestError ? err.message : `Antigravity upstream unavailable: ${err.message}`;
       return reply.status(statusCode).send({
@@ -510,6 +518,14 @@ export async function createServer(
     } catch (err: any) {
       if (err instanceof ContextOverflowError) {
         return reply.status(400).send({ error: { message: 'Request context exceeds the upstream limit.', type: 'invalid_request_error' } });
+      }
+      if (err instanceof LocationNotSupportedError) {
+        return reply.status(400).send({
+          error: {
+            message: 'Google Upstream 拒绝访问：当前代理出口 IP 地区不受支持 (User location is not supported for the API use)。请在代理软件（如 Clash）中将节点切换至美国(US)、日本(JP)、新加坡(SG)等 Google 支持的地区，避免使用香港(HK)节点或直连。',
+            type: 'invalid_request_error'
+          }
+        });
       }
       const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
       return reply.status(statusCode).send({ error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' } });

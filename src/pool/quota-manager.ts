@@ -1,6 +1,7 @@
-import { request, ProxyAgent } from 'undici';
+import { request } from 'undici';
 import { Account, AccountQuota, AppConfig } from '../types.js';
 import { AccountPool } from './account-pool.js';
+import { getOrCreateDispatcher, resetDispatcher } from './dispatcher.js';
 
 export class QuotaManager {
   private pollTimer: NodeJS.Timeout | null = null;
@@ -18,10 +19,7 @@ export class QuotaManager {
 
     try {
       const effectiveProxy = account.proxyUrl || this.config?.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-      const dispatcher = effectiveProxy ? new ProxyAgent({
-        uri: effectiveProxy,
-        connect: { timeout: 30000 }
-      }) : undefined;
+      const dispatcher = getOrCreateDispatcher(effectiveProxy, { timeoutMs: 30000 });
     let res: any;
 
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -42,6 +40,7 @@ export class QuotaManager {
         break;
       } catch (err: any) {
         if (attempt < 2) {
+          resetDispatcher(effectiveProxy, { timeoutMs: 30000 });
           await new Promise(r => setTimeout(r, 1500));
           continue;
         }

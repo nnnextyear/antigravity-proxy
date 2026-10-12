@@ -1,7 +1,8 @@
-import { request, ProxyAgent } from 'undici';
+import { request } from 'undici';
 import { Account, AppConfig } from '../types.js';
 import { AccountPool } from './account-pool.js';
 import { DEFAULT_OAUTH_CLIENT_ID, DEFAULT_OAUTH_CLIENT_SECRET } from '../config.js';
+import { getOrCreateDispatcher, resetDispatcher } from './dispatcher.js';
 
 const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 
@@ -67,17 +68,14 @@ export class TokenRefresher {
 
     const clientSecret = this.config.oauthClientSecret || DEFAULT_CLIENT_SECRET;
     bodyParams.append('client_secret', clientSecret);
+    const effectiveProxy = acc.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         if (attempt === 1) {
           console.log(`[TokenRefresher] Refreshing token for account: ${acc.email} (${acc.id})...`);
         }
-        const effectiveProxy = acc.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-        const dispatcher = effectiveProxy ? new ProxyAgent({
-          uri: effectiveProxy,
-          connect: { timeout: 30000 }
-        }) : undefined;
+        const dispatcher = getOrCreateDispatcher(effectiveProxy, { timeoutMs: 30000 });
 
         const res = await request(GOOGLE_TOKEN_ENDPOINT, {
           method: 'POST',
@@ -117,6 +115,7 @@ export class TokenRefresher {
         }
       } catch (e: any) {
         if (attempt < 2) {
+          resetDispatcher(effectiveProxy, { timeoutMs: 30000 });
           await new Promise(r => setTimeout(r, 1500));
           continue;
         }

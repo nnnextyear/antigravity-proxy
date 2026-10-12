@@ -1,9 +1,9 @@
-import { request, ProxyAgent } from 'undici';
+import { request } from 'undici';
 import { Account, AppConfig, GoogleCloudCodePayload } from '../types.js';
 import { AccountPool } from './account-pool.js';
 import { TokenRefresher } from './refresher.js';
-
 import { QuotaManager } from './quota-manager.js';
+import { getOrCreateDispatcher, resetDispatcher } from './dispatcher.js';
 
 export interface UpstreamExecutionResult {
   statusCode: number;
@@ -35,11 +35,26 @@ export class ContextOverflowError extends UpstreamRequestError {
   }
 }
 
+export class LocationNotSupportedError extends UpstreamRequestError {
+  constructor(statusCode: number, upstreamBody: string) {
+    super(statusCode, upstreamBody);
+    this.name = 'LocationNotSupportedError';
+  }
+}
+
 function isContextOverflow(statusCode: number, body: string): boolean {
   return statusCode === 400 && (
     /input token count exceeds the maximum number of tokens/i.test(body) ||
     /maximum number of tokens allowed/i.test(body) ||
     /CONTEXT_LENGTH_EXCEEDED/i.test(body)
+  );
+}
+
+function isLocationNotSupported(statusCode: number, body: string): boolean {
+  return (statusCode === 400 || statusCode === 403) && (
+    /User location is not supported/i.test(body) ||
+    /location is not supported/i.test(body) ||
+    (/FAILED_PRECONDITION/i.test(body) && /location/i.test(body))
   );
 }
 
@@ -82,56 +97,59 @@ export class RequestExecutor {
 
       try {
         const effectiveProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-        const dispatcher = effectiveProxy ? new ProxyAgent({ uri: effectiveProxy, connect: { timeout: 60000 } }) : undefined;
-        // CloudCode deployments have used both envelopes over time. Count the
-        // exact generation payload first, then the bare request envelope as a
-        // compatibility fallback. Returning the larger successful result avoids
-        // silently under-counting wrappers/tools that one endpoint ignores.
-        const requestBodies = [JSON.stringify(payload), JSON.stringify({ request: payload.request })];
-        let countedTokens: number | undefined;
-        let lastFailure = '';
-        for (const requestBody of requestBodies) {
-          const res = await request(countUrl, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${account.accessToken}`,
-              'Content-Type': 'application/json',
-              'User-Agent': 'antigravity/2.14.0',
-              'x-goog-api-client': 'gl-node/22.7.0 grpc-web/1.0.0'
-            },
-            body: requestBody,
-            headersTimeout: 120000,
-            bodyTimeout: 120000,
-            dispatcher
-          });
-          const body = await res.body.text();
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            const parsed = JSON.parse(body);
-            const totalTokens = Number(
-              parsed.totalTokens ?? parsed.total_tokens ?? parsed.promptTokenCount ?? parsed.usageMetadata?.promptTokenCount
-            );
-            if (Number.isFinite(totalTokens)) {
-              countedTokens = Math.max(countedTokens ?? 0, totalTokens);
-              continue;
-            }
-            lastFailure = `countTokens response did not include totalTokens: ${body.slice(0, 300)}`;
+        const dispatcher = getOrCreateDispatcher(effectiveProxy, { timeoutMs: 60000 });
+        // countTokens accepts the inner request envelope only. Sending the
+        // full generation payload first doubles the upload for large prompts
+        // and adds avoidable proxy/TLS failure points.
+        const res = await request(countUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${account.accessToken}`,
+            'Content-Type': 'application/json',
+            'User-Agent': 'antigravity/2.14.0',
+            'x-goog-api-client': 'gl-node/22.7.0 grpc-web/1.0.0'
+          },
+          body: JSON.stringify({ request: payload.request }),
+          headersTimeout: 120000,
+          bodyTimeout: 120000,
+          dispatcher
+        });
+        const body = await res.body.text();
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          const parsed = JSON.parse(body);
+          const totalTokens = Number(
+            parsed.totalTokens ?? parsed.total_tokens ?? parsed.promptTokenCount ?? parsed.usageMetadata?.promptTokenCount
+          );
+          if (Number.isFinite(totalTokens)) {
+            this.pool.releaseAccount(account.id);
+            return { totalTokens, accountUsed: account };
+          }
+          this.pool.releaseAccount(account.id);
+          throw new Error(`countTokens response did not include totalTokens: ${body.slice(0, 300)}`);
+        }
+
+        if (isLocationNotSupported(res.statusCode, body)) {
+          this.pool.releaseAccount(account.id);
+          resetDispatcher(effectiveProxy, { timeoutMs: 60000 });
+          if (attempt < maxRetries) {
+            triedAccountIds.delete(account.id);
+            console.warn(`[Executor] countTokens 地区限制，正在重建代理连接并重试 (${attempt + 1}/${maxRetries})。`);
+            await new Promise(r => setTimeout(r, attempt * 1000));
             continue;
           }
-          lastFailure = `countTokens upstream HTTP ${res.statusCode}: ${body}`;
-          if (res.statusCode === 401 || res.statusCode === 403) {
-            this.pool.releaseAccount(account.id);
-            throw new UpstreamRequestError(res.statusCode, body);
-          }
+          throw new LocationNotSupportedError(res.statusCode, body);
         }
-        if (countedTokens !== undefined) {
-          this.pool.releaseAccount(account.id);
-          return { totalTokens: countedTokens, accountUsed: account };
-        }
+
         this.pool.releaseAccount(account.id);
-        throw new Error(lastFailure || 'countTokens request failed');
+        throw new UpstreamRequestError(res.statusCode, body);
       } catch (err: any) {
         if (err instanceof UpstreamRequestError) throw err;
+        const retryProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+        resetDispatcher(retryProxy, { timeoutMs: 60000 });
         this.pool.releaseAccount(account.id, { code: 500, message: `countTokens network error: ${err.message}` }, family);
+        if (attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, attempt * 1000));
+        }
         if (attempt === maxRetries) throw err;
       }
     }
@@ -201,12 +219,7 @@ export class RequestExecutor {
 
       try {
         const effectiveProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-        const dispatcher = effectiveProxy ? new ProxyAgent({
-          uri: effectiveProxy,
-          connect: {
-            timeout: 60000 // 放宽底层 TCP/TLS 握手及代理建连超时至 60 秒，完美承载几兆的大 Prompt 上下文
-          }
-        }) : undefined;
+        const dispatcher = getOrCreateDispatcher(effectiveProxy, { timeoutMs: 60000 });
         const upstreamHeaders: Record<string, string> = {
           'Authorization': `Bearer ${account.accessToken}`,
           'Content-Type': 'application/json',
@@ -263,6 +276,17 @@ export class RequestExecutor {
         // 处理 403 封禁或无权限
         if (res.statusCode === 403) {
           const errBody = await res.body.text();
+          if (isLocationNotSupported(res.statusCode, errBody)) {
+            this.pool.releaseAccount(account.id);
+            resetDispatcher(effectiveProxy, { timeoutMs: 60000 });
+            if (attempt < maxRetries) {
+              triedAccountIds.delete(account.id);
+              console.warn(`[Executor] 生成请求地区限制，正在重建代理连接并重试 (${attempt + 1}/${maxRetries})。`);
+              await new Promise(r => setTimeout(r, attempt * 1000));
+              continue;
+            }
+            throw new LocationNotSupportedError(res.statusCode, errBody);
+          }
           console.error(`[Executor] Account ${account.email} hit 403 Forbidden:`, errBody);
           this.pool.releaseAccount(account.id, { code: 403, message: errBody });
           continue;
@@ -283,11 +307,22 @@ export class RequestExecutor {
           continue;
         }
 
-        // 400 是请求本身不合法，换账号无意义；尤其不能把上下文超限误报成网络故障。
+        // 400 是请求本身不合法或环境限制，换账号无意义；尤其不能把上下文超限误报成网络故障。
         const errBody = await res.body.text();
         this.pool.releaseAccount(account.id);
         if (isContextOverflow(res.statusCode, errBody)) {
           throw new ContextOverflowError(res.statusCode, errBody);
+        }
+        if (isLocationNotSupported(res.statusCode, errBody)) {
+          console.error(`[Executor] 🚨 账号 ${account.email} 遭遇 Google 地区限制: User location is not supported for the API use. 当前代理出口节点所处地区不受 Google API 支持，请在代理软件（如 Clash）中将出口节点切换为美国(US)、日本(JP)、新加坡(SG)等支持地区，避免使用香港(HK)节点。`);
+          resetDispatcher(effectiveProxy, { timeoutMs: 60000 });
+          if (attempt < maxRetries) {
+            triedAccountIds.delete(account.id);
+            console.warn(`[Executor] 正在重建代理连接并重试 (${attempt + 1}/${maxRetries})。`);
+            await new Promise(r => setTimeout(r, attempt * 1000));
+            continue;
+          }
+          throw new LocationNotSupportedError(res.statusCode, errBody);
         }
         throw new UpstreamRequestError(res.statusCode, errBody);
 
@@ -298,7 +333,12 @@ export class RequestExecutor {
         }
         // 网络层异常（如 Connect Timeout、Socket 掉线等），自动换号继续尝试，不立即中断
         console.error(`[Executor] Network or connection error for account ${account.email} (attempt ${attempt}/${maxRetries}):`, err.message);
+        const retryProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+        resetDispatcher(retryProxy, { timeoutMs: 60000 });
         this.pool.releaseAccount(account.id, { code: 500, message: `Network error: ${err.message}` });
+        if (attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, attempt * 1000));
+        }
         if (attempt === maxRetries) {
           throw err;
         }

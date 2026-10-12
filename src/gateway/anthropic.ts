@@ -3,7 +3,7 @@ import { StringDecoder } from 'string_decoder';
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { AppConfig, GoogleCloudCodePayload, GoogleContent } from '../types.js';
 import { AccountPool } from '../pool/account-pool.js';
-import { ContextOverflowError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
+import { ContextOverflowError, LocationNotSupportedError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
 import { resolveDynamicUpstreamModel, ThinkingEffort } from './models.js';
 
 interface AnthropicMessageParam {
@@ -513,6 +513,15 @@ export function registerAnthropicRoutes(
         return reply.status(400).send({
           type: 'error',
           error: { type: 'invalid_request_error', message: 'Request context exceeds the upstream limit. Claude Code must compact the conversation and retry.' }
+        });
+      }
+      if (err instanceof LocationNotSupportedError) {
+        return reply.status(400).send({
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: 'Google Upstream 拒绝访问：当前代理出口 IP 地区不受支持 (User location is not supported for the API use)。请在代理软件（如 Clash）中将节点切换至美国(US)、日本(JP)、新加坡(SG)等 Google 支持的地区，避免使用香港(HK)节点或直连。'
+          }
         });
       }
       const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
