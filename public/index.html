@@ -68,7 +68,7 @@
             <span class="strategy-badge-glow">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
             </span>
-            <span class="strategy-active-name" id="strategy-active-name">智能零浪费调度</span>
+            <span class="strategy-active-name" id="strategy-active-name">纯粘性水坝调度</span>
             <svg class="strategy-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
           </button>
 
@@ -76,17 +76,17 @@
             <div class="popover-header">
               <span>账号调度算法 (Routing Strategy)</span>
             </div>
-            
+
             <div class="popover-option active" data-strategy="zero-waste">
               <div class="opt-icon-box opt-icon-violet">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
               </div>
               <div class="opt-text-group">
                 <div class="opt-title-line">
-                  <span class="opt-name">智能零浪费调度</span>
-                  <span class="opt-tag-recommend">推荐</span>
+                  <span class="opt-name">纯粘性水坝调度</span>
+                  <span class="opt-tag-recommend">推荐 (Cache 优先)</span>
                 </div>
-                <div class="opt-desc">优先消耗即将刷新的账号，防止额度过期浪费</div>
+                <div class="opt-desc">连续会话强粘性死锁最大化缓存命中率；新会话临期抢救 + 深度耗尽</div>
               </div>
               <div class="opt-check-mark">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
@@ -101,7 +101,7 @@
                 <div class="opt-title-line">
                   <span class="opt-name">顺序耗尽模式</span>
                 </div>
-                <div class="opt-desc">集中打满单号 5h 额度后再平滑切换下一可用账号</div>
+                <div class="opt-desc">会话粘性优先；新会话集中打满单号 5h 额度再平滑切换下一账号</div>
               </div>
               <div class="opt-check-mark">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
@@ -116,7 +116,7 @@
                 <div class="opt-title-line">
                   <span class="opt-name">经典负载轮询</span>
                 </div>
-                <div class="opt-desc">请求在所有就绪账号之间均匀分摊调用压力</div>
+                <div class="opt-desc">会话粘性优先；新会话在所有就绪账号之间均匀分摊调用压力</div>
               </div>
               <div class="opt-check-mark">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>

@@ -32,6 +32,8 @@ interface AnthropicMessageRequest {
 
 interface GoogleParsedChunk {
   text: string;
+  thoughtText: string;
+  thoughtSignature?: string;
   functionCalls: Array<{
     id?: string;
     name: string;
@@ -55,6 +57,44 @@ function sanitizeToolName(name: string): string {
   return (name || '').replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 128) || 'tool';
 }
 
+/**
+ * 稳健提取会话指纹 SessionKey (参考 gemini-balance 缓存亲和调度):
+ * 优先取显式 Header/Metadata；若无，则稳定取首轮用户消息内容生成 Hash，
+ * 绝不能把动态可变的 system prompt 卷入 hash，确保长对话过程中 sessionKey 永不漂移。
+ */
+export function extractSessionKeyFromAnthropic(req: FastifyRequest, body: AnthropicMessageRequest): string | undefined {
+  const headerSession = (
+    req.headers['x-session-id'] ||
+    req.headers['session-id'] ||
+    req.headers['conversation-id'] ||
+    req.headers['x-conversation-id'] ||
+    (body as any)?.metadata?.user_id ||
+    (body as any)?.metadata?.session_id
+  ) as string | undefined;
+
+  if (headerSession && typeof headerSession === 'string' && headerSession.trim()) {
+    return headerSession.trim();
+  }
+
+  if (body?.messages && Array.isArray(body.messages) && body.messages.length > 0) {
+    const firstUser = body.messages.find(m => m.role === 'user');
+    if (firstUser) {
+      let rawText = '';
+      if (typeof firstUser.content === 'string') {
+        rawText = firstUser.content;
+      } else if (Array.isArray(firstUser.content)) {
+        const textPart = firstUser.content.find((p: any) => p && (p.type === 'text' || typeof p === 'string'));
+        rawText = typeof textPart === 'string' ? textPart : (textPart?.text || JSON.stringify(firstUser.content[0] || ''));
+      }
+      if (rawText.trim()) {
+        return crypto.createHash('sha256').update(`anthropic_session_${rawText.trim().substring(0, 300)}`).digest('hex');
+      }
+    }
+  }
+
+  return undefined;
+}
+
 // 缓存 Gemini 思考签名，以便在多轮对话中回传真实 thoughtSignature
 const thoughtSignatureCache = new Map<string, string>();
 
@@ -63,19 +103,29 @@ function parseGoogleStreamChunk(jsonStr: string): GoogleParsedChunk {
     const parsed = JSON.parse(jsonStr);
     const usageMetadata = parsed.response?.usageMetadata || parsed.usageMetadata;
     const candidate = parsed.response?.candidates?.[0] || parsed.candidates?.[0];
-    if (!candidate) return { text: '', functionCalls: [], usageMetadata };
+    if (!candidate) return { text: '', thoughtText: '', functionCalls: [], usageMetadata };
 
     const parts = candidate.content?.parts;
     let text = '';
+    let thoughtText = '';
+    let thoughtSignature: string | undefined;
     const functionCalls: Array<{ id?: string; name: string; args: any }> = [];
 
     if (Array.isArray(parts)) {
       for (const part of parts) {
-        if (part.text && !part.thought) {
+        if (part.thought) {
+          if (typeof part.text === 'string') {
+            thoughtText += part.text;
+          }
+          if (part.thoughtSignature || part.thought_signature) {
+            thoughtSignature = part.thoughtSignature || part.thought_signature;
+          }
+        } else if (part.text) {
           text += part.text;
         }
+
         if (part.functionCall) {
-          const sig = part.thoughtSignature || part.thought_signature;
+          const sig = part.thoughtSignature || part.thought_signature || thoughtSignature;
           if (part.functionCall.id && sig) {
             thoughtSignatureCache.set(part.functionCall.id, sig);
             if (thoughtSignatureCache.size > 1000) {
@@ -93,9 +143,9 @@ function parseGoogleStreamChunk(jsonStr: string): GoogleParsedChunk {
     }
 
     const finishReason = candidate.finishReason || null;
-    return { text, functionCalls, finishReason, usageMetadata };
+    return { text, thoughtText, thoughtSignature, functionCalls, finishReason, usageMetadata };
   } catch {
-    return { text: '', functionCalls: [] };
+    return { text: '', thoughtText: '', functionCalls: [] };
   }
 }
 
@@ -338,13 +388,7 @@ export function registerAnthropicRoutes(
     }
 
     try {
-      const headerSession = (req.headers['x-session-id'] || req.headers['session-id'] || req.headers['conversation-id'] || (body as any).metadata?.user_id) as string | undefined;
-      let sessionKey = headerSession;
-      if (!sessionKey && body.messages.length > 0) {
-        const firstUser = body.messages.find(m => m.role === 'user');
-        const userKey = typeof firstUser?.content === 'string' ? firstUser.content : JSON.stringify(firstUser?.content || '');
-        sessionKey = crypto.createHash('md5').update(`anthropic_${userKey.substring(0, 200)}`).digest('hex');
-      }
+      const sessionKey = extractSessionKeyFromAnthropic(req, body);
       const counted = await executor.countTokens({ project: 'aicode-consumers', model: modelDef.upstreamModel, request }, 3, sessionKey);
       return reply.send({ input_tokens: counted.totalTokens });
     } catch (err: any) {
@@ -480,15 +524,8 @@ export function registerAnthropicRoutes(
     const isStream = Boolean(body.stream);
     const messageId = `msg_${crypto.randomBytes(12).toString('hex')}`;
 
-    // 提取会话唯一指纹（用于 Zero-Waste 会话粘性，最大化利用 Google 上游 Prompt Cache）
-    const headerSession = (req.headers['x-session-id'] || req.headers['session-id'] || req.headers['conversation-id'] || (body as any).metadata?.user_id) as string | undefined;
-    let sessionKey = headerSession;
-    if (!sessionKey && body.messages && body.messages.length > 0) {
-      const sysKey = typeof body.system === 'string' ? body.system : JSON.stringify(body.system || '');
-      const firstUser = body.messages.find(m => m.role === 'user');
-      const userKey = typeof firstUser?.content === 'string' ? firstUser.content : JSON.stringify(firstUser?.content || '');
-      sessionKey = crypto.createHash('md5').update(`anthropic_${sysKey.substring(0, 200)}_${userKey.substring(0, 200)}`).digest('hex');
-    }
+    // 提取稳定会话唯一指纹（用于强会话粘性，最大化利用 Google 上游 Prompt Cache）
+    const sessionKey = extractSessionKeyFromAnthropic(req, body);
 
     // Anthropic clients use message_start.usage.input_tokens to decide when to
     // run their native context compaction. Count the exact Google request before
@@ -502,9 +539,14 @@ export function registerAnthropicRoutes(
       console.warn(`[AnthropicGateway] Preflight countTokens unavailable; continuing with upstream generation: ${countErr.message}`);
     }
 
+    const abortController = new AbortController();
+    const abortUpstream = () => {
+      if (!abortController.signal.aborted) abortController.abort();
+    };
+    req.raw.once('aborted', abortUpstream);
     let upstreamRes: any;
     try {
-      upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey);
+      upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey, abortController.signal);
     } catch (err: any) {
       if (err instanceof ContextOverflowError) {
         // Claude Code owns conversation compaction. Never rewrite the history
@@ -542,12 +584,21 @@ export function registerAnthropicRoutes(
       reply.raw.setHeader('X-Accel-Buffering', 'no');
 
       let released = false;
+      let completed = false;
       const cleanup = (err?: any) => {
         if (released) return;
         released = true;
         pool.releaseAccount(accountUsed.id, err);
       };
-      req.raw.on('close', () => cleanup());
+      const onClientClose = () => {
+        if (!completed) {
+          console.warn(`[AnthropicGateway] ⚠️ 客户端主动中断连接 (Client aborted/timeout, req: ${req.id})`);
+          abortUpstream();
+        }
+        cleanup({ code: 499, message: 'Client disconnected' });
+      };
+      req.raw.once('aborted', onClientClose);
+      reply.raw.once('close', onClientClose);
 
       try {
         // 1. message_start
@@ -569,11 +620,14 @@ export function registerAnthropicRoutes(
         let buffer = '';
         const decoder = new StringDecoder('utf-8');
         let currentBlockIndex = 0;
+        let isThinkingBlockOpen = false;
         let isTextBlockOpen = false;
         let textBlockStarted = false;
         let hasToolUse = false;
         let lastUsageMetadata: any = null;
+        let lastSignature: string | undefined;
         const seenToolCalls = new Set<string>();
+        const clientRequestedThinking = Boolean(body.thinking && body.thinking.type !== 'disabled') || budgetTokens > 0;
 
         for await (const chunk of bodyStream) {
           buffer += decoder.write(chunk);
@@ -586,10 +640,50 @@ export function registerAnthropicRoutes(
             const jsonStr = trimmed.substring(5).trim();
             if (!jsonStr || jsonStr === '[DONE]') continue;
 
-            const { text, functionCalls, usageMetadata } = parseGoogleStreamChunk(jsonStr);
+            const { text, thoughtText, thoughtSignature, functionCalls, usageMetadata } = parseGoogleStreamChunk(jsonStr);
+            if (thoughtSignature) lastSignature = thoughtSignature;
             if (usageMetadata) lastUsageMetadata = mergeUsageMetadata(lastUsageMetadata, usageMetadata);
 
-            // 处理文本流
+            // 1. 处理思考流 (Anthropic Extended Thinking 规范)
+            if (thoughtText) {
+              if (clientRequestedThinking) {
+                if (!isThinkingBlockOpen) {
+                  reply.raw.write(`event: content_block_start\ndata: ${JSON.stringify({
+                    type: 'content_block_start',
+                    index: currentBlockIndex,
+                    content_block: { type: 'thinking', thinking: '' }
+                  })}\n\n`);
+                  isThinkingBlockOpen = true;
+                }
+                reply.raw.write(`event: content_block_delta\ndata: ${JSON.stringify({
+                  type: 'content_block_delta',
+                  index: currentBlockIndex,
+                  delta: { type: 'thinking_delta', thinking: thoughtText }
+                })}\n\n`);
+              } else {
+                // 客户端未开启 thinking 参数，发送 SSE 保活注释避免底层 TCP/HTTP 读取超时中断
+                reply.raw.write(`: keepalive\n\n`);
+              }
+            }
+
+            // 2. 如果收到正式文本或函数调用，且思考块仍未关闭，先安全关闭思考块
+            if ((text || functionCalls.length > 0) && isThinkingBlockOpen) {
+              if (lastSignature) {
+                reply.raw.write(`event: content_block_delta\ndata: ${JSON.stringify({
+                  type: 'content_block_delta',
+                  index: currentBlockIndex,
+                  delta: { type: 'signature_delta', signature: lastSignature }
+                })}\n\n`);
+              }
+              reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({
+                type: 'content_block_stop',
+                index: currentBlockIndex
+              })}\n\n`);
+              isThinkingBlockOpen = false;
+              currentBlockIndex++;
+            }
+
+            // 3. 处理文本流
             if (text) {
               if (!isTextBlockOpen) {
                 reply.raw.write(`event: content_block_start\ndata: ${JSON.stringify({
@@ -608,7 +702,7 @@ export function registerAnthropicRoutes(
               })}\n\n`);
             }
 
-            // 处理原生 Function Call
+            // 4. 处理原生 Function Call
             if (functionCalls.length > 0) {
               if (isTextBlockOpen) {
                 // 如果当前文本块仍在开启状态，先结束文本块
@@ -660,6 +754,23 @@ export function registerAnthropicRoutes(
           }
         }
 
+        // 如果流结束时思考块仍开启，关闭它
+        if (isThinkingBlockOpen) {
+          if (lastSignature) {
+            reply.raw.write(`event: content_block_delta\ndata: ${JSON.stringify({
+              type: 'content_block_delta',
+              index: currentBlockIndex,
+              delta: { type: 'signature_delta', signature: lastSignature }
+            })}\n\n`);
+          }
+          reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({
+            type: 'content_block_stop',
+            index: currentBlockIndex
+          })}\n\n`);
+          isThinkingBlockOpen = false;
+          currentBlockIndex++;
+        }
+
         // 如果流结束时文本块仍开启，关闭它
         if (isTextBlockOpen) {
           reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({
@@ -669,16 +780,16 @@ export function registerAnthropicRoutes(
           isTextBlockOpen = false;
         }
 
-        // 兜底：既无文本也无 tool_use，补一个空 text 块
-        if (!textBlockStarted && !hasToolUse) {
+        // 兜底：既无文本也无 tool_use 且没有 thinking，补一个空 text 块
+        if (!textBlockStarted && !hasToolUse && !clientRequestedThinking) {
           reply.raw.write(`event: content_block_start\ndata: ${JSON.stringify({
             type: 'content_block_start',
-            index: 0,
+            index: currentBlockIndex,
             content_block: { type: 'text', text: '' }
           })}\n\n`);
           reply.raw.write(`event: content_block_stop\ndata: ${JSON.stringify({
             type: 'content_block_stop',
-            index: 0
+            index: currentBlockIndex
           })}\n\n`);
         }
 
@@ -696,22 +807,36 @@ export function registerAnthropicRoutes(
         // 5. message_stop
         reply.raw.write(`event: message_stop\ndata: {"type":"message_stop"}\n\n`);
         reply.raw.end();
+        completed = true;
+        console.info(`[AnthropicGateway] ✅ 流式响应成功交付 (req: ${req.id}, 产出: ${lastUsageMetadata?.candidatesTokenCount ?? 0} tokens)`);
 
         if (lastUsageMetadata) pool.recordTokenUsage(lastUsageMetadata);
       } catch (err: any) {
         console.error('[AnthropicGateway] Stream error:', err.message);
+        if (!reply.raw.destroyed && !reply.raw.writableEnded) {
+          reply.raw.write(`event: error\ndata: ${JSON.stringify({
+            type: 'error',
+            error: { type: 'api_error', message: `Upstream stream failed: ${err.message}` }
+          })}\n\n`);
+          reply.raw.end();
+        }
       } finally {
+        completed = true;
+        abortUpstream();
         cleanup();
       }
     } else {
       // 非流式 Anthropic JSON
       let fullText = '';
+      let fullThinking = '';
+      let lastSignature: string | undefined;
       const contentParts: any[] = [];
       const seenToolCalls = new Set<string>();
       let hasToolUse = false;
       let buffer = '';
       const decoder = new StringDecoder('utf-8');
       let lastUsageMetadata: any = null;
+      const clientRequestedThinking = Boolean(body.thinking && body.thinking.type !== 'disabled') || budgetTokens > 0;
 
       try {
         for await (const chunk of bodyStream) {
@@ -725,8 +850,10 @@ export function registerAnthropicRoutes(
             const jsonStr = trimmed.substring(5).trim();
             if (!jsonStr || jsonStr === '[DONE]') continue;
 
-            const { text, functionCalls, usageMetadata } = parseGoogleStreamChunk(jsonStr);
+            const { text, thoughtText, thoughtSignature, functionCalls, usageMetadata } = parseGoogleStreamChunk(jsonStr);
+            if (thoughtSignature) lastSignature = thoughtSignature;
             if (usageMetadata) lastUsageMetadata = mergeUsageMetadata(lastUsageMetadata, usageMetadata);
+            if (thoughtText) fullThinking += thoughtText;
             if (text) fullText += text;
 
             for (const fn of functionCalls) {
@@ -749,8 +876,16 @@ export function registerAnthropicRoutes(
 
         if (lastUsageMetadata) pool.recordTokenUsage(lastUsageMetadata);
 
+        if (fullThinking && clientRequestedThinking) {
+          contentParts.push({
+            type: 'thinking',
+            thinking: fullThinking,
+            ...(lastSignature ? { signature: lastSignature } : {})
+          });
+        }
+
         if (fullText) {
-          contentParts.unshift({ type: 'text', text: fullText });
+          contentParts.push({ type: 'text', text: fullText });
         }
 
         if (contentParts.length === 0) {

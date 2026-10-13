@@ -237,6 +237,37 @@ export async function createServer(
   app.get('/v1/usage', handleUserBalance);
 
   // 2. POST /v1/chat/completions (流式 & 非流式核心)
+  const extractSessionKeyFromOpenAI = (req: FastifyRequest, chatReq: OpenAIChatCompletionRequest): string | undefined => {
+    const headerSession = (
+      req.headers['x-session-id'] ||
+      req.headers['session-id'] ||
+      req.headers['conversation-id'] ||
+      req.headers['x-conversation-id'] ||
+      chatReq.user
+    ) as string | undefined;
+
+    if (headerSession && typeof headerSession === 'string' && headerSession.trim()) {
+      return headerSession.trim();
+    }
+
+    if (chatReq.messages && Array.isArray(chatReq.messages) && chatReq.messages.length > 0) {
+      const firstUser = chatReq.messages.find(m => m.role === 'user');
+      if (firstUser) {
+        let rawText = '';
+        if (typeof firstUser.content === 'string') {
+          rawText = firstUser.content;
+        } else if (Array.isArray(firstUser.content)) {
+          const textPart = firstUser.content.find((p: any) => p && (p.type === 'text' || typeof p === 'string'));
+          rawText = typeof textPart === 'string' ? textPart : (textPart?.text || JSON.stringify(firstUser.content[0] || ''));
+        }
+        if (rawText.trim()) {
+          return crypto.createHash('sha256').update(`openai_session_${rawText.trim().substring(0, 300)}`).digest('hex');
+        }
+      }
+    }
+    return undefined;
+  };
+
   const handleChatCompletions = async (req: FastifyRequest, reply: FastifyReply) => {
     verifyClientAuth(req, reply);
     if (reply.sent) return;
@@ -252,20 +283,17 @@ export async function createServer(
     const isStream = Boolean(chatReq.stream);
     const completionId = `chatcmpl-${crypto.randomBytes(12).toString('hex')}`;
 
-    // 提取会话唯一指纹（用于 Zero-Waste 会话粘性，最大化利用 Google 上游 Prompt Cache）
-    const headerSession = (req.headers['x-session-id'] || req.headers['session-id'] || req.headers['conversation-id'] || (chatReq as any).user) as string | undefined;
-    let sessionKey = headerSession;
-    if (!sessionKey && chatReq.messages && chatReq.messages.length > 0) {
-      const firstSys = chatReq.messages.find(m => m.role === 'system');
-      const firstUser = chatReq.messages.find(m => m.role === 'user');
-      const sysKey = typeof firstSys?.content === 'string' ? firstSys.content : JSON.stringify(firstSys?.content || '');
-      const userKey = typeof firstUser?.content === 'string' ? firstUser.content : JSON.stringify(firstUser?.content || '');
-      sessionKey = crypto.createHash('md5').update(`openai_${sysKey.substring(0, 200)}_${userKey.substring(0, 200)}`).digest('hex');
-    }
+    // 提取稳定会话唯一指纹（用于强会话粘性，最大化利用 Google 上游 Prompt Cache）
+    const sessionKey = extractSessionKeyFromOpenAI(req, chatReq);
 
+    const abortController = new AbortController();
+    const abortUpstream = () => {
+      if (!abortController.signal.aborted) abortController.abort();
+    };
+    req.raw.once('aborted', abortUpstream);
     let upstreamRes: any = null;
     try {
-      upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey);
+      upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey, abortController.signal);
     } catch (err: any) {
       if (err instanceof ContextOverflowError) {
         return reply.status(400).send({
@@ -302,13 +330,19 @@ export async function createServer(
       const toolCalls: Array<{ id?: string; name: string; arguments: string }> = [];
 
       let released = false;
+      let completed = false;
       const cleanup = (err?: any) => {
         if (released) return;
         released = true;
         pool.releaseAccount(accountUsed.id, err);
       };
 
-      req.raw.on('close', () => cleanup());
+      const onClientClose = () => {
+        if (!completed) abortUpstream();
+        cleanup({ code: 499, message: 'Client disconnected' });
+      };
+      req.raw.once('aborted', onClientClose);
+      reply.raw.once('close', onClientClose);
 
       try {
         for await (const chunk of bodyStream) {
@@ -350,10 +384,20 @@ export async function createServer(
         // 发送终止标志
         reply.raw.write('data: [DONE]\n\n');
         reply.raw.end();
+        completed = true;
         if (usageMetadata) pool.recordTokenUsage(usageMetadata);
       } catch (e: any) {
         console.error('[Gateway] SSE Streaming error:', e.message);
+        if (!reply.raw.destroyed && !reply.raw.writableEnded) {
+          reply.raw.write(`data: ${JSON.stringify({
+            error: { message: `Upstream stream failed: ${e.message}`, type: 'api_error' }
+          })}\n\n`);
+          reply.raw.write('data: [DONE]\n\n');
+          reply.raw.end();
+        }
       } finally {
+        completed = true;
+        abortUpstream();
         cleanup();
       }
     } else {

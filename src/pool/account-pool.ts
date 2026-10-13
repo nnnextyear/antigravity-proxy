@@ -83,7 +83,7 @@ export class AccountPool {
     this.sessionCleanTimer = setInterval(() => {
       const now = Date.now();
       for (const [key, val] of this.sessionBindings.entries()) {
-        if (now - val.lastUsedAt > 30 * 60 * 1000) {
+        if (now - val.lastUsedAt > 60 * 60 * 1000) {
           this.sessionBindings.delete(key);
         }
       }
@@ -297,85 +297,57 @@ export class AccountPool {
       return null;
     }
 
-    let chosen: Account;
+    let chosen: Account | null = null;
 
-    if (this.routingStrategy === 'zero-waste') {
-      // ==================== 策略 1: 零浪费智能融合调度 (Zero-Waste Hybrid) ====================
-
-      // 阶段 1: 会话粘性优先 (Session Affinity) -> 保证同一会话命中 Google 上游 Prompt Cache，省下 80%~90% 上下文 Token
-      let sessionStickyAccount: Account | null = null;
-      if (sessionKey && this.sessionBindings.has(sessionKey)) {
-        const bound = this.sessionBindings.get(sessionKey)!;
-        const candidateAcc = candidates.find(c => c.id === bound.accountId);
-        if (candidateAcc) {
-          // 检查该粘性账号是否健康且配额没有到达警戒线 (< 3%)
-          const isLowQuota = (requiredFamily === 'claude' && candidateAcc.quota && candidateAcc.quota.claude5hFraction < 0.03) ||
-                             (requiredFamily === 'gemini' && candidateAcc.quota && candidateAcc.quota.gemini5hFraction < 0.03);
-          // Cache affinity is valuable, but it must yield to a materially more
-          // urgent reset. This prevents one recently-used account from being
-          // pinned for 15 minutes while another account's weekly/5h quota is
-          // about to expire and be discarded.
-          const family5h = requiredFamily === 'claude' ? candidateAcc.quota?.claudeResetTime : candidateAcc.quota?.geminiResetTime;
-          const familyWeekly = requiredFamily === 'claude' ? candidateAcc.quota?.claudeWeeklyResetTime : candidateAcc.quota?.geminiWeeklyResetTime;
-          const bound5h = family5h ? new Date(family5h).getTime() - now : Infinity;
-          const boundWeekly = familyWeekly ? new Date(familyWeekly).getTime() - now : Infinity;
-          const hasMoreUrgentCandidate = candidates.some(candidate => {
-            if (candidate.id === candidateAcc.id || !candidate.quota) return false;
-            const reset5h = requiredFamily === 'claude' ? candidate.quota.claudeResetTime : candidate.quota.geminiResetTime;
-            const resetWeekly = requiredFamily === 'claude' ? candidate.quota.claudeWeeklyResetTime : candidate.quota.geminiWeeklyResetTime;
-            const candidate5h = reset5h ? new Date(reset5h).getTime() - now : Infinity;
-            const candidateWeekly = resetWeekly ? new Date(resetWeekly).getTime() - now : Infinity;
-            const fraction = requiredFamily === 'claude' ? candidate.quota.claude5hFraction : candidate.quota.gemini5hFraction;
-            const imminent5h = candidate5h > 0 && candidate5h <= 45 * 60 * 1000 && fraction > 0.08;
-            const weeklyUrgency = candidateWeekly > 0 && candidateWeekly + 24 * 60 * 60 * 1000 < boundWeekly;
-            const fiveHourUrgency = candidate5h > 0 && candidate5h + 5 * 60 * 1000 < bound5h;
-            return imminent5h || weeklyUrgency || fiveHourUrgency;
-          });
-          if (!isLowQuota && !hasMoreUrgentCandidate) {
-            sessionStickyAccount = candidateAcc;
-          }
-        }
+    // ==================== 统一阶段 1: 绝对会话粘性 (Pure Session Affinity - Cache First) ====================
+    // 参考 gemini-balance 黄金调度法则：
+    // 同一会话一旦锁定账号，只要该账号健康且未达最大并发，100% 死锁在该账号上！
+    // 绝不中途因为其他账号“快重置”而切走，确保 Google 上游 75%~90%+ 的 Prompt Cache 命中率。
+    if (sessionKey && this.sessionBindings.has(sessionKey)) {
+      const bound = this.sessionBindings.get(sessionKey)!;
+      const candidateAcc = candidates.find(c => c.id === bound.accountId);
+      if (candidateAcc) {
+        chosen = candidateAcc;
+        this.sessionBindings.set(sessionKey, { accountId: chosen.id, lastUsedAt: now });
       }
+    }
 
-      if (sessionStickyAccount) {
-        chosen = sessionStickyAccount;
-        this.sessionBindings.set(sessionKey!, { accountId: chosen.id, lastUsedAt: now });
-      } else {
-        // 阶段 2: 临期抢救优先 (Time-to-Reset Expiration Harvesting)
-        // 如果有账号在 45 分钟内即将重置 5 小时额度，且目前剩余额度 > 8%，必须优先用它，防止重置清零浪费！
+    // ==================== 阶段 2: 仅全新会话或旧账号满载失效时，才执行调度分配 ====================
+    if (!chosen) {
+      if (this.routingStrategy === 'zero-waste') {
+        // ==================== 策略 1: 零浪费智能调度 (新会话临期抢救 + 流水线耗尽) ====================
+        // 步骤 2.1: 临期抢救优先 (Time-to-Reset Expiration Harvesting)
+        // 如果有账号在 45 分钟内即将重置 5 小时额度，且目前剩余额度 > 8%，将新会话优先分配给它，抢救剩余额度！
         const imminentCandidates = candidates.filter(acc => {
           if (!acc.quota) return false;
           const resetTimeStr = (requiredFamily === 'claude' ? acc.quota.claudeResetTime : acc.quota.geminiResetTime);
           const fraction = (requiredFamily === 'claude' ? acc.quota.claude5hFraction : acc.quota.gemini5hFraction) ?? 1;
           if (!resetTimeStr || fraction <= 0.08) return false;
           const diffMs = new Date(resetTimeStr).getTime() - now;
-          return diffMs > 0 && diffMs <= 45 * 60 * 1000; // 45分钟内即将重置
+          return diffMs > 0 && diffMs <= 45 * 60 * 1000;
         });
 
         if (imminentCandidates.length > 0) {
-          // 临近重置者中，剩余时间最近且额度最多的优先
           imminentCandidates.sort((a, b) => {
             const timeA = new Date(requiredFamily === 'claude' ? a.quota!.claudeResetTime! : a.quota!.geminiResetTime!).getTime();
             const timeB = new Date(requiredFamily === 'claude' ? b.quota!.claudeResetTime! : b.quota!.geminiResetTime!).getTime();
-            if (Math.abs(timeA - timeB) > 5 * 60 * 1000) return timeA - timeB; // 时间差大于5分钟，先救最近的
+            if (Math.abs(timeA - timeB) > 5 * 60 * 1000) return timeA - timeB;
             const fracA = (requiredFamily === 'claude' ? a.quota!.claude5hFraction : a.quota!.gemini5hFraction) ?? 0;
             const fracB = (requiredFamily === 'claude' ? b.quota!.claude5hFraction : b.quota!.gemini5hFraction) ?? 0;
-            return fracB - fracA; // 额度多的先用
+            return fracB - fracA;
           });
           chosen = imminentCandidates[0];
-          console.log(`[AccountPool] 🎯 [Zero-Waste 临期抢救] 优先调度账号 ${chosen.email} (5h额度即将重置，抢救剩余额度)`);
+          console.log(`[AccountPool] 🎯 [Zero-Waste 临期抢救] 新会话分配至账号 ${chosen.email} (5h额度即将重置，抢救剩余额度)`);
         } else {
-          // 阶段 3: 流水线深度耗尽 (Sequential Pipeline)
-          // 优先集中消耗当前的主力活跃账号（最近 15 分钟内被活跃调用的账号），直到其 5h 额度用透再切下一个，让前序账号拥有完整的 5 小时回满时间！
+          // 步骤 2.2: 流水线深度耗尽 (Sequential Pipeline)
+          // 优先集中消耗当前的主力活跃账号，直到其 5h 额度用透再切下一个，让前序账号拥有完整的 5 小时回满时间！
           candidates.sort((a, b) => {
-            // 首先排除周额度极度危险的账号（< 3%）
+            // 排除周额度极度危险的账号（< 3%）
             const aWeekly = (requiredFamily === 'claude' ? a.quota?.claudeWeeklyFraction : a.quota?.geminiWeeklyFraction) ?? 1;
             const bWeekly = (requiredFamily === 'claude' ? b.quota?.claudeWeeklyFraction : b.quota?.geminiWeeklyFraction) ?? 1;
             if (aWeekly <= 0.03 && bWeekly > 0.03) return 1;
             if (bWeekly <= 0.03 && aWeekly > 0.03) return -1;
 
-            // 时间紧迫度优先于“15 分钟主力号”：先消耗更接近周重置的账号，
-            // 防止周期结束时剩余额度被刷新浪费；周重置接近时再比较 5h 重置。
             const getResetDelay = (account: Account, weekly: boolean): number => {
               if (!account.quota) return Infinity;
               const resetTime = weekly
@@ -402,19 +374,17 @@ export class AccountPool {
               }
             }
 
-            // 多个同类候选时，先按并发数均衡。主力号优先不能压过
-            // least-connections，否则第二个并发请求会继续锁在同一账号。
+            // 多个同类候选时，优先按并发数均衡
             if (a.activeConcurrency !== b.activeConcurrency) {
               return a.activeConcurrency - b.activeConcurrency;
             }
 
-            // 并发相同且额度状态相近时，再保留主力号的缓存粘性。
+            // 保持主力活跃号集中消耗
             const aIsActiveDrain = (now - a.lastUsedAt < 15 * 60 * 1000) && ((requiredFamily === 'claude' ? a.quota?.claude5hFraction : a.quota?.gemini5hFraction) ?? 1) > 0.05;
             const bIsActiveDrain = (now - b.lastUsedAt < 15 * 60 * 1000) && ((requiredFamily === 'claude' ? b.quota?.claude5hFraction : b.quota?.gemini5hFraction) ?? 1) > 0.05;
             if (aIsActiveDrain && !bIsActiveDrain) return -1;
             if (bIsActiveDrain && !aIsActiveDrain) return 1;
 
-            // 5h 额度充裕的优先接棒
             const a5h = (requiredFamily === 'claude' ? a.quota?.claude5hFraction : a.quota?.gemini5hFraction) ?? 1;
             const b5h = (requiredFamily === 'claude' ? b.quota?.claude5hFraction : b.quota?.gemini5hFraction) ?? 1;
             return b5h - a5h;
@@ -422,31 +392,30 @@ export class AccountPool {
           chosen = candidates[0];
         }
 
-        // 建立新的会话粘性
-        if (sessionKey) {
-          this.sessionBindings.set(sessionKey, { accountId: chosen.id, lastUsedAt: now });
-        }
+      } else if (this.routingStrategy === 'sequential-drain') {
+        // ==================== 策略 2: 流水线顺序耗尽模式 (Sequential Drain) ====================
+        candidates.sort((a, b) => {
+          if (a.activeConcurrency === 0 && b.activeConcurrency > 0) return -1;
+          if (b.activeConcurrency === 0 && a.activeConcurrency > 0) return 1;
+          return a.createdAt - b.createdAt;
+        });
+        chosen = candidates[0];
+
+      } else {
+        // ==================== 策略 3: 传统均衡轮询模式 (Round-Robin) ====================
+        candidates.sort((a, b) => {
+          if (a.activeConcurrency !== b.activeConcurrency) {
+            return a.activeConcurrency - b.activeConcurrency;
+          }
+          return a.lastUsedAt - b.lastUsedAt;
+        });
+        chosen = candidates[0];
       }
 
-    } else if (this.routingStrategy === 'sequential-drain') {
-      // ==================== 策略 2: 流水线顺序耗尽模式 (Sequential Drain) ====================
-      // 严格按照账号列表顺序，打满一个再切下一个
-      candidates.sort((a, b) => {
-        if (a.activeConcurrency === 0 && b.activeConcurrency > 0) return -1;
-        if (b.activeConcurrency === 0 && a.activeConcurrency > 0) return 1;
-        return a.createdAt - b.createdAt;
-      });
-      chosen = candidates[0];
-
-    } else {
-      // ==================== 策略 3: 传统均衡轮询模式 (Round-Robin) ====================
-      candidates.sort((a, b) => {
-        if (a.activeConcurrency !== b.activeConcurrency) {
-          return a.activeConcurrency - b.activeConcurrency;
-        }
-        return a.lastUsedAt - b.lastUsedAt;
-      });
-      chosen = candidates[0];
+      // 新会话首次分配，立刻建立强粘性绑定，锁死后续所有连续请求
+      if (sessionKey) {
+        this.sessionBindings.set(sessionKey, { accountId: chosen.id, lastUsedAt: now });
+      }
     }
 
     chosen.activeConcurrency++;

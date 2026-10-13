@@ -162,7 +162,8 @@ export class RequestExecutor {
   public async executeWithRetry(
     payload: GoogleCloudCodePayload,
     maxRetries = 3,
-    sessionKey?: string
+    sessionKey?: string,
+    signal?: AbortSignal
   ): Promise<UpstreamExecutionResult> {
     const triedAccountIds = new Set<string>();
     const model = (payload.model || '').toLowerCase();
@@ -233,7 +234,8 @@ export class RequestExecutor {
           body: JSON.stringify(payload),
           headersTimeout: 600000,
           bodyTimeout: 600000,
-          dispatcher
+          dispatcher,
+          signal
         });
 
         // 成功状态
@@ -314,13 +316,25 @@ export class RequestExecutor {
           throw new ContextOverflowError(res.statusCode, errBody);
         }
         if (isLocationNotSupported(res.statusCode, errBody)) {
-          console.error(`[Executor] 🚨 账号 ${account.email} 遭遇 Google 地区限制: User location is not supported for the API use. 当前代理出口节点所处地区不受 Google API 支持，请在代理软件（如 Clash）中将出口节点切换为美国(US)、日本(JP)、新加坡(SG)等支持地区，避免使用香港(HK)节点。`);
           resetDispatcher(effectiveProxy, { timeoutMs: 60000 });
           if (attempt < maxRetries) {
             triedAccountIds.delete(account.id);
-            console.warn(`[Executor] 正在重建代理连接并重试 (${attempt + 1}/${maxRetries})。`);
-            await new Promise(r => setTimeout(r, attempt * 1000));
+            console.warn(`[Executor] ⚠️ 触发 Google 链路地区抖动 (HTTP 400)，正在极速刷新代理隧道重试 (${attempt + 1}/${maxRetries})...`);
             continue;
+          }
+          console.error(`[Executor] 🚨 账号 ${account.email} 遭遇 Google 地区限制: User location is not supported for the API use.`);
+          console.error(`[Executor] 💡 原因定位：当前代理出口节点或其所属数据中心机房段 (ASN) 被 Google API 判定为不受支持地区。`);
+          console.error(`[Executor] 💡 诊断建议：请在代理软件（如 Clash）中更换其他美国(US)、日本(JP)或新加坡(SG)节点，避免使用同一条不稳定的出口链路。`);
+          if (effectiveProxy) {
+            const probeDisp = getOrCreateDispatcher(effectiveProxy, { timeoutMs: 5000 });
+            request('https://ipinfo.io/json', { dispatcher: probeDisp, headersTimeout: 5000, bodyTimeout: 5000 })
+              .then(async r => {
+                if (r.statusCode === 200) {
+                  const info = (await r.body.json()) as any;
+                  console.error(`[Executor] 🔍 出口 IP 探测：当前代理出口为 ${info.ip} (${info.country} - ${info.city || ''}, ${info.org || ''})`);
+                }
+              })
+              .catch(() => {});
           }
           throw new LocationNotSupportedError(res.statusCode, errBody);
         }
