@@ -9,7 +9,7 @@
     "build": "tsc",
     "extract-local": "tsx scripts/extract-local.ts",
     "login": "tsx scripts/oauth-login.ts",
-    "test": "tsx tests/test-system.ts"
+    "test": "node --import tsx --test tests/*.test.ts"
   },
   "keywords": ["antigravity", "openai-proxy", "account-rotation", "gemini"],
   "author": "",

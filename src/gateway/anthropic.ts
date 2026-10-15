@@ -4,7 +4,14 @@ import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { AppConfig, GoogleCloudCodePayload, GoogleContent } from '../types.js';
 import { AccountPool, mergeUsageMetadata } from '../pool/account-pool.js';
 import { ContextOverflowError, LocationNotSupportedError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
-import { resolveDynamicUpstreamModel, ThinkingEffort } from './models.js';
+import {
+  ModelRequestError,
+  ResolvedModel,
+  resolveDynamicUpstreamModel,
+  resolveFrameworkThinking,
+  resolveThinkingConfig,
+} from './models.js';
+import { attachUpstreamSessionId, extractSessionKey } from './session.js';
 
 interface AnthropicMessageParam {
   role: 'user' | 'assistant';
@@ -19,7 +26,7 @@ interface AnthropicMessageRequest {
   temperature?: number;
   stream?: boolean;
   thinking?: {
-    type?: 'enabled' | 'disabled';
+    type?: 'enabled' | 'disabled' | 'adaptive';
     budget_tokens?: number;
   };
   tools?: any[];
@@ -63,36 +70,7 @@ function sanitizeToolName(name: string): string {
  * 绝不能把动态可变的 system prompt 卷入 hash，确保长对话过程中 sessionKey 永不漂移。
  */
 export function extractSessionKeyFromAnthropic(req: FastifyRequest, body: AnthropicMessageRequest): string | undefined {
-  const headerSession = (
-    req.headers['x-session-id'] ||
-    req.headers['session-id'] ||
-    req.headers['conversation-id'] ||
-    req.headers['x-conversation-id'] ||
-    (body as any)?.metadata?.user_id ||
-    (body as any)?.metadata?.session_id
-  ) as string | undefined;
-
-  if (headerSession && typeof headerSession === 'string' && headerSession.trim()) {
-    return headerSession.trim();
-  }
-
-  if (body?.messages && Array.isArray(body.messages) && body.messages.length > 0) {
-    const firstUser = body.messages.find(m => m.role === 'user');
-    if (firstUser) {
-      let rawText = '';
-      if (typeof firstUser.content === 'string') {
-        rawText = firstUser.content;
-      } else if (Array.isArray(firstUser.content)) {
-        const textPart = firstUser.content.find((p: any) => p && (p.type === 'text' || typeof p === 'string'));
-        rawText = typeof textPart === 'string' ? textPart : (textPart?.text || JSON.stringify(firstUser.content[0] || ''));
-      }
-      if (rawText.trim()) {
-        return crypto.createHash('sha256').update(`anthropic_session_${rawText.trim().substring(0, 300)}`).digest('hex');
-      }
-    }
-  }
-
-  return undefined;
+  return extractSessionKey(req.headers as Record<string, unknown>, body, 'anthropic');
 }
 
 // 缓存 Gemini 思考签名，以便在多轮对话中回传真实 thoughtSignature
@@ -253,7 +231,10 @@ function convertAnthropicMessages(
  */
 function sanitizeGoogleSchema(schema: any): any {
   if (!schema || typeof schema !== 'object') return schema;
-  if (Array.isArray(schema)) return schema.map(sanitizeGoogleSchema);
+  // Google Schema requires array.items to be a concrete Schema object. JSON
+  // Schema may omit it or provide tuple items, so use the first item and a
+  // string fallback rather than emitting an empty Proto message.
+  if (Array.isArray(schema)) return sanitizeGoogleSchema(schema[0] || { type: 'string' });
 
   let s = { ...schema };
 
@@ -348,6 +329,12 @@ function sanitizeGoogleSchema(schema: any): any {
   if (result.type === 'object' && !result.properties) {
     result.properties = {};
   }
+  if (!result.type) {
+    result.type = result.properties ? 'object' : result.items ? 'array' : result.enum ? 'string' : 'string';
+  }
+  if (result.type === 'array') {
+    result.items = sanitizeGoogleSchema(result.items || { type: 'string' });
+  }
 
   return result;
 }
@@ -369,7 +356,13 @@ export function registerAnthropicRoutes(
       return reply.status(400).send({ type: 'error', error: { type: 'invalid_request_error', message: 'messages is required and must be an array' } });
     }
 
-    const modelDef = resolveDynamicUpstreamModel(body.model || 'claude-sonnet-4-6', 'high');
+    let modelDef: ResolvedModel;
+    try {
+      modelDef = resolveDynamicUpstreamModel(body.model, await executor.fetchAvailableModels());
+    } catch (err: any) {
+      const statusCode = err instanceof ModelRequestError ? 400 : err instanceof UpstreamRequestError ? err.statusCode : 503;
+      return reply.status(statusCode).send({ type: 'error', error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message: err.message } });
+    }
     const converted = convertAnthropicMessages(body.messages, modelDef.upstreamModel.startsWith('gemini'));
     const systemTexts = [...converted.systemFromMessages];
     if (body.system) {
@@ -410,36 +403,30 @@ export function registerAnthropicRoutes(
     }
 
     // 1. 动态思考预算检测
-    let effort: ThinkingEffort = 'high';
-    let budgetTokens = 0;
-
-    if (body.thinking) {
-      if (body.thinking.type === 'disabled') {
-        effort = 'none';
-      } else if (typeof body.thinking.budget_tokens === 'number') {
-        budgetTokens = body.thinking.budget_tokens;
-        if (budgetTokens <= 1500) effort = 'low';
-        else if (budgetTokens <= 5000) effort = 'medium';
-        else effort = 'high';
-      }
+    let thinking: ReturnType<typeof resolveFrameworkThinking>;
+    let modelDef: ResolvedModel;
+    try {
+      thinking = resolveFrameworkThinking(body);
+      modelDef = resolveDynamicUpstreamModel(body.model, await executor.fetchAvailableModels());
+    } catch (err: any) {
+      const statusCode = err instanceof ModelRequestError ? 400 : err instanceof UpstreamRequestError ? err.statusCode : 503;
+      return reply.status(statusCode).send({ type: 'error', error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message: err.message } });
     }
+    const { effort, budgetTokens } = thinking;
 
     // 2. 转换模型与消息
-    const modelDef = resolveDynamicUpstreamModel(body.model, effort);
     const isGemini = modelDef.upstreamModel.startsWith('gemini');
     const { contents, systemFromMessages } = convertAnthropicMessages(body.messages, isGemini);
 
-    const defaultMaxOutput = isGemini ? 65536 : 8192;
+    const defaultMaxOutput = Number(modelDef.info?.maxOutputTokens ?? modelDef.info?.outputTokenLimit)
+      || (isGemini ? 65536 : 64000);
     const generationConfig: any = {
       temperature: body.temperature ?? 0.7,
       maxOutputTokens: body.max_tokens ? Math.min(body.max_tokens, defaultMaxOutput) : defaultMaxOutput
     };
 
-    if (budgetTokens > 0) {
-      generationConfig.thinkingConfig = {
-        thinkingBudget: budgetTokens
-      };
-    }
+    const thinkingConfig = resolveThinkingConfig(modelDef.upstreamModel, effort, budgetTokens, modelDef.info, generationConfig.maxOutputTokens);
+    if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
 
     // Claude Code uses this for its built-in /goal Stop hook. The hook expects
     // a JSON verdict; silently dropping the format makes it return prose and
@@ -526,6 +513,7 @@ export function registerAnthropicRoutes(
 
     // 提取稳定会话唯一指纹（用于强会话粘性，最大化利用 Google 上游 Prompt Cache）
     const sessionKey = extractSessionKeyFromAnthropic(req, body);
+    attachUpstreamSessionId(payload, sessionKey);
 
     // Anthropic clients use message_start.usage.input_tokens to decide when to
     // run their native context compaction. Count the exact Google request before
@@ -627,7 +615,7 @@ export function registerAnthropicRoutes(
         let lastUsageMetadata: any = null;
         let lastSignature: string | undefined;
         const seenToolCalls = new Set<string>();
-        const clientRequestedThinking = Boolean(body.thinking && body.thinking.type !== 'disabled') || budgetTokens > 0;
+        const clientRequestedThinking = effort !== undefined && effort !== 'none';
 
         for await (const chunk of bodyStream) {
           buffer += decoder.write(chunk);
@@ -836,7 +824,7 @@ export function registerAnthropicRoutes(
       let buffer = '';
       const decoder = new StringDecoder('utf-8');
       let lastUsageMetadata: any = null;
-      const clientRequestedThinking = Boolean(body.thinking && body.thinking.type !== 'disabled') || budgetTokens > 0;
+      const clientRequestedThinking = effort !== undefined && effort !== 'none';
 
       try {
         for await (const chunk of bodyStream) {

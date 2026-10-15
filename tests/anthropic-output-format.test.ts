@@ -19,6 +19,7 @@ test('Claude Code /goal JSON schema reaches the Google generation request', asyn
   const app = fastify();
   let captured: GoogleCloudCodePayload | undefined;
   const executor = {
+    fetchAvailableModels: async () => ({ models: { 'claude-sonnet-4-6': { maxOutputTokens: 64000 } } }),
     countTokens: async () => ({ totalTokens: 42 }),
     executeWithRetry: async (payload: GoogleCloudCodePayload) => {
       captured = payload;
@@ -50,6 +51,7 @@ test('Claude Code /goal JSON schema reaches the Google generation request', asyn
       }
     });
     assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(captured?.request.generationConfig?.thinkingConfig, { thinkingBudget: 32768 });
     assert.equal(captured?.request.generationConfig?.responseMimeType, 'application/json');
     assert.deepEqual(captured?.request.generationConfig?.responseSchema, {
       type: 'object',

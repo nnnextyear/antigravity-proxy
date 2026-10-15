@@ -73,9 +73,10 @@ export interface OpenAIChatCompletionRequest {
   max_tokens?: number;
   presence_penalty?: number;
   frequency_penalty?: number;
-  reasoning_effort?: 'low' | 'medium' | 'high' | 'none';
+  reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'auto';
+  reasoning?: { effort?: OpenAIChatCompletionRequest['reasoning_effort'] };
   thinking?: {
-    type?: 'enabled' | 'disabled';
+    type?: 'enabled' | 'disabled' | 'adaptive';
     budget_tokens?: number;
   };
   thinking_budget?: number;
@@ -128,6 +129,7 @@ export interface GoogleCloudCodePayload {
   project?: string;
   model?: string;
   request: {
+    sessionId?: string;
     contents: GoogleContent[];
     systemInstruction?: {
       parts: GooglePart[];

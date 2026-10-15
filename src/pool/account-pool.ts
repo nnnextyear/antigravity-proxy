@@ -159,6 +159,16 @@ export class AccountPool {
     return this.accounts.get(id);
   }
 
+  public getSessionBinding(sessionKey: string): { accountId: string; lastUsedAt: number } | undefined {
+    return this.sessionBindings.get(sessionKey);
+  }
+
+  private clearSessionBinding(sessionKey: string | undefined, accountId: string): void {
+    if (!sessionKey) return;
+    const binding = this.sessionBindings.get(sessionKey);
+    if (binding?.accountId === accountId) this.sessionBindings.delete(sessionKey);
+  }
+
   public addAccount(params: {
     email: string;
     refreshToken: string;
@@ -234,6 +244,22 @@ export class AccountPool {
     sessionKey?: string
   ): Account | null {
     const now = Date.now();
+    const existingBinding = sessionKey ? this.sessionBindings.get(sessionKey) : undefined;
+    if (existingBinding) {
+      const boundAccount = this.accounts.get(existingBinding.accountId);
+      if (!boundAccount || boundAccount.status === 'dead' || boundAccount.status === 'disabled') {
+        this.sessionBindings.delete(sessionKey!);
+      } else if (boundAccount.status === 'active' && !excludeIds.has(boundAccount.id) && boundAccount.activeConcurrency >= boundAccount.maxConcurrency) {
+        // A bound conversation waits for its own lease. Never borrow another
+        // account merely because the bound account is momentarily full.
+        return null;
+      } else if (excludeIds.has(boundAccount.id)) {
+        // The executor must clear a permanent failure before asking for a new
+        // account. This guard prevents an accidental retry exclusion from
+        // silently overwriting a healthy conversation binding.
+        return null;
+      }
+    }
     const candidates: Account[] = [];
 
     for (const acc of this.accounts.values()) {
@@ -299,12 +325,12 @@ export class AccountPool {
 
     let chosen: Account | null = null;
 
-    // ==================== 统一阶段 1: 绝对会话粘性 (Pure Session Affinity - Cache First) ====================
-    // 参考 gemini-balance 黄金调度法则：
-    // 同一会话一旦锁定账号，只要该账号健康且未达最大并发，100% 死锁在该账号上！
-    // 绝不中途因为其他账号“快重置”而切走，确保 Google 上游 75%~90%+ 的 Prompt Cache 命中率。
-    if (sessionKey && this.sessionBindings.has(sessionKey)) {
-      const bound = this.sessionBindings.get(sessionKey)!;
+    // ==================== 统一阶段 1: 会话粘性 (Pure Session Affinity - Cache First) ====================
+    // 只要绑定账号仍健康且有空闲并发，就复用该账号。缓存命中率
+    // 仍取决于上游 TTL、请求前缀和客户端是否提供稳定会话 ID，不能在
+    // 调度层承诺固定比例。
+    if (sessionKey && existingBinding) {
+      const bound = existingBinding;
       const candidateAcc = candidates.find(c => c.id === bound.accountId);
       if (candidateAcc) {
         chosen = candidateAcc;
@@ -429,7 +455,12 @@ export class AccountPool {
   /**
    * 释放借出的账号，并处理错误与状态更新
    */
-  public releaseAccount(accId: string, error?: { code: number; message: string }, family?: 'claude' | 'gemini'): void {
+  public releaseAccount(
+    accId: string,
+    error?: { code: number; message: string },
+    family?: 'claude' | 'gemini',
+    sessionKey?: string
+  ): void {
     const acc = this.accounts.get(accId);
     if (!acc) return;
 
@@ -467,24 +498,18 @@ export class AccountPool {
 
         this.saveAccounts();
 
-        // 清理绑定在该账号上的会话粘性，使后续请求自动平滑漂移至健康备用账号
-        for (const [sKey, binding] of this.sessionBindings.entries()) {
-          if (binding.accountId === accId) {
-            this.sessionBindings.delete(sKey);
-          }
-        }
+        // 只清理触发此次失败的会话。一个账号上的其他会话不能因为
+        // 某个模型或某个会话的 429 全部失去粘性。
+        this.clearSessionBinding(sessionKey, accId);
       } else if (error.code === 401) {
         // 凭证过期，需刷新
         console.warn(`[CircuitBreaker] Account ${acc.email} returned 401, token will be refreshed.`);
+        this.clearSessionBinding(sessionKey, accId);
       } else if (error.code === 403) {
         // 权限或封禁，标记为 dead
         acc.status = 'dead';
         console.error(`[CircuitBreaker] Account ${acc.email} marked as DEAD due to 403 Forbidden.`);
-        for (const [sKey, binding] of this.sessionBindings.entries()) {
-          if (binding.accountId === accId) {
-            this.sessionBindings.delete(sKey);
-          }
-        }
+        this.clearSessionBinding(sessionKey, accId);
       }
     }
   }

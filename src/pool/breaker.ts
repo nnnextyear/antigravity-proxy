@@ -4,6 +4,7 @@ import { AccountPool } from './account-pool.js';
 import { TokenRefresher } from './refresher.js';
 import { QuotaManager } from './quota-manager.js';
 import { getOrCreateDispatcher, resetDispatcher } from './dispatcher.js';
+import type { LiveModelCatalog } from '../gateway/models.js';
 
 export interface UpstreamExecutionResult {
   statusCode: number;
@@ -14,6 +15,10 @@ export interface UpstreamExecutionResult {
 
 export interface UpstreamTokenCountResult {
   totalTokens: number;
+  accountUsed: Account;
+}
+
+export interface AvailableModelsResult extends LiveModelCatalog {
   accountUsed: Account;
 }
 
@@ -66,6 +71,140 @@ export class RequestExecutor {
     private quotaManager?: QuotaManager
   ) {}
 
+  /**
+   * Acquire a lease while preserving an established conversation binding.
+   * A full bound account is a queueing condition, not a reason to migrate the
+   * conversation. Permanent failures clear the binding before this is called.
+   */
+  private async acquireRequestAccount(
+    excludeIds: Set<string>,
+    requiredFamily: 'claude' | 'gemini',
+    sessionKey: string | undefined,
+    signal?: AbortSignal
+  ): Promise<Account | null> {
+    const maxWaitMs = 120000;
+    const pollMs = 100;
+    const deadline = Date.now() + maxWaitMs;
+
+    while (true) {
+      if (signal?.aborted) throw new Error('Request aborted by client.');
+      const account = this.pool.acquireAccount(excludeIds, requiredFamily, sessionKey);
+      if (account) return account;
+
+      const binding = sessionKey ? this.pool.getSessionBinding(sessionKey) : undefined;
+      const bound = binding ? this.pool.getAccount(binding.accountId) : undefined;
+      const boundIsBusy = Boolean(
+        bound && bound.status === 'active' && !excludeIds.has(bound.id) && bound.activeConcurrency >= bound.maxConcurrency
+      );
+      if (!boundIsBusy) return null;
+      if (Date.now() >= deadline) {
+        throw new Error(`会话绑定账号 ${bound!.email} 当前并发已满，等待 120 秒后仍未释放；本次请求未切换账号。`);
+      }
+      await new Promise<void>((resolve, reject) => {
+        let timer: NodeJS.Timeout;
+        const onAbort = () => {
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', onAbort);
+          reject(new Error('Request aborted by client.'));
+        };
+        timer = setTimeout(() => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve();
+        }, pollMs);
+        if (!signal) return;
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener('abort', onAbort, { once: true });
+      });
+    }
+  }
+
+  /** Fetch the live model catalog from Antigravity. There is deliberately no
+   * static fallback: an unavailable control-plane endpoint must be visible to
+   * CC Switch instead of advertising models that the account cannot use. */
+  public async fetchAvailableModels(maxRetries = 3): Promise<AvailableModelsResult> {
+    const triedAccountIds = new Set<string>();
+    const modelsUrl = (() => {
+      try {
+        const url = new URL(this.config.upstreamUrl);
+        url.pathname = url.pathname.replace(/:[^/]+$/, ':fetchAvailableModels');
+        url.search = '';
+        return url.toString();
+      } catch {
+        return 'https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels';
+      }
+    })();
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const account = this.pool.acquireAccount(triedAccountIds);
+      if (!account) throw new Error('No available account for fetching the Antigravity model list.');
+      triedAccountIds.add(account.id);
+
+      if (!account.accessToken || Date.now() >= account.accessTokenExpiresAt) {
+        const refreshed = await this.refresher.refreshSingleAccount(account);
+        if (!refreshed) {
+          this.pool.releaseAccount(account.id, { code: 401, message: 'Token refresh failed while fetching models' });
+          continue;
+        }
+      }
+
+      const effectiveProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+      try {
+        const dispatcher = getOrCreateDispatcher(effectiveProxy, { timeoutMs: 30000 });
+        const res = await request(modelsUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${account.accessToken}`,
+            'Content-Type': 'application/json',
+            'User-Agent': 'antigravity/2.14.0',
+            'x-goog-api-client': 'gl-node/22.7.0 grpc-web/1.0.0'
+          },
+          body: '{}',
+          headersTimeout: 30000,
+          bodyTimeout: 30000,
+          dispatcher
+        });
+        const body = await res.body.text();
+
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          let parsed: any;
+          try {
+            parsed = JSON.parse(body);
+          } catch {
+            this.pool.releaseAccount(account.id);
+            throw new UpstreamRequestError(502, 'Antigravity returned invalid model list JSON.');
+          }
+          if (!parsed || !parsed.models || typeof parsed.models !== 'object' || Array.isArray(parsed.models)) {
+            this.pool.releaseAccount(account.id);
+            throw new UpstreamRequestError(502, 'Antigravity returned no model list.');
+          }
+          this.pool.releaseAccount(account.id);
+          return { models: parsed.models, agentModelSorts: parsed.agentModelSorts, accountUsed: account };
+        }
+
+        if (res.statusCode === 401) {
+          this.pool.releaseAccount(account.id, { code: 401, message: body });
+          if (await this.refresher.refreshSingleAccount(account)) {
+            triedAccountIds.delete(account.id);
+          }
+          continue;
+        }
+
+        this.pool.releaseAccount(account.id, { code: res.statusCode, message: body.substring(0, 500) });
+        if (res.statusCode === 429 || res.statusCode >= 500) continue;
+        throw new UpstreamRequestError(res.statusCode, body);
+      } catch (err: any) {
+        if (err instanceof UpstreamRequestError) throw err;
+        resetDispatcher(effectiveProxy, { timeoutMs: 30000 });
+        this.pool.releaseAccount(account.id);
+        if (attempt === maxRetries) throw err;
+      }
+    }
+    throw new Error('Failed to fetch the Antigravity model list after retries.');
+  }
+
   /** Uses Google's countTokens endpoint so Claude Code can run its own compaction logic. */
   public async countTokens(
     payload: GoogleCloudCodePayload,
@@ -83,7 +222,9 @@ export class RequestExecutor {
       .replace(/[?&]$/, '');
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      const account = this.pool.acquireAccount(triedAccountIds, family, sessionKey);
+      // Token counting is an auxiliary control-plane call. It must never
+      // create, replace, or delete the generation request's session binding.
+      const account = this.pool.acquireAccount(triedAccountIds, family);
       if (!account) throw new Error(`No available ${family} account for token counting.`);
       triedAccountIds.add(account.id);
 
@@ -101,6 +242,9 @@ export class RequestExecutor {
         // countTokens accepts the inner request envelope only. Sending the
         // full generation payload first doubles the upload for large prompts
         // and adds avoidable proxy/TLS failure points.
+        // Google countTokens does not need the generation session ID; keep the
+        // upstream affinity token exclusive to the actual generation call.
+        const { sessionId: _sessionId, ...countRequest } = payload.request;
         const res = await request(countUrl, {
           method: 'POST',
           headers: {
@@ -109,7 +253,7 @@ export class RequestExecutor {
             'User-Agent': 'antigravity/2.14.0',
             'x-goog-api-client': 'gl-node/22.7.0 grpc-web/1.0.0'
           },
-          body: JSON.stringify({ request: payload.request }),
+          body: JSON.stringify({ request: countRequest }),
           headersTimeout: 120000,
           bodyTimeout: 120000,
           dispatcher
@@ -146,7 +290,7 @@ export class RequestExecutor {
         if (err instanceof UpstreamRequestError) throw err;
         const retryProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
         resetDispatcher(retryProxy, { timeoutMs: 60000 });
-        this.pool.releaseAccount(account.id, { code: 500, message: `countTokens network error: ${err.message}` }, family);
+        this.pool.releaseAccount(account.id);
         if (attempt < maxRetries) {
           await new Promise(r => setTimeout(r, attempt * 1000));
         }
@@ -172,7 +316,7 @@ export class RequestExecutor {
       : 'gemini';
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      const account = this.pool.acquireAccount(triedAccountIds, family, sessionKey);
+      const account = await this.acquireRequestAccount(triedAccountIds, family, sessionKey, signal);
 
       if (!account) {
         if (family === 'claude') {
@@ -213,7 +357,7 @@ export class RequestExecutor {
       if (!account.accessToken || Date.now() >= account.accessTokenExpiresAt) {
         const ok = await this.refresher.refreshSingleAccount(account);
         if (!ok) {
-          this.pool.releaseAccount(account.id, { code: 401, message: 'Initial token refresh failed' }, family);
+          this.pool.releaseAccount(account.id, { code: 401, message: 'Initial token refresh failed' }, family, sessionKey);
           continue; // 换下一个号重试
         }
       }
@@ -252,7 +396,7 @@ export class RequestExecutor {
         if (res.statusCode === 429) {
           const errBody = await res.body.text();
           console.warn(`[Executor] 账号 ${account.email} 触发 429 限频/额度枯竭 (第 ${attempt}/${maxRetries} 次尝试)，正在无感自动换号...:`, errBody.substring(0, 120));
-          this.pool.releaseAccount(account.id, { code: 429, message: errBody }, family);
+          this.pool.releaseAccount(account.id, { code: 429, message: errBody }, family, sessionKey);
           if (this.quotaManager) {
             this.quotaManager.fetchQuotaForAccount(account).catch(() => {});
           }
@@ -268,9 +412,10 @@ export class RequestExecutor {
           const refreshOk = await this.refresher.refreshSingleAccount(account);
           if (refreshOk) {
             // 刷新成功，重试当前账号
+            this.pool.releaseAccount(account.id);
             triedAccountIds.delete(account.id);
           } else {
-            this.pool.releaseAccount(account.id, { code: 401, message: 'Token refresh failed' });
+            this.pool.releaseAccount(account.id, { code: 401, message: 'Token refresh failed' }, family, sessionKey);
           }
           continue;
         }
@@ -290,7 +435,7 @@ export class RequestExecutor {
             throw new LocationNotSupportedError(res.statusCode, errBody);
           }
           console.error(`[Executor] Account ${account.email} hit 403 Forbidden:`, errBody);
-          this.pool.releaseAccount(account.id, { code: 403, message: errBody });
+          this.pool.releaseAccount(account.id, { code: 403, message: errBody }, family, sessionKey);
           continue;
         }
 
@@ -298,14 +443,13 @@ export class RequestExecutor {
         if (res.statusCode === 503) {
           const errBody = await res.body.text();
           console.warn(`[Executor] Google Upstream 503:`, errBody);
-          if (errBody.includes('MODEL_CAPACITY_EXHAUSTED') && payload.model?.includes('gpt-oss')) {
-            console.warn(`[Executor] GPT-OSS capacity exhausted, automatically falling back to gemini-3.8-flash-high...`);
-            payload.model = 'gemini-3.8-flash-high';
-            triedAccountIds.delete(account.id);
-            this.pool.releaseAccount(account.id);
-            continue;
+          // Capacity is transient. Keep the conversation binding and retry
+          // the same account after a short backoff instead of rotating it.
+          this.pool.releaseAccount(account.id);
+          triedAccountIds.delete(account.id);
+          if (attempt < maxRetries) {
+            await new Promise(r => setTimeout(r, Math.min(1000 * attempt, 3000)));
           }
-          this.pool.releaseAccount(account.id, { code: 503, message: errBody });
           continue;
         }
 
@@ -345,11 +489,17 @@ export class RequestExecutor {
         if (err instanceof UpstreamRequestError) {
           throw err;
         }
-        // 网络层异常（如 Connect Timeout、Socket 掉线等），自动换号继续尝试，不立即中断
+        if (signal?.aborted) {
+          this.pool.releaseAccount(account.id);
+          throw err;
+        }
+        // 网络层异常只影响本次请求。保留会话绑定并有限重试同一账号，
+        // 避免普通代理抖动把整个会话永久迁移到另一个账号。
         console.error(`[Executor] Network or connection error for account ${account.email} (attempt ${attempt}/${maxRetries}):`, err.message);
         const retryProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
         resetDispatcher(retryProxy, { timeoutMs: 60000 });
-        this.pool.releaseAccount(account.id, { code: 500, message: `Network error: ${err.message}` });
+        this.pool.releaseAccount(account.id);
+        triedAccountIds.delete(account.id);
         if (attempt < maxRetries) {
           await new Promise(r => setTimeout(r, attempt * 1000));
         }

@@ -4,19 +4,35 @@ import {
   GoogleContent,
   OpenAIChatCompletionChunk
 } from '../types.js';
-import { resolveDynamicUpstreamModel, ThinkingEffort } from './models.js';
+import {
+  resolveDynamicUpstreamModel,
+  resolveFrameworkThinking,
+  resolveThinkingConfig,
+  LiveModelCatalog
+} from './models.js';
 
 // CloudCode accepts a restricted protobuf-style schema. Keep the useful
 // structural fields and drop JSON-Schema keywords that routinely cause 400s.
 function sanitizeGoogleSchema(value: any): any {
-  if (Array.isArray(value)) return value.map(sanitizeGoogleSchema);
+  // Google Schema uses one Schema object for array.items. JSON Schema also
+  // permits tuple arrays and omitted items, so collapse those forms to a
+  // concrete child schema instead of sending an empty Proto message.
+  if (Array.isArray(value)) {
+    return sanitizeGoogleSchema(value[0] || { type: 'string' });
+  }
   if (!value || typeof value !== 'object') return value;
   const result: any = {};
   for (const [key, child] of Object.entries(value)) {
     if (['$schema', '$id', '$defs', 'definitions', 'propertyNames', 'additionalProperties', 'unevaluatedProperties', 'exclusiveMinimum', 'exclusiveMaximum', 'minLength', 'maxLength', 'pattern', 'minItems', 'maxItems', 'uniqueItems'].includes(key)) continue;
     result[key] = sanitizeGoogleSchema(child);
   }
+  if (!result.type) {
+    result.type = result.properties ? 'object' : result.items ? 'array' : result.enum ? 'string' : 'string';
+  }
   if (result.type === 'object' && !result.properties) result.properties = {};
+  if (result.type === 'array') {
+    result.items = sanitizeGoogleSchema(result.items || { type: 'string' });
+  }
   return result;
 }
 
@@ -24,34 +40,14 @@ function sanitizeGoogleSchema(value: any): any {
  * 将 OpenAI 格式的 chat completions 请求转换为 Google CloudCode / Gemini 内部 payload
  * 自动检测客户端（CC / Codex）随时传入的 thinking / reasoning_effort，动态控制底层思考强度
  */
-export function convertOpenAIToCloudCode(req: OpenAIChatCompletionRequest): {
+export function convertOpenAIToCloudCode(req: OpenAIChatCompletionRequest, catalog?: LiveModelCatalog): {
   payload: GoogleCloudCodePayload;
   upstreamModel: string;
   pool: 'cli' | 'sandbox';
 } {
   // 1. 动态检测客户端随请求传入的思考强度控制
-  let effort: ThinkingEffort = 'high';
-  let budgetTokens: number | undefined = undefined;
-
-  if (req.reasoning_effort) {
-    effort = req.reasoning_effort;
-  } else if (req.thinking) {
-    if (req.thinking.type === 'disabled') {
-      effort = 'none';
-    } else if (typeof req.thinking.budget_tokens === 'number') {
-      budgetTokens = req.thinking.budget_tokens;
-      if (budgetTokens <= 1500) effort = 'low';
-      else if (budgetTokens <= 5000) effort = 'medium';
-      else effort = 'high';
-    }
-  } else if (req.thinking_budget !== undefined || req.thinkingBudget !== undefined) {
-    budgetTokens = req.thinking_budget ?? req.thinkingBudget;
-    if (budgetTokens! <= 1500) effort = 'low';
-    else if (budgetTokens! <= 5000) effort = 'medium';
-    else effort = 'high';
-  }
-
-  const modelDef = resolveDynamicUpstreamModel(req.model, effort);
+  const { effort, budgetTokens } = resolveFrameworkThinking(req);
+  const modelDef = resolveDynamicUpstreamModel(req.model, catalog);
   const isGemini = modelDef.upstreamModel.startsWith('gemini');
   const contents: GoogleContent[] = [];
   let systemInstruction: { parts: { text: string }[] } | undefined = undefined;
@@ -134,7 +130,8 @@ export function convertOpenAIToCloudCode(req: OpenAIChatCompletionRequest): {
     });
   }
 
-  const defaultMaxOutput = isGemini ? 65536 : 8192;
+  const defaultMaxOutput = Number(modelDef.info?.maxOutputTokens ?? modelDef.info?.outputTokenLimit)
+    || (isGemini ? 65536 : 64000);
   const generationConfig: any = {
     temperature: req.temperature ?? 0.7,
     topP: req.top_p ?? 0.95,
@@ -153,12 +150,8 @@ export function convertOpenAIToCloudCode(req: OpenAIChatCompletionRequest): {
     generationConfig.responseMimeType = 'application/json';
   }
 
-  // 如果客户端指定了具体的思考 Token 预算，透传给上游
-  if (budgetTokens !== undefined && budgetTokens > 0) {
-    generationConfig.thinkingConfig = {
-      thinkingBudget: budgetTokens
-    };
-  }
+  const thinkingConfig = resolveThinkingConfig(modelDef.upstreamModel, effort, budgetTokens, modelDef.info, generationConfig.maxOutputTokens);
+  if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
 
   const innerRequest: any = {
     contents,

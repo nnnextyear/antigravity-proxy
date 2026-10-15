@@ -102,29 +102,25 @@ flowchart TD
 
 ## 🧠 纯净官方模型矩阵与动态思考调度
 
-向客户端暴露的 `/v1/models` 仅包含 15 款真实官方模型，思考强度完全由客户端在发起请求时按需动态控制：
-
-| 客户端模型 ID (`model`) | 官方全称 | 上游真实底座 | 特性与动态思考支持 |
-| :--- | :--- | :--- | :--- |
-| **`claude-3-7-sonnet`** | Claude 3.7 Sonnet | `claude-sonnet-4-6` | Anthropic 最新旗舰编程模型，支持 1M 上下文 |
-| **`claude-3-5-sonnet`** | Claude 3.5 Sonnet | `claude-sonnet-4-6` | Anthropic 主力编程模型 (CC Switch 推荐) |
-| **`claude-3-opus`** | Claude 3 Opus | `claude-opus-4-6-thinking` | Anthropic 官方正统 Opus 旗舰推理底座 |
-| **`claude-3-5-haiku`** | Claude 3.5 Haiku | `claude-sonnet-4-6` | 高速轻量模型，映射高速 Sonnet 底座 |
-| **`gemini-3.8-flash`** | Gemini 3.8 Flash | `gemini-3.8-flash-{low/med/high}` | 纯净旗舰底座，思考强度由 CC/Codex 动态调节 |
-| **`gemini-3.7-flash`** | Gemini 3.7 Flash | `gemini-3.7-flash-{low/med/high}` | 纯净底座，思考强度由 CC/Codex 动态调节 |
-| **`gemini-3.6-flash`** | Gemini 3.6 Flash | `gemini-3.6-flash-{low/med/high}` | 纯净底座，思考强度由 CC/Codex 动态调节 |
-| **`gemini-3.1-pro`** | Gemini 3.1 Pro | `gemini-pro-agent` / `3.1-pro-low` | 深度推理与 Agent 专用底座 |
-| **`gemini-2.5-pro`** | Gemini 2.5 Pro | `gemini-2.5-pro` | 经典大上下文模型 |
-| **`gemini-2.5-flash`** | Gemini 2.5 Flash | `gemini-2.5-flash` | 极速轻量模型 |
-| **`gpt-4o`** | GPT-4o | `gpt-oss-120b-medium` | OpenAI 官方旗舰标识 (映射 Google 120B 开源底座) |
-| **`gpt-4o-mini`** | GPT-4o Mini | `gpt-oss-120b-medium` | OpenAI 轻量标识 |
-| **`gpt-oss-120b`** | GPT-OSS 120B | `gpt-oss-120b-medium` | Google 官方开源 120B 旗舰模型 |
-| **`claude-opus-4-6-thinking`** | Claude Opus 4.6 (Thinking) | `claude-opus-4-6-thinking` | Google 内部原生全称 |
-| **`claude-sonnet-4-6`** | Claude Sonnet 4.6 | `claude-sonnet-4-6` | Google 内部原生全称 |
+向客户端暴露的 `/v1/models` 每次都从 Antigravity 实时获取，以 `agentModelSorts` 中的模型选择器目录为准，不返回补全、搜索和旧版内部入口。同一个模型的 `-low`、`-medium`、`-high`、`-tiered`、`-thinking` 等预设会合并为一个模型。接口失败直接返回错误，不回退固定或过期列表；模型版本不会互相替换。
 
 > **💡 如何在客户端动态调节思考强度？**
-> - **在 Claude Code (CC) 中**：直接输入 `/effort low`、`/effort medium` 或 `/effort high`，服务会自动向 Google 上游匹配对应的思考深度；
-> - **在 Codex / Cline / OpenAI SDK 中**：在请求体中附带 `"reasoning_effort": "low" | "medium" | "high"`，网关会自动路由至对应的思考底座。
+> - **Claude Code**：读取框架发送的 `output_config.effort` 和 `thinking`（包括 `adaptive`、`disabled`、`budget_tokens`）。
+> - **Codex / OpenAI 协议**：读取 `reasoning_effort` 或 Responses API 的 `reasoning.effort`。
+> - 未传思考设置时保留上游默认行为；模型名里的思考后缀不会覆盖框架设置。
+
+六档请求级别为 `minimal / low / medium / high / xhigh / max`。Gemini 3 用 `thinkingLevel`，按实时目录支持的档位收敛，不会伪造六个原生等级。例如当前 Gemini 3.8 Flash：
+
+| 框架 effort | Gemini 3.8 Flash thinkingLevel |
+| :--- | :--- |
+| minimal | low |
+| low | low |
+| medium | medium |
+| high | high |
+| xhigh | high |
+| max | high |
+
+Gemini 2.5 / Claude 使用 token budget，六档预算依次为 4096 / 8192 / 16384 / 24576 / 32768 / 32768，并受模型及输出上限约束。显式预算保留，`-1` 表示自动、`0` 表示关闭；Gemini 3 及 Gemini 2.5 Pro 无法关闭思考时使用模型支持的最低档位。
 
 ---
 

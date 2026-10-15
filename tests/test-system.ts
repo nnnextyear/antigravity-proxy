@@ -134,19 +134,20 @@ async function runTests() {
     // 5. 测试纯净模型名与动态思考强度解析 (Opus, Sonnet, Gemini 3.8 等)
     console.log('5️⃣ Testing Clean Model IDs & Dynamic Thinking Effort Resolution...');
     const { resolveDynamicUpstreamModel } = await import('../src/gateway/models.js');
+    const catalogFixture = { models: {
+      'claude-opus-4-6-thinking': {}, 'claude-sonnet-4-6': {},
+      'gemini-3.8-flash-tiered': {}, 'gpt-oss-120b-medium': {}
+    } };
     const testCases = [
-      { input: 'claude-3-opus', effort: 'high', expected: 'claude-opus-4-6-thinking' },
-      { input: 'claude-3-5-sonnet', effort: 'high', expected: 'claude-sonnet-4-6' },
-      { input: 'gemini-3.8-flash', effort: 'high', expected: 'gemini-3.8-flash-high' },
-      { input: 'gemini-3.8-flash', effort: 'medium', expected: 'gemini-3.8-flash-medium' },
-      { input: 'gemini-3.8-flash', effort: 'low', expected: 'gemini-3.8-flash-low' },
-      { input: 'gemini-3.7-flash', effort: 'low', expected: 'gemini-3.7-flash-low' },
-      { input: 'gpt-4o', effort: 'high', expected: 'gpt-oss-120b-medium' }
+      { input: 'claude-opus-4-6', expected: 'claude-opus-4-6-thinking' },
+      { input: 'claude-sonnet-4-6', expected: 'claude-sonnet-4-6' },
+      { input: 'gemini-3.8-flash', expected: 'gemini-3.8-flash-tiered' },
+      { input: 'gpt-oss-120b', expected: 'gpt-oss-120b-medium' }
     ];
     for (const tc of testCases) {
-      const resolved = resolveDynamicUpstreamModel(tc.input, tc.effort as any);
+      const resolved = resolveDynamicUpstreamModel(tc.input, catalogFixture);
       if (resolved.upstreamModel === tc.expected) {
-        console.log(`   ✅ [${tc.input}] (effort: ${tc.effort}) correctly routed to upstream [${resolved.upstreamModel}]`);
+        console.log(`   ✅ [${tc.input}] resolved to catalog entry [${resolved.upstreamModel}]`);
       } else {
         throw new Error(`Failed to resolve ${tc.input}: got ${resolved.upstreamModel}, expected ${tc.expected}`);
       }

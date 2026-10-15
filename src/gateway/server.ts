@@ -8,11 +8,12 @@ import { AppConfig, OpenAIChatCompletionRequest } from '../types.js';
 import { AccountPool, mergeUsageMetadata } from '../pool/account-pool.js';
 import { TokenRefresher } from '../pool/refresher.js';
 import { ContextOverflowError, LocationNotSupportedError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
-import { SUPPORTED_MODELS } from './models.js';
 import { convertOpenAIToCloudCode, createOpenAIChunk, extractTextFromGoogleChunk } from './adapter.js';
+import { ModelRequestError, toPublicModelCatalog } from './models.js';
 import { registerAdminRoutes } from '../admin/routes.js';
 import { registerAnthropicRoutes } from './anthropic.js';
 import { QuotaManager } from '../pool/quota-manager.js';
+import { attachUpstreamSessionId, extractSessionKey } from './session.js';
 
 export async function createServer(
   config: AppConfig,
@@ -123,32 +124,50 @@ export async function createServer(
 
   // ===================== OpenAI / CC Switch 模型查询路由 =====================
 
-  // GET /v1/models 以及 GET /models (支持 CC Switch 及各类第三方客户端发现模型列表)
+  // GET /v1/models 以及 GET /models (直接返回当前账号从 Antigravity 拉取的目录)
   const handleGetModels = async (req: FastifyRequest, reply: FastifyReply) => {
     verifyClientAuth(req, reply);
     if (reply.sent) return;
-    return {
-      object: 'list',
-      data: SUPPORTED_MODELS.map(m => ({
-        id: m.id,
-        object: 'model',
-        owned_by:
-          m.id.includes('claude') || m.id.includes('opus') || m.id.includes('sonnet') || m.id.includes('haiku')
+    try {
+      const result = await executor.fetchAvailableModels();
+      reply.header('Cache-Control', 'no-store');
+      const data = toPublicModelCatalog(result).map(({ id: normalizedId, info, sourceId }) => {
+        const contextLength = Number(info.inputTokenLimit ?? info.maxTokens ?? info.contextLength ?? info.context_length) || 1048576;
+        const maxOutputTokens = Number(info.outputTokenLimit ?? info.maxOutputTokens ?? info.max_output_tokens) || 65536;
+        return {
+          id: normalizedId,
+          object: 'model',
+          owned_by: normalizedId.includes('claude') || normalizedId.includes('opus') || normalizedId.includes('sonnet') || normalizedId.includes('haiku')
             ? 'anthropic'
-            : m.id.includes('gpt') || m.id.includes('o1') || m.id.includes('o3') || m.id.includes('chatgpt')
+            : normalizedId.includes('gpt') || normalizedId.includes('o1') || normalizedId.includes('o3') || normalizedId.includes('chatgpt')
               ? 'openai'
-              : m.id.includes('gemini')
-                ? 'google'
-                : 'antigravity-proxy',
-        permission: [],
-        root: m.id,
-        parent: null,
-        context_length: m.contextLength ?? 1048576,
-        max_tokens: m.contextLength ?? 1048576,
-        max_output_tokens: m.maxOutputTokens ?? 65536,
-        description: m.description
-      }))
-    };
+              : normalizedId.includes('gemini') ? 'google' : 'antigravity',
+          permission: [],
+          root: normalizedId,
+          parent: null,
+          context_length: contextLength,
+          max_tokens: maxOutputTokens,
+          max_output_tokens: maxOutputTokens,
+          // A variant's display name often repeats "low/medium/high". Use
+          // the canonical ID for merged entries so the client cannot mistake
+          // a thinking preset for a separate model.
+          description: String(
+            sourceId !== normalizedId
+              ? normalizedId
+              : (info.displayName ?? info.display_name ?? info.description ?? normalizedId)
+          )
+        };
+      });
+      return { object: 'list', data };
+    } catch (err: any) {
+      const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
+      return reply.status(statusCode).send({
+        error: {
+          message: err instanceof UpstreamRequestError ? err.message : `Antigravity model catalog unavailable: ${err.message}`,
+          type: statusCode === 400 ? 'invalid_request_error' : 'api_error'
+        }
+      });
+    }
   };
 
   app.get('/v1/models', handleGetModels);
@@ -237,37 +256,6 @@ export async function createServer(
   app.get('/v1/usage', handleUserBalance);
 
   // 2. POST /v1/chat/completions (流式 & 非流式核心)
-  const extractSessionKeyFromOpenAI = (req: FastifyRequest, chatReq: OpenAIChatCompletionRequest): string | undefined => {
-    const headerSession = (
-      req.headers['x-session-id'] ||
-      req.headers['session-id'] ||
-      req.headers['conversation-id'] ||
-      req.headers['x-conversation-id'] ||
-      chatReq.user
-    ) as string | undefined;
-
-    if (headerSession && typeof headerSession === 'string' && headerSession.trim()) {
-      return headerSession.trim();
-    }
-
-    if (chatReq.messages && Array.isArray(chatReq.messages) && chatReq.messages.length > 0) {
-      const firstUser = chatReq.messages.find(m => m.role === 'user');
-      if (firstUser) {
-        let rawText = '';
-        if (typeof firstUser.content === 'string') {
-          rawText = firstUser.content;
-        } else if (Array.isArray(firstUser.content)) {
-          const textPart = firstUser.content.find((p: any) => p && (p.type === 'text' || typeof p === 'string'));
-          rawText = typeof textPart === 'string' ? textPart : (textPart?.text || JSON.stringify(firstUser.content[0] || ''));
-        }
-        if (rawText.trim()) {
-          return crypto.createHash('sha256').update(`openai_session_${rawText.trim().substring(0, 300)}`).digest('hex');
-        }
-      }
-    }
-    return undefined;
-  };
-
   const handleChatCompletions = async (req: FastifyRequest, reply: FastifyReply) => {
     verifyClientAuth(req, reply);
     if (reply.sent) return;
@@ -279,12 +267,20 @@ export async function createServer(
       });
     }
 
-    const { payload, upstreamModel } = convertOpenAIToCloudCode(chatReq);
+    let converted: ReturnType<typeof convertOpenAIToCloudCode>;
+    try {
+      converted = convertOpenAIToCloudCode(chatReq, await executor.fetchAvailableModels());
+    } catch (err: any) {
+      const statusCode = err instanceof ModelRequestError ? 400 : err instanceof UpstreamRequestError ? err.statusCode : 503;
+      return reply.status(statusCode).send({ error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' } });
+    }
+    const { payload } = converted;
     const isStream = Boolean(chatReq.stream);
     const completionId = `chatcmpl-${crypto.randomBytes(12).toString('hex')}`;
 
     // 提取稳定会话唯一指纹（用于强会话粘性，最大化利用 Google 上游 Prompt Cache）
-    const sessionKey = extractSessionKeyFromOpenAI(req, chatReq);
+    const sessionKey = extractSessionKey(req.headers as Record<string, unknown>, chatReq, 'openai');
+    attachUpstreamSessionId(payload, sessionKey);
 
     const abortController = new AbortController();
     const abortUpstream = () => {
@@ -551,14 +547,25 @@ export async function createServer(
       responseReq.response_format = { type: 'json_object' };
     }
 
-    const { payload } = convertOpenAIToCloudCode(responseReq);
+    let converted: ReturnType<typeof convertOpenAIToCloudCode>;
+    try {
+      converted = convertOpenAIToCloudCode(responseReq, await executor.fetchAvailableModels());
+    } catch (err: any) {
+      const statusCode = err instanceof ModelRequestError ? 400 : err instanceof UpstreamRequestError ? err.statusCode : 503;
+      return reply.status(statusCode).send({ error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' } });
+    }
+    const { payload } = converted;
     const responseId = `resp_${crypto.randomBytes(12).toString('hex')}`;
-    const headerSession = (req.headers['x-session-id'] || req.headers['session-id'] || input.user) as string | undefined;
-    const sessionKey = headerSession || crypto.createHash('md5').update(`responses_${JSON.stringify(messages.slice(0, 2))}`).digest('hex');
+    const sessionKey = extractSessionKey(req.headers as Record<string, unknown>, input, 'responses');
+    attachUpstreamSessionId(payload, sessionKey);
 
+    const abortController = new AbortController();
+    req.raw.once('aborted', () => {
+      if (!abortController.signal.aborted) abortController.abort();
+    });
     let upstreamRes: any;
     try {
-      upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey);
+      upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey, abortController.signal);
     } catch (err: any) {
       if (err instanceof ContextOverflowError) {
         return reply.status(400).send({ error: { message: 'Request context exceeds the upstream limit.', type: 'invalid_request_error' } });
