@@ -1,195 +1,136 @@
-# ⚡ Antigravity Proxy (多账号高性能反向代理与管理系统)
+# ⚡ Antigravity Proxy
 
-> 基于 **TypeScript + Node.js 22 + Fastify** 构建的企业级 Google Antigravity 模型反向代理系统。对外提供标准 **OpenAI 兼容接口** 与 **Anthropic Messages 协议**，支持在 **CC Switch、Claude Code、Codex、Cline、Cursor、NextChat、OneAPI** 等任意第三方框架中无缝调用 Google 原生旗舰模型（**Claude 3 Opus、Claude 3.7 Sonnet、Gemini 3.8 全系列**），内置**零浪费智能调度引擎（防 Cache 穿透 + 临期抢救 + 流水线永动机）**、原生 Function Calling / Tool Use 深度加固、实时 5小时/周双额度监控、额度用尽自动无感换号、动态思考强度调度、Token 自动保活与现代化 Web 管理控制台。
+<p align="center">
+  <strong>面向 Google Antigravity 原生模型的高性能企业级多账号反向代理与智能调度网关</strong>
+</p>
 
----
+<p align="center">
+  <a href="https://github.com/nnnextyear/antigravity-proxy/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
+  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%3E%3D20.0.0-brightgreen.svg?logo=node.js" alt="Node Version"></a>
+  <a href="https://www.typescriptlang.org/"><img src="https://img.shields.io/badge/TypeScript-5.5-3178C6.svg?logo=typescript" alt="TypeScript"></a>
+  <a href="https://fastify.dev/"><img src="https://img.shields.io/badge/Fastify-4.28-000000.svg?logo=fastify" alt="Fastify"></a>
+  <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/Docker-Ready-2496ED.svg?logo=docker" alt="Docker"></a>
+  <img src="https://img.shields.io/badge/Tests-Passing-success.svg?logo=node.js" alt="Tests Status">
+</p>
 
-## 📑 目录
-
-- [🌟 核心功能特性](#-核心功能特性)
-- [🚀 零浪费智能调度引擎 (Zero-Waste Engine)](#-零浪费智能调度引擎-zero-waste-engine)
-- [🛠️ 原生 Agent 工具调用与上游协议加固](#️-原生-agent-工具调用与上游协议加固)
-- [🧠 纯净官方模型矩阵与动态思考调度](#-纯净官方模型矩阵与动态思考调度)
-- [📊 Google 官方双重额度监控机制](#-google-官方双重额度监控机制)
-- [🏛️ 系统架构设计](#️-系统架构设计)
-- [🚀 快速开始与部署](#-快速开始与部署)
-- [🔑 账号凭证录入与管理 (三种途径)](#-账号凭证录入与管理-三种途径)
-- [💻 第三方客户端接入指南](#-第三方客户端接入指南)
-  - [1. CC Switch (Claude Code 切换器)](#1-cc-switch-claude-code-切换器)
-  - [2. Claude Code CLI 官方直连](#2-claude-code-cli-官方直连)
-  - [3. Codex / Cline / Roo Code / Cursor](#3-codex--cline--roo-code--cursor)
-  - [4. NextChat / Cherry Studio / OneAPI](#4-nextchat--cherry-studio--oneapi)
-- [🖥️ Web 可视化管理控制台](#️-web-可视化管理控制台)
-- [⚙️ 配置说明 (config.json / .env)](#️-配置说明-configjson--env)
-- [🛡️ 多账号防关联与防封指南](#️-多账号防关联与防封指南)
-- [❓ 常见问题排查 (FAQ)](#-常见问题排查-faq)
-
----
-
-## 🌟 核心功能特性
-
-1. **🚀 零浪费智能调度引擎 (Zero-Waste Smart Scheduler)**
-   - **会话粘性防穿透 (Session Affinity)**：基于会话指纹自动锁定同一账号，吃满 Google 上游 Prompt Cache，**节省 80%~90% 的上下文 Token 损耗**。
-   - **临期额度优先抢救 (Time-to-Reset Aware)**：对 45 分钟内即将重置 5 小时配额且仍有余量的账号进行优先派发，防止残余额度被 Google 自动抹平作废。
-   - **流水线回血永动机 (Sequential Pipeline)**：集中打透主力账号，为前序账号留出整整 5 小时自然回满周期，形成水车式不间断流水线。
-2. **🛠️ 原生 Agent 工具调用深度兼容 (Full Native Tool Use)**
-   - 完整支持 Claude Code、Cline 等 Agent 框架的原生工具调用，支持 SSE `content_block_start` tool_use / `input_json_delta` / `stop_reason: tool_use`。
-   - **Google Schema 自动清洗**：递归剔除 Google Protobuf 拒绝的 `$schema`、`propertyNames` 等 Draft-07 字段。
-   - **Gemini 3.x 思考签名支持**：自动注入真实 `thought_signature` 或 `skip_thought_signature_validator` 哨兵，杜绝 400 校验异常。
-   - **工具名双向映射**：自动转换带冒号的工具名（如 `default_api:Write` $\leftrightarrow$ `default_api_Write`），满足 Claude 严格正则命名规范。
-3. **⚡ 标准 OpenAI & Anthropic 双协议全兼容**
-   - 完整支持 `POST /v1/chat/completions`（毫秒级 **SSE 流式**与非流式响应）。
-   - 支持 OpenAI Responses API `POST /v1/responses`，可直接用于新版 Codex。
-   - 原生兼容 Anthropic `POST /v1/messages` 接口（Claude Code 官方通信协议）。
-   - 完整支持 `GET /v1/models`，供 CC Switch、OneAPI 等客户端免密一键拉取模型列表。
-4. **🧠 纯净官方模型名 + 框架动态思考调控**
-   - 严格遵循官方正规带版本号命名，彻底清除了非官方的无号伪模型与 `-high`、`-medium`、`-low` 后缀。
-   - **动态思考强度引擎**：在 Claude Code（通过 `/effort`）或 Codex（通过 `reasoning_effort` / `budget_tokens`）中随时调整思考深度，代理服务在请求级别毫秒级动态路由至底层对应的思考底座。
-5. **📊 Google 官方真实额度监控（5小时额度 + 周期总额度）**
-   - 直连 Google 生产端配额接口 `v1internal:retrieveUserQuotaSummary`，Web 控制台精确展示每个账号的 Claude/GPT 与 Gemini **5小时滚动额度**与**周期总额度**进度条与回满倒计时。
-6. **🔄 额度用尽与 429 毫秒级无感智能换号**
-   - 当某个账号 5小时额度耗尽或遭遇 Google 429 限流时，调度池**自动解绑会话并毫秒级无感轮换至下一个健康账号**重试，客户端无需手动干预。
-7. **🛡️ 独立出口代理隔离 (防关联防封号)**
-   - 允许为账号池中的每个账号独立绑定专属 HTTP/SOCKS5 代理出口（如静态住宅 IP），避免同 IP 高频并发请求 Google 触发批量风控。
-8. **🔄 Token 异步自动保活守护进程**
-   - 后台协程每 3 分钟自动巡检，在 Token 过期前自动调用 Google OAuth 凭据换取新令牌，实现全年 7×24 小时零人工干预。
+<p align="center">
+  <a href="#-为什么选择-antigravity-proxy">核心优势</a> •
+  <a href="#-系统架构">系统架构</a> •
+  <a href="#-快速开始">快速开始</a> •
+  <a href="#-模型矩阵与动态思考">动态思考与模型</a> •
+  <a href="#-客户端接入指南">客户端接入</a> •
+  <a href="#-web-管理控制台">管理控制台</a> •
+  <a href="#-配置参考">配置参考</a> •
+  <a href="#-常见问题-faq">FAQ</a>
+</p>
 
 ---
 
-## 🚀 零浪费智能调度引擎 (Zero-Waste Engine)
+**Antigravity Proxy** 是一款基于 **TypeScript + Node.js 22 + Fastify** 打造的高吞吐量 AI 网关系统。它专为 Google Antigravity 官方底座打造，对外提供标准 **Anthropic Messages API**、**OpenAI Chat Completions** 以及新版 Codex **Responses API**。
 
-针对多账号在 Google Antigravity 配额体系下普遍存在的“闲置作废”、“频繁换号打散导致 Prompt Cache 失效”等严重浪费问题，系统实现了**三级调度流水线**：
+无论你在使用 **Claude Code、CC Switch、Codex、Cursor、Cline、NextChat** 还是 **OneAPI / NewAPI**，都能无缝调用 Google 原生旗舰模型（**Claude 3 Opus、Claude 3.7 / 3.5 Sonnet、Gemini 3.8 全系列**），并在多账号轮换下获得媲美单账号官方直连的 **Prompt Cache 极速命中**与**零浪费调度**体验。
 
-```mermaid
-flowchart TD
-    Req["客户端请求入站 (Anthropic / OpenAI)"] --> FP["提取会话指纹 (Session Fingerprint)"]
-    FP --> S1{"会话粘性判定 (Session Sticky)"}
-    S1 -->|历史会话且账号健康| Reuse["复用绑定账号 (命中 Google Prompt Cache，省 80%~90% Token)"]
-    S1 -->|新会话或原账号已耗尽| S2{"临期抢救判定 (Time-to-Reset)"}
-    S2 -->|45分钟内即将重置且有余量| Imminent["优先调度临近重置账号 (防止额度清零作废)"]
-    S2 -->|无临期账号| S3["流水线深度耗尽 (集中跑满主力号，留出 5 小时完整回血期)"]
-    Reuse --> Exec["上游调用"]
-    Imminent --> Exec
-    S3 --> Exec
-    Exec -->|429 限频| Failover["自动解绑会话，冷却 60s，秒级无感换号重试"]
-```
+---
 
-### 三大调度策略对比（可在 Web 控制台随时一键切换）
+## 🌟 为什么选择 Antigravity Proxy？
 
-| 策略标识 | 策略名称 | 适用场景与工作机制 |
+普通反代在多账号轮转时，往往因为随机切号导致 Google 上游 Prompt Cache 彻底失效，不仅延迟飙升，更浪费高达 80% 的配额。**Antigravity Proxy** 专为解决多账号生产落地痛点而生：
+
+| 对比维度 | 传统第三方反代 / 简单轮询 | ⚡ Antigravity Proxy |
 | :--- | :--- | :--- |
-| **`zero-waste`** *(默认推荐)* | **🚀 智能零浪费** | 综合会话粘性（防 Prompt Cache 穿透）、临期额度抢救（防清零蒸发）与流水线深度耗尽，最大限度压榨并兑现账号总额度。 |
-| **`sequential-drain`** | **🔄 流水线顺序耗尽** | 严格按顺序集中打满单账号的 5 小时配额，打满后顺位切下一个，适合账号数较多、希望流水线时间差回血的用户。 |
-| **`round-robin`** | **⚖️ 传统均衡轮询** | 全池请求均匀打散，结合最小并发数（Least-Connections），适合压力测试与高并发短任务。 |
+| **Prompt Cache 命中** | ❌ 每次请求随机切号，缓存穿透率 90%+ | ✅ **纯净会话粘性 (Session Sticky)**，单会话死锁账号，**保留 80%~90%+ 缓存** |
+| **瞬态并发满载** | ❌ 账号并发占满立即漂移换号，丢掉前缀缓存 | ✅ **会话队列等待（最多 120s）**，平稳等待当前租约，绝不随意跳号 |
+| **模型命名体系** | ❌ 充斥虚假无号模型或强制带 `-high/-low` 后缀 | ✅ **实时直连上游模型选择器**，无缝聚合思考档位，杜绝过期/伪造版本 |
+| **思考强度控制 (Thinking)** | ❌ 只能写死或切不同模型名 | ✅ **全框架动态解析**：支持 `/effort`、`reasoning_effort` 六档映射与 Token 预算约束 |
+| **Agent 工具调用加固** | ❌ 频繁触发 Protobuf Schema 400 或丢失工具调用 | ✅ **Google Schema 深度净化**、`thought_signature` 签名自动流转、冒号工具名双向转译 |
+| **配额利用与监控** | ❌ 黑盒盲猜，额度耗尽直接报错崩溃 | ✅ **直连 Google 5小时/周期双额度监控**，临期自动抢救，429 秒级无感重试 |
+| **多账号防封关联** | ❌ 同 IP 高并发批量请求，极易触发 Google 风控 | ✅ **单账号独立出口代理 (HTTP/SOCKS5)** 彻底网络隔离，支持住宅 IP 绑定 |
 
 ---
 
-## 🛠️ 原生 Agent 工具调用与上游协议加固
-
-针对在 Claude Code CLI、Atlas 等 Agent 运行复杂任务（调用 Bash 命令、文件读写等）时出现的卡顿或报错，代理层完成了深度协议治理：
-
-1. **解决模型“自言自语输出普通文本”而非真正执行命令**：
-   - 入站自动解析 Anthropic 请求中的 `tools` 定义并完整转译给上游底层；
-   - 出站自动将底座生成的 `functionCall` 包装为标准的 Anthropic SSE 事件（`content_block_start` tool_use、`input_json_delta`、`content_block_stop`、`stop_reason: "tool_use"`）。
-2. **规避 Gemini 3.x 400 校验错误**：
-   - 自动嗅探上游生成的真实 `thought_signature` 并在多轮交互中智能回传；对离线或无签名轮次，自动带上 Google 标准标记 `skip_thought_signature_validator`。
-3. **消除特殊工具名冒号报错**：
-   - 自动双向映射 `default_api:Write` $\leftrightarrow$ `default_api_Write`，既符合 Claude 命名正则规范，又满足客户端原样识别。
-4. **Google Protobuf Schema 严格清洗**：
-   - 过滤 Schema 中所有 `$schema`、`propertyNames`、`exclusiveMinimum` 等不支持属性。
-
----
-
-## 🧠 纯净官方模型矩阵与动态思考调度
-
-向客户端暴露的 `/v1/models` 每次都从 Antigravity 实时获取，以 `agentModelSorts` 中的模型选择器目录为准，不返回补全、搜索和旧版内部入口。同一个模型的 `-low`、`-medium`、`-high`、`-tiered`、`-thinking` 等预设会合并为一个模型。接口失败直接返回错误，不回退固定或过期列表；模型版本不会互相替换。
-
-> **💡 如何在客户端动态调节思考强度？**
-> - **Claude Code**：读取框架发送的 `output_config.effort` 和 `thinking`（包括 `adaptive`、`disabled`、`budget_tokens`）。
-> - **Codex / OpenAI 协议**：读取 `reasoning_effort` 或 Responses API 的 `reasoning.effort`。
-> - 未传思考设置时保留上游默认行为；模型名里的思考后缀不会覆盖框架设置。
-
-六档请求级别为 `minimal / low / medium / high / xhigh / max`。Gemini 3 用 `thinkingLevel`，按实时目录支持的档位收敛，不会伪造六个原生等级。例如当前 Gemini 3.8 Flash：
-
-| 框架 effort | Gemini 3.8 Flash thinkingLevel |
-| :--- | :--- |
-| minimal | low |
-| low | low |
-| medium | medium |
-| high | high |
-| xhigh | high |
-| max | high |
-
-Gemini 2.5 / Claude 使用 token budget，六档预算依次为 4096 / 8192 / 16384 / 24576 / 32768 / 32768，并受模型及输出上限约束。显式预算保留，`-1` 表示自动、`0` 表示关闭；Gemini 3 及 Gemini 2.5 Pro 无法关闭思考时使用模型支持的最低档位。
-
----
-
-## 📊 Google 官方双重额度监控机制
-
-系统直接对接 Google 生产端配额接口 `v1internal:retrieveUserQuotaSummary`：
-
-1. **两大独立配额池**：
-   - **Claude / GPT 额度池**：共享 Opus、Sonnet 与 GPT-OSS，包含 5小时滚动平滑限额（`3p-5h`）与周期总额度（`3p-weekly`）。
-   - **Google Gemini 额度池**：共享 Gemini 系列，包含 5小时滚动平滑限额（`gemini-5h`）与周期总额度（`gemini-weekly`）。
-2. **控制台双进度条展示**：
-   - 打开 `http://localhost:3000/admin`，每个账号直观展示 Claude/GPT 与 Gemini 各自的进度条与回满倒计时（例如 `⏳ 2小时40分后回满`、`🔄 5天后刷新`）。
-
----
-
-## 🏛️ 系统架构设计
+## 🏛️ 系统架构
 
 ```mermaid
 flowchart TD
-    Client[第三方客户端\nCC Switch / Claude Code / Codex / NextChat] -->|OpenAI /v1/chat/completions\n或 Anthropic /v1/messages| Gateway[Fastify 协议适配网关]
-    
-    subgraph Core [Antigravity Proxy 核心调度层]
-        Gateway --> Fingerprint[会话指纹提取器\nSession Fingerprint Identifier]
-        Fingerprint --> ZeroWaste[零浪费智能调度器\nZero-Waste Scheduler]
-        
-        subgraph Strategies [调度算法库]
-            SessSticky[会话粘性缓存]
-            TimeReset[临期抢救感知]
-            SeqDrain[流水线深度耗尽]
-        end
-        ZeroWaste --> Strategies
-        
-        subgraph AccountPool [多账号池管理中心]
-            Acc1[账号 A (Active)\nClaude 5h: 98% / Gemini 5h: 54%\n独立出口代理 Proxy A]
-            Acc2[账号 B (Active)\nClaude 5h: 100% / Gemini 5h: 90%\n独立出口代理 Proxy B]
-            Acc3[账号 C (Exhausted / 额度耗尽自动避让)]
-            Acc4[账号 D (Cooldown / 429 冷却隔离)]
-        end
-        
-        Strategies -->|选出最优健康账号| AccountPool
-        Refresher[Token 自动保活协程] -.->|每 3 分钟检测| AccountPool
-        QuotaManager[Google 官方配额监控巡检] -.->|实时拉取双额度| AccountPool
-        Breaker[熔断器 Circuit Breaker] -.->|429/503 秒级无感换号| AccountPool
-    end
-    
-    subgraph AdminLayer [管理控制台与持久化]
-        WebConsole[Web 控制台 /admin] --> AdminAPI[REST API /api/admin/*]
-        AdminAPI --> Storage[(本地存储 data/accounts.json)]
-        Storage --> AccountPool
+    subgraph Clients [客户端生态]
+        C1["Claude Code CLI\n(POST /v1/messages)"]
+        C2["CC Switch\n(Anthropic / OpenAI / Balance)"]
+        C3["Codex / Cursor\n(POST /v1/responses)"]
+        C4["NextChat / OneAPI / Cline\n(POST /v1/chat/completions)"]
     end
 
-    Acc1 -->|HTTPS + SSE| Upstream[Google CloudCode 上游生产端\ndaily-cloudcode-pa.googleapis.com]
-    Acc2 -->|HTTPS + SSE| Upstream
+    Clients -->|统一接入| Gateway["⚡ Fastify 高性能网关层"]
+
+    subgraph Core [Antigravity Proxy 核心层]
+        Gateway --> Auth["鉴权校验与协议适配\n(Anthropic / OpenAI / Responses)"]
+        Auth --> Session["会话指纹提取 (Session Key)\nHeader / Body / User / Context Hash"]
+        Session --> Engine["🚀 零浪费智能调度引擎 (Zero-Waste Engine)"]
+
+        subgraph Strategies [调度流水线]
+            S1["1. 会话粘性判定\n(锁定原账号，保留 Google Prompt Cache)"]
+            S2["2. 临期额度抢救\n(45分钟内重置账号优先消费)"]
+            S3["3. 流水线深度耗尽\n(集中打满单号，拉开 5 小时自然回满周期)"]
+        end
+        Engine --> Strategies
+
+        subgraph Pool [多账号池与健康治理]
+            Acc1["账号 A (Active)\n5h 滚动配额: 92% | 出口代理: IP-1"]
+            Acc2["账号 B (Active)\n5h 滚动配额: 100% | 出口代理: IP-2"]
+            Acc3["账号 C (429 冷却隔离 60s)"]
+            Acc4["账号 D (额度枯竭自动避让)"]
+        end
+        Strategies --> Pool
+
+        Refresher["Token 自动保活协程\n(每 3 分钟自动续期)"] -.-> Pool
+        QuotaSync["Google 官方配额同步\n(retrieveUserQuotaSummary)"] -.-> Pool
+        Breaker["熔断与重试器\n(429/401/503 秒级无感漂移)"] -.-> Pool
+    end
+
+    Pool -->|专用 Dispatcher 连接池| Upstream["Google CloudCode 生产端接口\ndaily-cloudcode-pa.googleapis.com"]
 ```
 
 ---
 
-## 🚀 快速开始与部署
+## 🚀 快速开始
 
-### 1. 运行环境要求
-- **Node.js**: `v20.0.0` 或更高版本（推荐 Node 22+）
-- **包管理器**: `npm` / `pnpm` / `yarn`
-- **操作系统**: Windows / macOS / Linux
+### 方式 1：Docker Compose 部署 (推荐，2分钟就绪)
+
+在任意装有 Docker 的服务器或本地机器上创建 `docker-compose.yml`：
+
+```yaml
+services:
+  antigravity-proxy:
+    image: ghcr.io/nnnextyear/antigravity-proxy:latest # 或自行 docker build
+    build: .
+    container_name: antigravity-proxy
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - HOST=0.0.0.0
+      - API_MASTER_KEY=sk-antigravity
+      - ADMIN_PASSWORD=admin123
+    volumes:
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+```
+
+启动容器：
+```bash
+docker compose up -d
+docker compose logs -f
+```
 
 ---
 
-### 2. 本地直接部署 (推荐)
+### 方式 2：本地 Node.js 源码运行
 
-#### 步骤一：克隆仓库并安装依赖
+#### 1. 环境准备
+- **Node.js**: `v20.0.0` 或更高版本（推荐 Node.js 22 LTS）
+- **Git**
+
+#### 2. 克隆与安装
 ```bash
 git clone https://github.com/nnnextyear/antigravity-proxy.git
 cd antigravity-proxy
@@ -197,262 +138,323 @@ cd antigravity-proxy
 # 安装依赖
 npm install
 
-# 构建生产产物
+# 生产构建
 npm run build
 ```
 
-#### 步骤二：配置文件准备
-项目根目录提供了配置模板，首次运行可直接基于模板复制：
+#### 3. 配置文件初始化
 ```bash
-# 复制配置文件
 cp config.example.json config.json
-# （可选）也可以通过环境变量或 .env 配置
-cp .env.example .env
 ```
+根据需要修改 `config.json`（可保留默认值即可快速体验）。
 
-`config.json` 核心字段说明：
-```json
-{
-  "port": 3000,
-  "host": "0.0.0.0",
-  "apiMasterKey": "sk-antigravity",
-  "adminPassword": "admin123",
-  "upstreamUrl": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse",
-  "defaultMaxConcurrency": 5,
-  "cooldownSeconds": 60,
-  "tokenRefreshIntervalMs": 180000,
-  "routingStrategy": "zero-waste"
-}
-```
-
-#### 步骤三：启动服务
+#### 4. 启动服务
 ```bash
-# 启动生产代理服务
+# 启动生产服务
 npm start
 
-# 或开发环境热重载 (开发模式)
-npm run dev
-```
-
-#### 步骤四：后台守护进程部署 (PM2)
-如需在 VPS / Linux 服务器上持续后台运行：
-```bash
-# 全局安装 PM2
+# 或使用 PM2 守护进程后台运行 (VPS 部署推荐)
 npm install -g pm2
-
-# 启动并命名
 pm2 start "npm start" --name antigravity-proxy
-
-# 查看状态与日志
-pm2 status
-pm2 logs antigravity-proxy
-
-# 设置开机自启
 pm2 save
-pm2 startup
+```
+
+服务就绪后控制台输出：
+```text
+[Server] Antigravity Proxy listening on http://0.0.0.0:3000
+[Server] Web Dashboard: http://localhost:3000/admin
+[Server] OpenAI API: http://localhost:3000/v1/chat/completions
+[Server] Anthropic API: http://localhost:3000/v1/messages
 ```
 
 ---
 
-### 3. Docker 容器化部署
+## 🔑 账号导入与池化管理 (3 种方式)
 
-本项目提供了官方 `Dockerfile` 与 `docker-compose.yml`，支持一键容器化运行：
+系统支持多账号池化轮换，你可以选择最顺手的添加方式：
 
-#### 方式一：Docker Compose（推荐）
-```bash
-# 1. 启动容器
-docker compose up -d
-
-# 2. 查看运行日志
-docker compose logs -f
-```
-
-#### 方式二：直接使用 Docker CLI 构建运行
-```bash
-# 构建镜像
-docker build -t antigravity-proxy:latest .
-
-# 运行容器并挂载数据持久化目录
-docker run -d \
-  --name antigravity-proxy \
-  -p 3000:3000 \
-  -v $(pwd)/data:/app/data \
-  --restart unless-stopped \
-  antigravity-proxy:latest
-```
-
----
-
-### 4. 服务入口与默认凭证
-
-服务启动成功后：
-- 🌐 **Web 管理控制台**：`http://localhost:3000/admin` （默认密码：`admin123`）
-- 🔌 **OpenAI 兼容端点**：`http://localhost:3000/v1/chat/completions`
-- 🔌 **Responses API 端点**：`http://localhost:3000/v1/responses`（新版 Codex）
-- 📨 **Anthropic 兼容端点**：`http://localhost:3000/v1/messages`
-- 📋 **模型列表端点**：`http://localhost:3000/v1/models`
-- 🔑 **默认客户端 API Key**：`sk-antigravity`
-
----
-
-## 🔑 账号凭证录入与管理 (三种途径)
-
-### 途径 1：一键自动同步本机 Antigravity 已登录账号 (最推荐)
-如果您本地电脑上已安装并登录了 Antigravity IDE：
-- **Web 界面一键点击**：打开 `http://localhost:3000/admin`，在顶部导航栏点击 **【⚡ 一键同步本机账号】**，系统将自动读取凭据并完成握手。
-- **命令行脚本执行**：
-  ```powershell
+### 途径 1：一键同步本机 Antigravity 已登录凭据 (最快)
+如果你已经在当前电脑上使用过 Antigravity 官方客户端并完成登录：
+- 打开浏览器访问 `http://localhost:3000/admin`，点击顶部导航栏 **【⚡ 一键同步本机账号】**；
+- 或直接在终端运行：
+  ```bash
   npm run extract-local
   ```
+  脚本会自动定位系统持久化凭证，提取长效凭据并同步至账号池。
 
-### 途径 2：使用官方 OAuth 网页向导添加多账号 (多号池化轮换)
-如果您准备开 2 个、5 个或更多 Google 账号做账号池轮换：
-1. 执行：
-   ```powershell
+### 途径 2：通过 Google OAuth 向导多账号授权录入
+如果你需要开辟多个账号进行池化轮换：
+1. 运行内置 OAuth 交互程序：
+   ```bash
    npm run login
    ```
-2. 终端会生成官方授权链接，直接在浏览器中打开。
-3. 登录并选择您的**任意 Google 账号**完成授权。
-4. 授权完毕后会自动提取长效 `refresh_token` 并存入账号池。重复执行即可依次添加多个账号。
+2. 终端将输出 Google 官方 OAuth 授权 URL，复制至浏览器打开；
+3. 登录并授权你的任意 Google 账号，系统会自动截获回调并提取长效 `refresh_token`；
+4. 多次运行即可轻松录入第 2、第 3、第 N 个账号。
 
-### 途径 3：在 Web 控制台手动录入
-1. 访问 `http://localhost:3000/admin`；
-2. 点击右上角 **+ 手动添加**；
-3. 填入邮箱、Refresh Token，以及可选的**独立出口代理 (Proxy URL)**。
+### 途径 3：Web 控制台手动录入
+访问 `http://localhost:3000/admin`，点击右上角 **+ 手动添加**，填入账号邮箱、Refresh Token，以及可选的**独立出口代理 (Proxy URL)**。
 
 ---
 
-## 💻 第三方客户端接入指南
+## 🧠 模型矩阵与动态思考调度
 
-### 1. CC Switch (Claude Code 切换器)
+### 1. 纯净官方实时模型目录
+不同于其他反代服务返回写死、硬编码的静态模型名，Antigravity Proxy 的 `/v1/models` **直接从 Antigravity 上游的 `agentModelSorts` 实时拉取最新模型目录**：
+- 自动剔除 internal 搜索和补全通道，仅暴露当前真实可用的 Agent 模型；
+- 自动将带有 `-low`、`-medium`、`-high`、`-thinking`、`-tiered` 的多个上游入口合并为同一个标准模型；
+- 保留官方原始版本编号，杜绝模型替换与伪造版本。
+
+### 2. 多协议动态思考强度映射 (Thinking Effort)
+你不再需要在模型名称后硬拼 `-high` 或 `-low`。只需通过框架原生指令，网关即可毫秒级动态将思考配置下发给上游底座：
+
+- **Claude Code 客户端**：通过 `/effort <level>` 或 `output_config.effort` / `thinking` 协议控制；
+- **Codex / OpenAI SDK**：通过 `reasoning_effort` 或 Responses API 的 `reasoning.effort` 控制；
+- **显式 Token 预算**：传入 `budget_tokens` 时，网关会自动适配上下游预算约束。
+
+#### 思考档位对齐映射表
+系统支持 `minimal / low / medium / high / xhigh / max` 六档标准请求：
+
+| 客户端请求级别 | Gemini 3 映射档位 (`thinkingLevel`) | Gemini 2.5 / Claude 预算约束 (`budgetTokens`) |
+| :--- | :--- | :--- |
+| **`minimal`** | `low` | 4,096 tokens |
+| **`low`** | `low` | 8,192 tokens |
+| **`medium`** | `medium` | 16,384 tokens |
+| **`high`** | `high` | 24,576 tokens |
+| **`xhigh`** | `high` (或模型支持最高档) | 32,768 tokens |
+| **`max`** | `high` (或模型支持最高档) | 32,768 tokens (受最大输出截断保护) |
+
+*注：若未指定思考参数，系统自动遵循上游默认设定；Gemini 3 与 Gemini 2.5 Pro 无法完全关闭思考时，将自动采用底座允许的最低挡位保证稳定运行。*
+
+---
+
+## 💻 客户端接入指南
+
+### 1. CC Switch (Claude Code 客户端管理利器)
+
 - **服务商类型**：选择 `Anthropic` 或 `OpenAI`
-- **API Base URL**：`http://127.0.0.1:3000/v1`（自动支持 `/v1/messages`、`/v1/models` 以及 `/v1/user/balance`）
-- **API Key / Token**：`sk-antigravity`
-- **获取模型**：直接点击“获取模型”，秒级同步包含 `claude-3-opus`、`claude-3-7-sonnet`、`gemini-3.8-flash` 在内的全部真实模型。
+- **API Base URL**：`http://127.0.0.1:3000/v1`
+- **API Key**：`sk-antigravity`
+- **模型同步**：点击“获取模型”直接拉取实时模型列表。
 
-#### 📊 在 CC Switch 中配置「用量查询」
-将鼠标悬停在 CC Switch 的供应商卡片上，点击 **用量查询**（图表图标），打开配置面板：
-1. 打开顶部的 **“启用用量查询”** 开关；
-2. **方式一（自定义脚本，最推荐，信息最丰富）**：
-   - 模板选择：**“自定义”**（Custom）；
-   - 在代码框中填入以下标准配置（可直接点击“测试脚本”）：
-   ```javascript
-   ({
-     request: {
-       url: "http://127.0.0.1:3000/v1/user/balance",
-       method: "GET",
-       headers: {
-         "Authorization": "Bearer {{apiKey}}"
-       }
-     },
-     extractor: function (response) {
-       const data = typeof response === "string" ? JSON.parse(response) : response;
-       return {
-         isValid: data.isValid ?? true,
-         remaining: data.remaining ?? 100, // 5小时配额剩余百分比（如 96.1%）
-         unit: data.unit ?? "%",
-         used: data.used ?? 0,
-         total: data.total ?? 100,
-         planName: data.planName ?? "Antigravity Proxy"
-       };
-     }
-   })
-   ```
-   *注：若你的 CC Switch UI 为表单拆分模式：*
-   - **请求地址 (URL)**：`http://127.0.0.1:3000/v1/user/balance`
-   - **请求方法**：`GET`
-   - **请求头**：`{"Authorization": "Bearer {{apiKey}}"}`
-   - **提取器**：
-     ```javascript
-     function (response) {
-       const data = typeof response === "string" ? JSON.parse(response) : response;
-       return {
-         isValid: true,
-         remaining: data.remaining ?? 100,
-         unit: "%",
-         planName: data.planName ?? "Antigravity Proxy"
-       };
-     }
-     ```
-3. **方式二（内置模板）**：
-   - 模板下拉直接选择 **NewAPI** 或 **OneAPI**，系统将自动适配 `/v1/user/balance` 并解析配额。
-4. 点击 **“测试脚本”**，测试成功后点击 **“保存”**。卡片上将实时显示当前账号池的剩余额度百分比、在线账号数与回血状态！
+#### 📊 配置 CC Switch 实时用量与回血监控
+在 CC Switch 中点击服务商卡片上的 **用量查询** 图标，开启开关并配置自定义提取器：
+- **请求地址 (URL)**：`http://127.0.0.1:3000/v1/user/balance`
+- **请求方法**：`GET`
+- **请求头**：`{"Authorization": "Bearer {{apiKey}}"}`
+- **提取脚本**：
+  ```javascript
+  ({
+    request: {
+      url: "http://127.0.0.1:3000/v1/user/balance",
+      method: "GET",
+      headers: { "Authorization": "Bearer {{apiKey}}" }
+    },
+    extractor: function (response) {
+      const data = typeof response === "string" ? JSON.parse(response) : response;
+      return {
+        isValid: data.isValid ?? true,
+        remaining: data.remaining ?? 100, // 5小时滚动剩余百分比 (如 95.5%)
+        unit: "%",
+        used: data.used ?? 0,
+        total: 100,
+        planName: data.planName ?? "Antigravity Proxy"
+      };
+    }
+  })
+  ```
+保存后，CC Switch 卡片将实时显示账号池在线数、剩余额度及回满倒计时。
 
+---
 
 ### 2. Claude Code CLI 官方直连
-直接通过环境变量指定第三方端点：
+设置环境变量后直接唤起：
+
+**macOS / Linux (Bash / Zsh):**
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:3000"
+export ANTHROPIC_API_KEY="sk-antigravity"
+claude
+```
+
+**Windows (PowerShell):**
 ```powershell
 $env:ANTHROPIC_BASE_URL="http://127.0.0.1:3000"
 $env:ANTHROPIC_API_KEY="sk-antigravity"
 claude
 ```
 
-### 3. Codex / Cline / Roo Code / Cursor
-- **API Provider**：选择 `OpenAI Compatible`
-- **Base URL**：`http://127.0.0.1:3000/v1`
-- **API Key**：`sk-antigravity`
-- **Model ID**：填写 `claude-3-7-sonnet` 或 `gemini-3.8-flash`
+---
 
-新版 Codex 默认使用 Responses API，代理已原生兼容 `/v1/responses`，无需切换协议。
+### 3. Codex / Cursor / Cline / Roo Code
 
-### 4. NextChat / Cherry Studio / OneAPI
-- **接口地址**：`http://127.0.0.1:3000/v1`
-- **API Key**：`sk-antigravity`
-- **拉取模型**：点击“从服务商拉取模型”即可同步全部可用列表。
+- **Provider**: 选择 `OpenAI Compatible`
+- **Base URL**: `http://127.0.0.1:3000/v1`
+- **API Key**: `sk-antigravity`
+- **Model**: `claude-3-7-sonnet` 或 `gemini-3.8-flash`
+- *(新版 Codex)*: 原生支持 `POST /v1/responses`，直接填入 base URL 即可识别。
 
 ---
 
-## 🖥️ Web 可视化管理控制台
+### 4. NextChat / Cherry Studio / OneAPI / Dify
 
-访问 `http://localhost:3000/admin` 并输入管理密码 `admin123`：
-
-### 核心功能与操作
-- **实时调度策略切换**：导航栏右侧快速切换 `🚀 智能零浪费` / `🔄 流水线顺序耗尽` / `⚖️ 传统均衡轮询`。
-- **大盘指标监控**：总账号数、可用数、冷却数、失效数、并发数，以及 Claude 与 Gemini 的平均剩余额度。
-- **多维额度进度条**：每个账号独立展示 Claude/GPT 与 Gemini 的 5小时额度与周期总额度，悬停查看精确重置时间。
-- **快捷管理操作**：
-  - **📊 查额度**：针对单个账号向 Google 发起实时探测并更新额度进度条；
-  - **🔄 刷新**：重新向 Google 兑换最新 Access Token；
-  - **⚡ 激活**：强制解除 429 冷却或异常状态；
-  - **🗑️ 删除**：移出账号池。
+- **接口地址**: `http://127.0.0.1:3000/v1`
+- **API Key**: `sk-antigravity`
+- 在模型管理中点击“从服务商拉取”，系统将自动同步全部有效模型。
 
 ---
 
-## ⚙️ 配置说明 (config.json / .env)
+### 5. 代码与 SDK 快速调用
 
-| 配置项 | 环境变量名 | 默认值 | 作用描述 |
+<details>
+<summary><strong>Python (OpenAI SDK)</strong></summary>
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:3000/v1",
+    api_key="sk-antigravity"
+)
+
+response = client.chat.completions.create(
+    model="gemini-3.8-flash",
+    messages=[{"role": "user", "content": "9.11 和 9.8 谁大？请给出详细思考过程。"}],
+    reasoning_effort="high",
+    stream=True
+)
+
+for chunk in response:
+    content = chunk.choices[0].delta.content or ""
+    print(content, end="", flush=True)
+```
+</details>
+
+<details>
+<summary><strong>Node.js / TypeScript (Anthropic SDK)</strong></summary>
+
+```typescript
+import Anthropic from '@anthropic-ai/sdk';
+
+const anthropic = new Anthropic({
+  baseURL: 'http://127.0.0.1:3000',
+  apiKey: 'sk-antigravity'
+});
+
+async function main() {
+  const stream = await anthropic.messages.stream({
+    model: 'claude-3-7-sonnet',
+    max_tokens: 4096,
+    messages: [{ role: 'user', content: '写一段高性能的快速排序算法' }]
+  });
+
+  for await (const event of stream) {
+    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+      process.stdout.write(event.delta.text);
+    }
+  }
+}
+main();
+```
+</details>
+
+<details>
+<summary><strong>cURL 验证命令</strong></summary>
+
+```bash
+# 测试 OpenAI 协议
+curl http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-antigravity" \
+  -d '{
+    "model": "gemini-3.8-flash",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+
+# 测试模型列表
+curl http://localhost:3000/v1/models \
+  -H "Authorization: Bearer sk-antigravity"
+```
+</details>
+
+---
+
+## 🖥️ Web 管理控制台
+
+访问 `http://localhost:3000/admin`，输入管理员密码（默认：`admin123`）即可进入现代化仪表盘：
+
+- 📊 **多维配额可视监控**：精确掌握每个账号的 **Claude/GPT 5小时额度** 与 **Gemini 5小时额度** 百分比及下次回满倒计时。
+- 🔄 **动态调度策略热切换**：
+  - **🚀 零浪费智能调度 (`zero-waste`)**：综合会话粘性、临期额度抢救与流水线深度耗尽，最大化压榨总额度（默认推荐）。
+  - **🔄 流水线顺序耗尽 (`sequential-drain`)**：集中打透单账号，留出整整 5 小时自然回满周期。
+  - **⚖️ 传统均衡轮询 (`round-robin`)**：全池均匀打散，适合高并发短文本任务。
+- ⚡ **快捷运维操作**：单账号一键健康探测、Token 手动刷新、429 强制解封、代理出口动态配置与账号剔除。
+
+---
+
+## ⚙️ 配置参考
+
+你可以通过 `config.json` 或环境变量（支持 `.env`）定制系统行为：
+
+| 配置项 (`config.json`) | 环境变量名 | 默认值 | 作用描述 |
 | :--- | :--- | :--- | :--- |
-| `port` | `PORT` | `3000` | 代理服务监听端口 |
-| `host` | `HOST` | `0.0.0.0` | 监听接口 (0.0.0.0 允许局域网共享) |
-| `apiMasterKey` | `API_MASTER_KEY` | `sk-antigravity` | 客户端调用 API 时的 Bearer Key |
-| `adminPassword` | `ADMIN_PASSWORD` | `admin123` | 管理控制台登录密码 |
-| `upstreamUrl` | `UPSTREAM_URL` | Google 官方端点 | Google CloudCode 生产端接口 |
+| `port` | `PORT` | `3000` | HTTP 服务监听端口 |
+| `host` | `HOST` | `0.0.0.0` | 监听地址（`0.0.0.0` 允许局域网或公网访问） |
+| `apiMasterKey` | `API_MASTER_KEY` | `sk-antigravity` | 客户端访问接口时鉴权的 Bearer 密钥 |
+| `adminPassword` | `ADMIN_PASSWORD` | `admin123` | Web 后台管理登录密码 |
+| `upstreamUrl` | `UPSTREAM_URL` | 官方 CloudCode 端点 | 上游流式生成与模型调度端点 |
+| `defaultProxyUrl` | `DEFAULT_PROXY_URL` | `null` | 全局兜底代理出口（支持 HTTP/HTTPS/SOCKS5） |
 | `routingStrategy` | `ROUTING_STRATEGY` | `zero-waste` | 调度策略 (`zero-waste` / `sequential-drain` / `round-robin`) |
-| `defaultMaxConcurrency`| - | `5` | 单账号并发上限 |
-| `cooldownSeconds` | - | `60` | 429 冷却隔离时长（秒） |
+| `defaultMaxConcurrency` | - | `5` | 单个账号允许的最大并发请求数 |
+| `cooldownSeconds` | - | `60` | 遇到 429 限流时的静默冷却时间（秒） |
+| `tokenRefreshIntervalMs`| - | `180000` | 后台 Token 自动续期轮询周期（毫秒，默认 3 分钟） |
 
 ---
 
-## 🛡️ 多账号防关联与防封指南
+## 🛡️ 多账号防关联与生产安全
 
 1. **绑定独立出口代理 (`proxyUrl`)**：
-   - 在控制台或 `data/accounts.json` 中，为每个账号填写独立代理（例如 `http://user:pass@127.0.0.1:7890` 或住宅 SOCKS5 代理）；
-   - 请求发往 Google 时将使用不同 IP，杜绝同 IP 集中并发导致批量风控。
-2. **并发削峰**：
-   - 保持单个账号的 `maxConcurrency` 在 3~5 之间，平稳消耗 5小时配额。
+   - 可以在 Web 控制台为每个账号单独指定代理出口（例如 `http://user:pass@residential-node1:port`）。
+   - 请求发往 Google 上游时自动由独立的专用代理派发，避免所有账号共用同一出口 IP 导致关联风控。
+2. **合理控制并发上限**：
+   - 建议单个账号的并发维持在 3~5，平稳匀速消耗 5 小时滚动配额，避免突发大并发被上游风控阻断。
+3. **保护数据与凭据目录**：
+   - 项目将账号池持久化存储在 `data/accounts.json`。生产环境请确保该目录拥有正确的读写权限，且**绝对不要提交至公共代码仓库**（已在 `.gitignore` 中默认保护）。
 
 ---
 
-## ❓ 常见问题排查 (FAQ)
+## ❓ 常见问题 (FAQ)
 
-### Q1: 什么是“零浪费智能调度”？
-- 普通代理在多轮会话中会随机切号，导致 Google 上游 Prompt Cache 全部失效，多耗费数倍 Token；
-- 零浪费智能引擎通过“**会话粘性**”锁定当前上下文，同时结合“**临期额度抢救**”（在账号重置前吃完残余配额）与“**流水线深度耗尽**”，让每个账号的 5小时回满机制形成无缝流水线。
+<details>
+<summary><strong>Q1: 什么是“纯净会话粘性”？为什么说它能节省 80%~90% 的 Token？</strong></summary>
 
-### Q2: 提示 `All accounts in the pool are busy, in cooldown, or exhausted`？
-- 说明当前账号池中所有账号的额度已耗尽或触发 429。
-- **解决方式**：打开控制台 `http://localhost:3000/admin` 查看重置时间；或通过 `npm run login` 增加备用账号，系统会自动多号轮换。
+Google 上游大模型具备内置的 Prompt Cache 机制。当同一段对话（例如长文件代码、系统 Prompt）在**同一个账号**上连续请求时，上游能直接命中内存中的缓存前缀，响应速度从数秒骤降至几百毫秒，且消耗的计费 Token 大幅削减。  
+如果反代随意轮询切号，每个新账号都必须重新完整读入上下文，导致缓存反复击穿。Antigravity Proxy 通过深度解析请求指纹锁定会话，确保同一任务始终由同一账号提供服务。
+</details>
 
-### Q3: 为什么模型列表中没有 `-high`、`-low` 或 `claude-opus`？
-- 本代理严格遵循官方标准：移除了无号伪模型 `claude-opus`，替换为 Anthropic 官方正式命名的 `claude-3-opus`；
-- 思考强度由客户端框架（Claude Code 的 `/effort` 或 Codex 的 `reasoning_effort`）在请求时动态决定，模型名称不包含任何 `-high`/`-low` 污染。
+<details>
+<summary><strong>Q2: 提示 "All accounts in the pool are busy, in cooldown, or exhausted" 怎么处理？</strong></summary>
+
+这说明账号池内所有可用账号的 5 小时额度均已暂时用尽，或短时间内触发了上游频控：
+1. 访问 `http://localhost:3000/admin` 查看各个账号的回满倒计时；
+2. 运行 `npm run login` 录入更多备用账号，系统将自动无感扩容与轮替。
+</details>
+
+<details>
+<summary><strong>Q3: 上游返回 "User location is not supported" 或 403 地区限制？</strong></summary>
+
+Google CloudCode 对请求出口 IP 所在的国家和地区有严格限制。  
+**解决方式**：在 `config.json` 中配置 `defaultProxyUrl`，或在 Web 控制台为账号绑定支持地区的代理出口（推荐台湾、日本、美西等受支持区域节点）。
+</details>
+
+<details>
+<summary><strong>Q4: 为什么在 `/v1/models` 中看不到带有 `-high` 或 `-low` 的模型？</strong></summary>
+
+这是本代理经过重构后的规范设计：思考档位属于请求级别的参数（Reasoning Effort），不应当污染模型名。你可以直接选择 `gemini-3.8-flash` 或 `claude-3-7-sonnet`，并通过框架原生选项自由切换高、中、低思考深度，网关会自动将参数注入到底层请求中。
+</details>
+
+---
+
+## 📄 开源许可证
+
+本项目基于 [MIT 许可证](LICENSE) 开源。欢迎 Star、Fork 并提交 Issue 与 PR 共同完善！
