@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { Account, PoolStats, AccountStatus, RoutingStrategy } from '../types.js';
+import { classifyUpstreamError, retryAfterMs } from './error-policy.js';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const ACCOUNTS_FILE = path.resolve(DATA_DIR, 'accounts.json');
@@ -163,10 +164,10 @@ export class AccountPool {
     return this.sessionBindings.get(sessionKey);
   }
 
-  private clearSessionBinding(sessionKey: string | undefined, accountId: string): void {
+  public clearSessionBinding(sessionKey: string | undefined, accountId?: string): void {
     if (!sessionKey) return;
     const binding = this.sessionBindings.get(sessionKey);
-    if (binding?.accountId === accountId) this.sessionBindings.delete(sessionKey);
+    if (!accountId || binding?.accountId === accountId) this.sessionBindings.delete(sessionKey);
   }
 
   public addAccount(params: {
@@ -457,7 +458,7 @@ export class AccountPool {
    */
   public releaseAccount(
     accId: string,
-    error?: { code: number; message: string },
+    error?: { code: number; message: string; retryAfterMs?: number },
     family?: 'claude' | 'gemini',
     sessionKey?: string
   ): void {
@@ -471,29 +472,35 @@ export class AccountPool {
       acc.lastError = `[HTTP ${error.code}] ${error.message}`;
 
       if (error.code === 429) {
-        // 判断是否属于特定模型族的额度用尽 (如 RESOURCE_EXHAUSTED / Quota exceeded / limit)
-        const errMsg = error.message.toLowerCase();
-        const isQuotaExhausted = errMsg.includes('resource_exhausted') ||
-                                 errMsg.includes('quota') ||
-                                 errMsg.includes('exhausted') ||
-                                 errMsg.includes('limit');
+        // Only a quota exhaustion response may affect one model family.
+        // A plain rate-limit response must cool the whole account.
+        const isQuotaExhausted = classifyUpstreamError(error.code, error.message).kind === 'quota';
+        const retryMs = error.retryAfterMs ?? retryAfterMs(undefined, error.message, 60 * 1000);
 
         if (isQuotaExhausted && family === 'claude') {
           // 仅 Claude / 3p 额度耗尽：精准置零 Claude 5h 额度，账号全局状态依然保持 active，Gemini 请求不受任何影响！
           if (acc.quota) {
             acc.quota.claude5hFraction = 0.0;
           }
+          if (!acc.quota) {
+            acc.status = 'cooldown';
+            acc.cooldownUntil = Date.now() + retryMs;
+          }
           console.warn(`[CircuitBreaker] 账号 ${acc.email} Claude/GPT 5h 额度耗尽，已标记 Claude 耗尽，账号保持 Active 供 Gemini 继续使用。`);
         } else if (isQuotaExhausted && family === 'gemini') {
           if (acc.quota) {
             acc.quota.gemini5hFraction = 0.0;
           }
+          if (!acc.quota) {
+            acc.status = 'cooldown';
+            acc.cooldownUntil = Date.now() + retryMs;
+          }
           console.warn(`[CircuitBreaker] 账号 ${acc.email} Gemini 5h 额度耗尽，已标记 Gemini 耗尽，账号保持 Active 供 Claude 继续使用。`);
         } else {
-          // 通用 RPM 频率限制（非特定模型额度用尽），账号进入 60 秒常规冷却
+          // 通用 RPM 频率限制（非特定模型额度用尽），遵守上游给出的冷却时间
           acc.status = 'cooldown';
-          acc.cooldownUntil = Date.now() + 60 * 1000;
-          console.warn(`[CircuitBreaker] 账号 ${acc.email} 触发通用 429 限频，进入冷却 60 秒。`);
+          acc.cooldownUntil = Date.now() + retryMs;
+          console.warn(`[CircuitBreaker] 账号 ${acc.email} 触发通用 429 限频，进入冷却 ${Math.ceil(retryMs / 1000)} 秒。`);
         }
 
         this.saveAccounts();
@@ -502,14 +509,23 @@ export class AccountPool {
         // 某个模型或某个会话的 429 全部失去粘性。
         this.clearSessionBinding(sessionKey, accId);
       } else if (error.code === 401) {
-        // 凭证过期，需刷新
-        console.warn(`[CircuitBreaker] Account ${acc.email} returned 401, token will be refreshed.`);
-        this.clearSessionBinding(sessionKey, accId);
-      } else if (error.code === 403) {
-        // 权限或封禁，标记为 dead
+        // 凭证失效。只允许上层执行一次刷新，失败后账号保持隔离，不能在后台循环重试。
         acc.status = 'dead';
-        console.error(`[CircuitBreaker] Account ${acc.email} marked as DEAD due to 403 Forbidden.`);
+        console.warn(`[CircuitBreaker] Account ${acc.email} returned 401 and was isolated until manual re-authentication.`);
         this.clearSessionBinding(sessionKey, accId);
+        this.saveAccounts();
+      } else if (error.code === 403) {
+        const classified = classifyUpstreamError(error.code, error.message);
+        // 政策类 403 和其他权限类 403 都是终止状态。不能继续轮换账号探测。
+        acc.status = 'dead';
+        if (classified.kind === 'policy_blocked') {
+          acc.lastError = `[POLICY_BLOCKED] ${error.message}`;
+          console.error(`[CircuitBreaker] Account ${acc.email} marked as POLICY_BLOCKED; automatic retries are disabled.`);
+        } else {
+          console.error(`[CircuitBreaker] Account ${acc.email} marked as DEAD due to 403 Forbidden.`);
+        }
+        this.clearSessionBinding(sessionKey, accId);
+        this.saveAccounts();
       }
     }
   }

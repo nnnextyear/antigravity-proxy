@@ -3,6 +3,7 @@ import { Account, AppConfig } from '../types.js';
 import { AccountPool } from './account-pool.js';
 import { DEFAULT_OAUTH_CLIENT_ID, DEFAULT_OAUTH_CLIENT_SECRET } from '../config.js';
 import { getOrCreateDispatcher, resetDispatcher } from './dispatcher.js';
+import { isInvalidGrantError } from './error-policy.js';
 
 const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 
@@ -11,6 +12,7 @@ const DEFAULT_CLIENT_SECRET = DEFAULT_OAUTH_CLIENT_SECRET;
 
 export class TokenRefresher {
   private timer: NodeJS.Timeout | null = null;
+  private refreshInFlight = new Map<string, Promise<boolean>>();
 
   constructor(
     private pool: AccountPool,
@@ -59,6 +61,21 @@ export class TokenRefresher {
    * 刷新单个账号的 Access Token
    */
   public async refreshSingleAccount(acc: Account): Promise<boolean> {
+    const existing = this.refreshInFlight.get(acc.id);
+    if (existing) return existing;
+
+    const refresh = this.refreshSingleAccountInternal(acc);
+    this.refreshInFlight.set(acc.id, refresh);
+    try {
+      return await refresh;
+    } finally {
+      if (this.refreshInFlight.get(acc.id) === refresh) {
+        this.refreshInFlight.delete(acc.id);
+      }
+    }
+  }
+
+  private async refreshSingleAccountInternal(acc: Account): Promise<boolean> {
     const clientId = this.config.oauthClientId || DEFAULT_CLIENT_ID;
     const bodyParams = new URLSearchParams({
       client_id: clientId,
@@ -92,13 +109,11 @@ export class TokenRefresher {
           const data = (await res.body.json()) as any;
           const newAccessToken = data.access_token;
           const expiresIn = data.expires_in || 3600;
+          const preserveTerminalReason = acc.status === 'dead' || acc.status === 'disabled';
 
           acc.accessToken = newAccessToken;
           acc.accessTokenExpiresAt = Date.now() + expiresIn * 1000;
-          if (acc.status === 'dead') {
-            acc.status = 'active';
-          }
-          acc.lastError = undefined;
+          if (!preserveTerminalReason) acc.lastError = undefined;
           this.pool.saveAccounts();
 
           console.log(`[TokenRefresher] Successfully refreshed token for ${acc.email}. Expires in ${expiresIn}s.`);
@@ -109,6 +124,9 @@ export class TokenRefresher {
           acc.lastError = `OAuth Refresh Failed (${res.statusCode}): ${errText}`;
           if (res.statusCode === 400 || res.statusCode === 401) {
             acc.status = 'dead';
+            if (isInvalidGrantError(res.statusCode, errText)) {
+              acc.lastError = `OAuth Refresh Failed (invalid_grant): ${errText}`;
+            }
           }
           this.pool.saveAccounts();
           return false;

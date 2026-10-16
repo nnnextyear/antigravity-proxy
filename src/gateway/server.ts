@@ -7,7 +7,7 @@ import { StringDecoder } from 'string_decoder';
 import { AppConfig, OpenAIChatCompletionRequest } from '../types.js';
 import { AccountPool, mergeUsageMetadata } from '../pool/account-pool.js';
 import { TokenRefresher } from '../pool/refresher.js';
-import { ContextOverflowError, LocationNotSupportedError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
+import { ContextOverflowError, getRetryAfterHeader, LocationNotSupportedError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
 import { convertOpenAIToCloudCode, createOpenAIChunk, extractTextFromGoogleChunk } from './adapter.js';
 import { ModelRequestError, toPublicModelCatalog } from './models.js';
 import { registerAdminRoutes } from '../admin/routes.js';
@@ -35,6 +35,11 @@ export async function createServer(
       return '/';
     }
   });
+
+  const applyRetryAfter = (reply: FastifyReply, error: unknown) => {
+    const retryAfter = getRetryAfterHeader(error);
+    if (retryAfter) reply.header('Retry-After', retryAfter);
+  };
 
   // 请求日志
   app.addHook('onRequest', async (req, reply) => {
@@ -129,7 +134,9 @@ export async function createServer(
     verifyClientAuth(req, reply);
     if (reply.sent) return;
     try {
-      const result = await executor.fetchAvailableModels();
+      const query = req.query as { refresh?: string } | undefined;
+      const forceRefresh = query?.refresh === '1' || query?.refresh === 'true';
+      const result = await executor.fetchAvailableModels(3, { forceRefresh });
       reply.header('Cache-Control', 'no-store');
       const data = toPublicModelCatalog(result).map(({ id: normalizedId, info, sourceId }) => {
         const contextLength = Number(info.inputTokenLimit ?? info.maxTokens ?? info.contextLength ?? info.context_length) || 1048576;
@@ -161,6 +168,7 @@ export async function createServer(
       return { object: 'list', data };
     } catch (err: any) {
       const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
+      applyRetryAfter(reply, err);
       return reply.status(statusCode).send({
         error: {
           message: err instanceof UpstreamRequestError ? err.message : `Antigravity model catalog unavailable: ${err.message}`,
@@ -272,6 +280,7 @@ export async function createServer(
       converted = convertOpenAIToCloudCode(chatReq, await executor.fetchAvailableModels());
     } catch (err: any) {
       const statusCode = err instanceof ModelRequestError ? 400 : err instanceof UpstreamRequestError ? err.statusCode : 503;
+      applyRetryAfter(reply, err);
       return reply.status(statusCode).send({ error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' } });
     }
     const { payload } = converted;
@@ -306,6 +315,7 @@ export async function createServer(
       }
       const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
       const message = err instanceof UpstreamRequestError ? err.message : `Antigravity upstream unavailable: ${err.message}`;
+      applyRetryAfter(reply, err);
       return reply.status(statusCode).send({
         error: { message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' }
       });
@@ -552,6 +562,7 @@ export async function createServer(
       converted = convertOpenAIToCloudCode(responseReq, await executor.fetchAvailableModels());
     } catch (err: any) {
       const statusCode = err instanceof ModelRequestError ? 400 : err instanceof UpstreamRequestError ? err.statusCode : 503;
+      applyRetryAfter(reply, err);
       return reply.status(statusCode).send({ error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' } });
     }
     const { payload } = converted;
@@ -579,6 +590,7 @@ export async function createServer(
         });
       }
       const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
+      applyRetryAfter(reply, err);
       return reply.status(statusCode).send({ error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' } });
     }
 

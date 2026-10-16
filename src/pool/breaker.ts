@@ -4,6 +4,7 @@ import { AccountPool } from './account-pool.js';
 import { TokenRefresher } from './refresher.js';
 import { QuotaManager } from './quota-manager.js';
 import { getOrCreateDispatcher, resetDispatcher } from './dispatcher.js';
+import { isLocationError, retryAfterMs } from './error-policy.js';
 import type { LiveModelCatalog } from '../gateway/models.js';
 
 export interface UpstreamExecutionResult {
@@ -19,14 +20,16 @@ export interface UpstreamTokenCountResult {
 }
 
 export interface AvailableModelsResult extends LiveModelCatalog {
-  accountUsed: Account;
+  /** The account used for a live fetch. Cached responses do not have a lease. */
+  accountUsed?: Account;
 }
 
 /** An upstream response that must be returned to the client, never retried on another account. */
 export class UpstreamRequestError extends Error {
   constructor(
     public readonly statusCode: number,
-    public readonly upstreamBody: string
+    public readonly upstreamBody: string,
+    public readonly upstreamHeaders?: Record<string, any>
   ) {
     super(`Google Upstream returned HTTP ${statusCode}: ${upstreamBody}`);
     this.name = 'UpstreamRequestError';
@@ -47,6 +50,14 @@ export class LocationNotSupportedError extends UpstreamRequestError {
   }
 }
 
+/** Return the upstream Retry-After value for a gateway response, if present. */
+export function getRetryAfterHeader(error: unknown): string | undefined {
+  if (!(error instanceof UpstreamRequestError)) return undefined;
+  const value = error.upstreamHeaders?.['retry-after'] ?? error.upstreamHeaders?.['Retry-After'];
+  if (Array.isArray(value)) return value.length ? String(value[0]) : undefined;
+  return value === undefined || value === null ? undefined : String(value);
+}
+
 function isContextOverflow(statusCode: number, body: string): boolean {
   return statusCode === 400 && (
     /input token count exceeds the maximum number of tokens/i.test(body) ||
@@ -56,14 +67,19 @@ function isContextOverflow(statusCode: number, body: string): boolean {
 }
 
 function isLocationNotSupported(statusCode: number, body: string): boolean {
-  return (statusCode === 400 || statusCode === 403) && (
-    /User location is not supported/i.test(body) ||
-    /location is not supported/i.test(body) ||
-    (/FAILED_PRECONDITION/i.test(body) && /location/i.test(body))
-  );
+  return isLocationError(statusCode, body);
+}
+
+function headersWithRetryAfter(headers: Record<string, any>, delayMs: number): Record<string, any> {
+  if (headers['retry-after'] !== undefined || headers['Retry-After'] !== undefined) return headers;
+  return { ...headers, 'retry-after': String(Math.ceil(delayMs / 1000)) };
 }
 
 export class RequestExecutor {
+  private modelCatalogCache: { catalog: LiveModelCatalog; expiresAt: number; upstreamUrl: string } | null = null;
+  private modelCatalogInFlight: Promise<AvailableModelsResult> | null = null;
+  private readonly modelCatalogTtlMs = 45 * 1000;
+
   constructor(
     private pool: AccountPool,
     private refresher: TokenRefresher,
@@ -123,8 +139,48 @@ export class RequestExecutor {
 
   /** Fetch the live model catalog from Antigravity. There is deliberately no
    * static fallback: an unavailable control-plane endpoint must be visible to
-   * CC Switch instead of advertising models that the account cannot use. */
-  public async fetchAvailableModels(maxRetries = 3): Promise<AvailableModelsResult> {
+   * CC Switch instead of advertising models that the account cannot use.
+   *
+   * The catalog changes much less often than individual generations. Keep a
+   * short cache and coalesce concurrent refreshes so model discovery from
+   * several clients cannot create a control-plane request burst. A caller can
+   * explicitly bypass the cache (for example, an authenticated admin refresh).
+   */
+  public async fetchAvailableModels(
+    maxRetries = 3,
+    options: { forceRefresh?: boolean } = {}
+  ): Promise<AvailableModelsResult> {
+    const now = Date.now();
+    if (!options.forceRefresh && this.modelCatalogCache
+      && this.modelCatalogCache.upstreamUrl === this.config.upstreamUrl
+      && this.modelCatalogCache.expiresAt > now) {
+      return { ...this.modelCatalogCache.catalog };
+    }
+
+    // A forced refresh also joins an already-running refresh. This prevents
+    // several explicit refreshes arriving together from bypassing the guard.
+    if (this.modelCatalogInFlight) return this.modelCatalogInFlight;
+
+    const refresh = this.fetchAvailableModelsFromUpstream(maxRetries);
+    this.modelCatalogInFlight = refresh;
+    try {
+      const result = await refresh;
+      const catalog: LiveModelCatalog = {
+        models: result.models,
+        agentModelSorts: result.agentModelSorts
+      };
+      this.modelCatalogCache = {
+        catalog,
+        expiresAt: Date.now() + this.modelCatalogTtlMs,
+        upstreamUrl: this.config.upstreamUrl
+      };
+      return result;
+    } finally {
+      if (this.modelCatalogInFlight === refresh) this.modelCatalogInFlight = null;
+    }
+  }
+
+  private async fetchAvailableModelsFromUpstream(maxRetries: number): Promise<AvailableModelsResult> {
     const triedAccountIds = new Set<string>();
     const modelsUrl = (() => {
       try {
@@ -145,7 +201,9 @@ export class RequestExecutor {
       if (!account.accessToken || Date.now() >= account.accessTokenExpiresAt) {
         const refreshed = await this.refresher.refreshSingleAccount(account);
         if (!refreshed) {
-          this.pool.releaseAccount(account.id, { code: 401, message: 'Token refresh failed while fetching models' });
+          // TokenRefresher already persists terminal invalid_grant failures.
+          // A network-only refresh failure must not turn a healthy account dead.
+          this.pool.releaseAccount(account.id);
           continue;
         }
       }
@@ -185,20 +243,39 @@ export class RequestExecutor {
         }
 
         if (res.statusCode === 401) {
-          this.pool.releaseAccount(account.id, { code: 401, message: body });
+          this.pool.releaseAccount(account.id);
           if (await this.refresher.refreshSingleAccount(account)) {
             triedAccountIds.delete(account.id);
           }
           continue;
         }
 
+        if (res.statusCode === 429) {
+          const retryDelay = retryAfterMs(res.headers as Record<string, unknown>, body, this.config.cooldownSeconds * 1000);
+          this.pool.releaseAccount(account.id, {
+            code: res.statusCode,
+            message: body,
+            retryAfterMs: retryDelay
+          });
+          throw new UpstreamRequestError(
+            res.statusCode,
+            body,
+            headersWithRetryAfter(res.headers as Record<string, any>, retryDelay)
+          );
+        }
         this.pool.releaseAccount(account.id, { code: res.statusCode, message: body.substring(0, 500) });
-        if (res.statusCode === 429 || res.statusCode >= 500) continue;
-        throw new UpstreamRequestError(res.statusCode, body);
+        if (res.statusCode >= 500) {
+          triedAccountIds.delete(account.id);
+          if (attempt < maxRetries) await new Promise(r => setTimeout(r, Math.min(500 * attempt, 1500)));
+          continue;
+        }
+        throw new UpstreamRequestError(res.statusCode, body, res.headers as Record<string, any>);
       } catch (err: any) {
         if (err instanceof UpstreamRequestError) throw err;
         resetDispatcher(effectiveProxy, { timeoutMs: 30000 });
         this.pool.releaseAccount(account.id);
+        triedAccountIds.delete(account.id);
+        if (attempt < maxRetries) await new Promise(r => setTimeout(r, Math.min(500 * attempt, 1500)));
         if (attempt === maxRetries) throw err;
       }
     }
@@ -222,17 +299,22 @@ export class RequestExecutor {
       .replace(/[?&]$/, '');
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      // Token counting is an auxiliary control-plane call. It must never
-      // create, replace, or delete the generation request's session binding.
-      const account = this.pool.acquireAccount(triedAccountIds, family);
+      // Token counting is an auxiliary control-plane call. It may establish
+      // the request's local account lease, but it must not replace that lease
+      // with another account before generation starts.
+      const account = this.pool.acquireAccount(triedAccountIds, family, sessionKey);
       if (!account) throw new Error(`No available ${family} account for token counting.`);
       triedAccountIds.add(account.id);
 
       if (!account.accessToken || Date.now() >= account.accessTokenExpiresAt) {
         const ok = await this.refresher.refreshSingleAccount(account);
         if (!ok) {
-          this.pool.releaseAccount(account.id, { code: 401, message: 'Token refresh failed during countTokens' }, family);
-          continue;
+          if (account.status === 'dead') {
+            this.pool.releaseAccount(account.id, { code: 401, message: 'Token refresh failed during countTokens' }, family, sessionKey);
+          } else {
+            this.pool.releaseAccount(account.id);
+          }
+          throw new UpstreamRequestError(401, 'Token refresh failed during countTokens; account requires re-authentication.');
         }
       }
 
@@ -268,29 +350,41 @@ export class RequestExecutor {
             this.pool.releaseAccount(account.id);
             return { totalTokens, accountUsed: account };
           }
-          this.pool.releaseAccount(account.id);
+          // Let the surrounding transport-error path release this lease once.
+          // Releasing here and then again in catch would steal concurrency
+          // from another request sharing the same account.
           throw new Error(`countTokens response did not include totalTokens: ${body.slice(0, 300)}`);
         }
 
         if (isLocationNotSupported(res.statusCode, body)) {
           this.pool.releaseAccount(account.id);
+          this.pool.clearSessionBinding(sessionKey, account.id);
           resetDispatcher(effectiveProxy, { timeoutMs: 60000 });
-          if (attempt < maxRetries) {
-            triedAccountIds.delete(account.id);
-            console.warn(`[Executor] countTokens 地区限制，正在重建代理连接并重试 (${attempt + 1}/${maxRetries})。`);
-            await new Promise(r => setTimeout(r, attempt * 1000));
-            continue;
-          }
+          console.warn('[Executor] countTokens 地区限制；本次请求停止，不在同一出口重复探测。');
           throw new LocationNotSupportedError(res.statusCode, body);
         }
 
-        this.pool.releaseAccount(account.id);
-        throw new UpstreamRequestError(res.statusCode, body);
+        const retryDelay = res.statusCode === 429
+          ? retryAfterMs(res.headers as Record<string, unknown>, body, this.config.cooldownSeconds * 1000)
+          : undefined;
+        this.pool.releaseAccount(account.id, {
+          code: res.statusCode,
+          message: body,
+          ...(retryDelay === undefined ? {} : { retryAfterMs: retryDelay })
+        }, family, sessionKey);
+        throw new UpstreamRequestError(
+          res.statusCode,
+          body,
+          retryDelay === undefined
+            ? res.headers as Record<string, any>
+            : headersWithRetryAfter(res.headers as Record<string, any>, retryDelay)
+        );
       } catch (err: any) {
         if (err instanceof UpstreamRequestError) throw err;
         const retryProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
         resetDispatcher(retryProxy, { timeoutMs: 60000 });
         this.pool.releaseAccount(account.id);
+        triedAccountIds.delete(account.id);
         if (attempt < maxRetries) {
           await new Promise(r => setTimeout(r, attempt * 1000));
         }
@@ -301,7 +395,7 @@ export class RequestExecutor {
   }
 
   /**
-   * 携带重试与熔断的执行器 (支持模型族群额度感知与智能无感换号)
+   * 带有限重试与熔断的执行器（按模型族群避开已知额度耗尽账号）
    */
   public async executeWithRetry(
     payload: GoogleCloudCodePayload,
@@ -357,7 +451,11 @@ export class RequestExecutor {
       if (!account.accessToken || Date.now() >= account.accessTokenExpiresAt) {
         const ok = await this.refresher.refreshSingleAccount(account);
         if (!ok) {
-          this.pool.releaseAccount(account.id, { code: 401, message: 'Initial token refresh failed' }, family, sessionKey);
+          if (account.status === 'dead') {
+            this.pool.releaseAccount(account.id, { code: 401, message: 'Initial token refresh failed' }, family, sessionKey);
+          } else {
+            this.pool.releaseAccount(account.id);
+          }
           continue; // 换下一个号重试
         }
       }
@@ -395,13 +493,16 @@ export class RequestExecutor {
         // 处理 429 限频 / 额度耗尽
         if (res.statusCode === 429) {
           const errBody = await res.body.text();
-          console.warn(`[Executor] 账号 ${account.email} 触发 429 限频/额度枯竭 (第 ${attempt}/${maxRetries} 次尝试)，正在无感自动换号...:`, errBody.substring(0, 120));
-          this.pool.releaseAccount(account.id, { code: 429, message: errBody }, family, sessionKey);
-          if (this.quotaManager) {
-            this.quotaManager.fetchQuotaForAccount(account).catch(() => {});
-          }
-          // 自动进入下一轮循环，换取下一个可用账号
-          continue;
+          const retryDelay = retryAfterMs(res.headers as Record<string, unknown>, errBody, this.config.cooldownSeconds * 1000);
+          console.warn(`[Executor] 账号 ${account.email} 触发 429 限频/额度枯竭 (第 ${attempt}/${maxRetries} 次尝试)，已记录 ${Math.ceil(retryDelay / 1000)} 秒冷却并停止复用该账号:`, errBody.substring(0, 120));
+          this.pool.releaseAccount(account.id, { code: 429, message: errBody, retryAfterMs: retryDelay }, family, sessionKey);
+          // Respect the upstream rate/quota decision for this request. Do not
+          // turn one 429 into a burst of retries across other accounts.
+          throw new UpstreamRequestError(
+            res.statusCode,
+            errBody,
+            headersWithRetryAfter(res.headers as Record<string, any>, retryDelay)
+          );
         }
 
         // 处理 401 Token 失效
@@ -415,7 +516,11 @@ export class RequestExecutor {
             this.pool.releaseAccount(account.id);
             triedAccountIds.delete(account.id);
           } else {
-            this.pool.releaseAccount(account.id, { code: 401, message: 'Token refresh failed' }, family, sessionKey);
+            if (account.status === 'dead') {
+              this.pool.releaseAccount(account.id, { code: 401, message: 'Token refresh failed' }, family, sessionKey);
+            } else {
+              this.pool.releaseAccount(account.id);
+            }
           }
           continue;
         }
@@ -425,18 +530,16 @@ export class RequestExecutor {
           const errBody = await res.body.text();
           if (isLocationNotSupported(res.statusCode, errBody)) {
             this.pool.releaseAccount(account.id);
+            this.pool.clearSessionBinding(sessionKey, account.id);
             resetDispatcher(effectiveProxy, { timeoutMs: 60000 });
-            if (attempt < maxRetries) {
-              triedAccountIds.delete(account.id);
-              console.warn(`[Executor] 生成请求地区限制，正在重建代理连接并重试 (${attempt + 1}/${maxRetries})。`);
-              await new Promise(r => setTimeout(r, attempt * 1000));
-              continue;
-            }
+            console.warn('[Executor] 生成请求地区限制；本次请求停止，不在同一出口重复探测。');
             throw new LocationNotSupportedError(res.statusCode, errBody);
           }
           console.error(`[Executor] Account ${account.email} hit 403 Forbidden:`, errBody);
           this.pool.releaseAccount(account.id, { code: 403, message: errBody }, family, sessionKey);
-          continue;
+          // 403 不是普通容量错误。尤其是 TOS_VIOLATION，继续轮换账号会
+          // 放大请求并掩盖真正原因；把原始上游正文直接返回给调用方。
+          throw new UpstreamRequestError(res.statusCode, errBody, res.headers as Record<string, any>);
         }
 
         // 处理 503 容量不足智能降级转移
@@ -460,29 +563,14 @@ export class RequestExecutor {
           throw new ContextOverflowError(res.statusCode, errBody);
         }
         if (isLocationNotSupported(res.statusCode, errBody)) {
+          this.pool.clearSessionBinding(sessionKey, account.id);
           resetDispatcher(effectiveProxy, { timeoutMs: 60000 });
-          if (attempt < maxRetries) {
-            triedAccountIds.delete(account.id);
-            console.warn(`[Executor] ⚠️ 触发 Google 链路地区抖动 (HTTP 400)，正在极速刷新代理隧道重试 (${attempt + 1}/${maxRetries})...`);
-            continue;
-          }
-          console.error(`[Executor] 🚨 账号 ${account.email} 遭遇 Google 地区限制: User location is not supported for the API use.`);
+          console.error(`[Executor] 🚨 账号 ${account.email} 遭遇 Google 地区限制: User location is not supported for the API use. 本次请求已停止。`);
           console.error(`[Executor] 💡 原因定位：当前代理出口节点或其所属数据中心机房段 (ASN) 被 Google API 判定为不受支持地区。`);
           console.error(`[Executor] 💡 诊断建议：请在代理软件（如 Clash）中更换其他美国(US)、日本(JP)或新加坡(SG)节点，避免使用同一条不稳定的出口链路。`);
-          if (effectiveProxy) {
-            const probeDisp = getOrCreateDispatcher(effectiveProxy, { timeoutMs: 5000 });
-            request('https://ipinfo.io/json', { dispatcher: probeDisp, headersTimeout: 5000, bodyTimeout: 5000 })
-              .then(async r => {
-                if (r.statusCode === 200) {
-                  const info = (await r.body.json()) as any;
-                  console.error(`[Executor] 🔍 出口 IP 探测：当前代理出口为 ${info.ip} (${info.country} - ${info.city || ''}, ${info.org || ''})`);
-                }
-              })
-              .catch(() => {});
-          }
           throw new LocationNotSupportedError(res.statusCode, errBody);
         }
-        throw new UpstreamRequestError(res.statusCode, errBody);
+        throw new UpstreamRequestError(res.statusCode, errBody, res.headers as Record<string, any>);
 
       } catch (err: any) {
         // 协议错误已完成账号释放，不允许被 catch 当成网络异常后再换号。

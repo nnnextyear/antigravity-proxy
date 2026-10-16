@@ -665,6 +665,10 @@ function getStatusPill(acc) {
     const remainingSec = Math.max(0, Math.ceil((acc.cooldownUntil - Date.now()) / 1000));
     return `<span class="status-badge-pill status-badge-cooldown"><span class="pulse-dot amber"></span>冷却 (${remainingSec}s)</span>`;
   } else if (acc.status === 'dead') {
+    const policyBlocked = isPolicyBlockedAccount(acc);
+    if (policyBlocked) {
+      return `<span class="status-badge-pill status-badge-dead" title="上游报告账号服务被停用，需要人工处理">政策限制</span>`;
+    }
     return `<span class="status-badge-pill status-badge-dead">异常失效</span>`;
   } else if (isClaudeExhausted && !isGeminiExhausted) {
     return `<span class="status-badge-pill status-badge-gemini" title="Claude 暂尽，Gemini 依然充足">Gemini可用</span>`;
@@ -674,6 +678,10 @@ function getStatusPill(acc) {
     return `<span class="status-badge-pill status-badge-dead">双额度暂尽</span>`;
   }
   return `<span class="status-badge-pill status-badge-active"><span class="pulse-dot green"></span>正常可用</span>`;
+}
+
+function isPolicyBlockedAccount(acc) {
+  return acc?.status === 'dead' && /POLICY_BLOCKED|TOS_VIOLATION|service has been disabled in this account/i.test(acc.lastError || '');
 }
 
 function getMetaClusterHtml(acc) {
@@ -711,6 +719,7 @@ function getCardHtml(acc) {
   const geminiPod = renderPodHtml('gemini', acc);
   const metaHtml = getMetaClusterHtml(acc);
   const isDisabled = acc.status === 'disabled';
+  const policyBlocked = isPolicyBlockedAccount(acc);
 
   return `
     <div class="account-card" id="card-${acc.id}" data-id="${acc.id}">
@@ -754,7 +763,7 @@ function getCardHtml(acc) {
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
             <span>刷新</span>
           </button>
-          ${isDisabled ? '' : `
+          ${isDisabled || policyBlocked ? '' : `
             <button class="card-action-btn action-activate" onclick="resetAccount('${acc.id}', this)" title="解除冷却重置为活跃状态">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
               <span>激活</span>

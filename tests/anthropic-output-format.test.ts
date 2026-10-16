@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import fastify from 'fastify';
 import { registerAnthropicRoutes } from '../src/gateway/anthropic.js';
+import { UpstreamRequestError } from '../src/pool/breaker.js';
 import type { AppConfig, GoogleCloudCodePayload } from '../src/types.js';
 
 const verdictSchema = {
@@ -79,6 +80,51 @@ test('Claude Code /goal JSON schema reaches the Google generation request', asyn
       }
     });
     assert.equal(invalidResponse.statusCode, 400);
+  } finally {
+    await app.close();
+  }
+});
+
+test('Anthropic generation stops when countTokens returns a policy error', async () => {
+  const app = fastify();
+  let generationCalls = 0;
+  const executor = {
+    fetchAvailableModels: async () => ({ models: { 'claude-sonnet-4-6': { maxOutputTokens: 64000 } } }),
+    countTokens: async () => {
+      throw new UpstreamRequestError(403, JSON.stringify({
+        error: {
+          code: 403,
+          reason: 'TOS_VIOLATION',
+          message: 'This service has been disabled in this account for violation of Terms of Service.'
+        }
+      }));
+    },
+    executeWithRetry: async () => {
+      generationCalls++;
+      throw new Error('generation must not be called');
+    }
+  };
+
+  registerAnthropicRoutes(
+    app,
+    {} as AppConfig,
+    { releaseAccount: () => {}, recordTokenUsage: () => {} } as any,
+    executor as any,
+    () => {}
+  );
+
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/messages',
+      payload: {
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'Hello' }]
+      }
+    });
+    assert.equal(response.statusCode, 403, response.body);
+    assert.equal(generationCalls, 0);
+    assert.match(response.body, /TOS_VIOLATION/);
   } finally {
     await app.close();
   }

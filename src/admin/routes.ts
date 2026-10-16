@@ -206,7 +206,7 @@ export function registerAdminRoutes(
     if (!acc.accessToken || Date.now() >= acc.accessTokenExpiresAt) {
       await refresher.refreshSingleAccount(acc);
     }
-    const quota = await quotaManager.fetchQuotaForAccount(acc);
+    const quota = await quotaManager.fetchQuotaForAccount(acc, { forceRefresh: true });
     return { success: Boolean(quota), quota, account: acc };
   });
 
@@ -220,7 +220,7 @@ export function registerAdminRoutes(
         await refresher.refreshSingleAccount(acc).catch(() => {});
       }
     }
-    await quotaManager.fetchAllQuotas();
+    await quotaManager.fetchAllQuotas({ forceRefresh: true });
     return { success: true, message: 'All account quotas updated successfully' };
   });
 

@@ -82,7 +82,7 @@ test('the picker excludes internal models and groups thinking presets without fa
   assert.deepEqual(toPublicModelCatalog({ ...catalog, agentModelSorts: [] }), []);
 });
 
-test('discovery always fetches fresh picker metadata and never serves a static or stale fallback', async () => {
+test('discovery uses the live picker metadata and never serves a static fallback', async () => {
   const f = await fixture();
   try {
     assert.equal((await f.inject('/v1/models', undefined, false)).statusCode, 401);

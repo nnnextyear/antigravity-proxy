@@ -2,9 +2,13 @@ import { request } from 'undici';
 import { Account, AccountQuota, AppConfig } from '../types.js';
 import { AccountPool } from './account-pool.js';
 import { getOrCreateDispatcher, resetDispatcher } from './dispatcher.js';
+import { isPolicyBlockedError } from './error-policy.js';
 
 export class QuotaManager {
   private pollTimer: NodeJS.Timeout | null = null;
+  private quotaInFlight = new Map<string, Promise<AccountQuota | null>>();
+  private quotaLastAttemptAt = new Map<string, number>();
+  private readonly minFetchIntervalMs = 30 * 1000;
 
   constructor(
     private pool: AccountPool,
@@ -14,8 +18,31 @@ export class QuotaManager {
   /**
    * 从 Google 官方上游 (v1internal:retrieveUserQuotaSummary) 拉取账号实时额度
    */
-  public async fetchQuotaForAccount(account: Account): Promise<AccountQuota | null> {
+  public async fetchQuotaForAccount(
+    account: Account,
+    options: { forceRefresh?: boolean } = {}
+  ): Promise<AccountQuota | null> {
     if (!account.accessToken) return null;
+
+    const existing = this.quotaInFlight.get(account.id);
+    if (existing) return existing;
+
+    const lastAttemptAt = this.quotaLastAttemptAt.get(account.id) ?? account.quota?.lastCheckedAt ?? 0;
+    if (!options.forceRefresh && Date.now() - lastAttemptAt < this.minFetchIntervalMs) {
+      return account.quota || null;
+    }
+
+    const fetch = this.fetchQuotaForAccountInternal(account);
+    this.quotaInFlight.set(account.id, fetch);
+    this.quotaLastAttemptAt.set(account.id, Date.now());
+    try {
+      return await fetch;
+    } finally {
+      if (this.quotaInFlight.get(account.id) === fetch) this.quotaInFlight.delete(account.id);
+    }
+  }
+
+  private async fetchQuotaForAccountInternal(account: Account): Promise<AccountQuota | null> {
 
     try {
       const effectiveProxy = account.proxyUrl || this.config?.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
@@ -52,6 +79,15 @@ export class QuotaManager {
       if (res.statusCode !== 200) {
         const errText = await res.body.text();
         console.warn(`[QuotaManager] Failed to fetch quota for ${account.email} (HTTP ${res.statusCode}): ${errText.substring(0, 100)}`);
+        if (isPolicyBlockedError(res.statusCode, errText)) {
+          // Quota polling is another upstream request. A policy 403 must
+          // isolate the account here too, otherwise the background worker
+          // would keep probing a disabled account every polling interval.
+          account.status = 'dead';
+          account.lastError = `[POLICY_BLOCKED] ${errText}`;
+          this.pool.updateAccount(account.id, { status: 'dead', lastError: account.lastError });
+          return null;
+        }
         try {
           const errJson = JSON.parse(errText);
           const validationDetail = errJson.error?.details?.find((d: any) => d.reason === 'VALIDATION_REQUIRED' || d.metadata?.validation_url);
@@ -138,10 +174,15 @@ export class QuotaManager {
         lastCheckedAt: Date.now()
       };
 
+      const preserveTerminalReason = account.status === 'dead' || account.status === 'disabled';
       account.quota = quota;
       account.validationUrl = undefined;
-      account.lastError = undefined;
-      this.pool.updateAccount(account.id, { quota, validationUrl: undefined, lastError: undefined });
+      if (!preserveTerminalReason) account.lastError = undefined;
+      this.pool.updateAccount(account.id, {
+        quota,
+        validationUrl: undefined,
+        ...(preserveTerminalReason ? {} : { lastError: undefined })
+      });
       return quota;
     } catch (err: any) {
       console.error(`[QuotaManager] Error fetching quota for ${account.email}:`, err.message);
@@ -152,11 +193,11 @@ export class QuotaManager {
   /**
    * 刷新账号池内所有活跃账号的额度
    */
-  public async fetchAllQuotas(): Promise<void> {
+  public async fetchAllQuotas(options: { forceRefresh?: boolean } = {}): Promise<void> {
     const accounts = this.pool.getAllAccounts();
     for (const acc of accounts) {
       if (acc.status === 'dead' || acc.status === 'disabled') continue;
-      await this.fetchQuotaForAccount(acc);
+      await this.fetchQuotaForAccount(acc, options);
       // 适度防抖
       await new Promise(r => setTimeout(r, 600));
     }

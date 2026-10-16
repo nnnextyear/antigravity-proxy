@@ -3,7 +3,7 @@ import { StringDecoder } from 'string_decoder';
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { AppConfig, GoogleCloudCodePayload, GoogleContent } from '../types.js';
 import { AccountPool, mergeUsageMetadata } from '../pool/account-pool.js';
-import { ContextOverflowError, LocationNotSupportedError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
+import { ContextOverflowError, getRetryAfterHeader, LocationNotSupportedError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
 import {
   ModelRequestError,
   ResolvedModel,
@@ -346,6 +346,11 @@ export function registerAnthropicRoutes(
   executor: RequestExecutor,
   verifyAuth: (req: FastifyRequest, reply: FastifyReply) => void
 ) {
+  const applyRetryAfter = (reply: FastifyReply, error: unknown) => {
+    const retryAfter = getRetryAfterHeader(error);
+    if (retryAfter) reply.header('Retry-After', retryAfter);
+  };
+
   // Claude Code calls this before /messages to decide when its own native
   // compaction should run. Return Google's real count instead of estimating.
   const handleAnthropicCountTokens = async (req: FastifyRequest, reply: FastifyReply) => {
@@ -361,6 +366,7 @@ export function registerAnthropicRoutes(
       modelDef = resolveDynamicUpstreamModel(body.model, await executor.fetchAvailableModels());
     } catch (err: any) {
       const statusCode = err instanceof ModelRequestError ? 400 : err instanceof UpstreamRequestError ? err.statusCode : 503;
+      applyRetryAfter(reply, err);
       return reply.status(statusCode).send({ type: 'error', error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message: err.message } });
     }
     const converted = convertAnthropicMessages(body.messages, modelDef.upstreamModel.startsWith('gemini'));
@@ -386,6 +392,7 @@ export function registerAnthropicRoutes(
       return reply.send({ input_tokens: counted.totalTokens });
     } catch (err: any) {
       const statusCode = err.statusCode && err.statusCode >= 400 && err.statusCode < 500 ? err.statusCode : 503;
+      applyRetryAfter(reply, err);
       return reply.status(statusCode).send({ type: 'error', error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message: `Unable to count request tokens: ${err.message}` } });
     }
   };
@@ -410,6 +417,7 @@ export function registerAnthropicRoutes(
       modelDef = resolveDynamicUpstreamModel(body.model, await executor.fetchAvailableModels());
     } catch (err: any) {
       const statusCode = err instanceof ModelRequestError ? 400 : err instanceof UpstreamRequestError ? err.statusCode : 503;
+      applyRetryAfter(reply, err);
       return reply.status(statusCode).send({ type: 'error', error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message: err.message } });
     }
     const { effort, budgetTokens } = thinking;
@@ -513,6 +521,14 @@ export function registerAnthropicRoutes(
 
     // 提取稳定会话唯一指纹（用于强会话粘性，最大化利用 Google 上游 Prompt Cache）
     const sessionKey = extractSessionKeyFromAnthropic(req, body);
+    // Even clients without a conversation identifier must use one account for
+    // the countTokens preflight and the following generation request. The
+    // ephemeral lease key is only used by the local account pool; it is never
+    // sent upstream as a session identifier.
+    const accountLeaseKey = sessionKey || `request:${crypto.randomUUID()}`;
+    const clearEphemeralAccountLease = () => {
+      if (!sessionKey) (pool as any).clearSessionBinding?.(accountLeaseKey);
+    };
     attachUpstreamSessionId(payload, sessionKey);
 
     // Anthropic clients use message_start.usage.input_tokens to decide when to
@@ -520,11 +536,27 @@ export function registerAnthropicRoutes(
     // generation so custom endpoints get the same signal as api.anthropic.com.
     let inputTokenCount = 0;
     try {
-      const counted = await executor.countTokens(payload, 3, sessionKey);
+      const counted = await executor.countTokens(payload, 3, accountLeaseKey);
       inputTokenCount = counted.totalTokens;
       console.info(`[AnthropicGateway] Preflight countTokens: ${inputTokenCount} input tokens (session ${sessionKey || 'none'})`);
     } catch (countErr: any) {
-      console.warn(`[AnthropicGateway] Preflight countTokens unavailable; continuing with upstream generation: ${countErr.message}`);
+      const statusCode = countErr instanceof LocationNotSupportedError
+        ? 400
+        : countErr instanceof UpstreamRequestError
+          ? countErr.statusCode
+          : 503;
+      const message = countErr instanceof LocationNotSupportedError
+        ? 'Google Upstream 拒绝访问：当前代理出口 IP 地区不受支持 (User location is not supported for the API use)。'
+        : countErr instanceof UpstreamRequestError
+          ? countErr.message
+          : `Unable to count request tokens safely: ${countErr.message}`;
+      console.error(`[AnthropicGateway] Preflight countTokens failed; generation was blocked: ${countErr.message}`);
+      applyRetryAfter(reply, countErr);
+      clearEphemeralAccountLease();
+      return reply.status(statusCode).send({
+        type: 'error',
+        error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message }
+      });
     }
 
     const abortController = new AbortController();
@@ -534,8 +566,9 @@ export function registerAnthropicRoutes(
     req.raw.once('aborted', abortUpstream);
     let upstreamRes: any;
     try {
-      upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey, abortController.signal);
+      upstreamRes = await executor.executeWithRetry(payload, 3, accountLeaseKey, abortController.signal);
     } catch (err: any) {
+      clearEphemeralAccountLease();
       if (err instanceof ContextOverflowError) {
         // Claude Code owns conversation compaction. Never rewrite the history
         // here: returning the native upstream error lets the client compact its
@@ -556,6 +589,7 @@ export function registerAnthropicRoutes(
       }
       const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
       const message = err instanceof UpstreamRequestError ? err.message : `Antigravity upstream unavailable: ${err.message}`;
+      applyRetryAfter(reply, err);
       return reply.status(statusCode).send({
         type: 'error',
         error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message }
@@ -577,6 +611,7 @@ export function registerAnthropicRoutes(
         if (released) return;
         released = true;
         pool.releaseAccount(accountUsed.id, err);
+        clearEphemeralAccountLease();
       };
       const onClientClose = () => {
         if (!completed) {
@@ -861,6 +896,7 @@ export function registerAnthropicRoutes(
         }
 
         pool.releaseAccount(accountUsed.id);
+        clearEphemeralAccountLease();
 
         if (lastUsageMetadata) pool.recordTokenUsage(lastUsageMetadata);
 
@@ -895,6 +931,7 @@ export function registerAnthropicRoutes(
         });
       } catch (err: any) {
         pool.releaseAccount(accountUsed.id, { code: 500, message: err.message });
+        clearEphemeralAccountLease();
         return reply.status(500).send({
           type: 'error',
           error: { type: 'api_error', message: `Stream parsing error: ${err.message}` }
