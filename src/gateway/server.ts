@@ -14,6 +14,7 @@ import { registerAdminRoutes } from '../admin/routes.js';
 import { registerAnthropicRoutes } from './anthropic.js';
 import { QuotaManager } from '../pool/quota-manager.js';
 import { attachUpstreamSessionId, extractSessionKey } from './session.js';
+import { startSseHeartbeat } from './streaming.js';
 
 export async function createServer(
   config: AppConfig,
@@ -329,6 +330,7 @@ export async function createServer(
       reply.raw.setHeader('Cache-Control', 'no-cache, no-transform');
       reply.raw.setHeader('Connection', 'keep-alive');
       reply.raw.setHeader('X-Accel-Buffering', 'no');
+      const stopSseHeartbeat = startSseHeartbeat(reply, config.streamKeepaliveMs);
 
       let buffer = '';
       const decoder = new StringDecoder('utf-8');
@@ -402,6 +404,7 @@ export async function createServer(
           reply.raw.end();
         }
       } finally {
+        stopSseHeartbeat();
         completed = true;
         abortUpstream();
         cleanup();
@@ -666,6 +669,7 @@ export async function createServer(
       reply.raw.setHeader('Cache-Control', 'no-cache, no-transform');
       reply.raw.setHeader('Connection', 'keep-alive');
       reply.raw.flushHeaders?.();
+      const stopSseHeartbeat = startSseHeartbeat(reply, config.streamKeepaliveMs);
       writeResponseEvent('response.created', { response: responseObject('in_progress') });
       writeResponseEvent('response.in_progress', { response: responseObject('in_progress') });
       const messageId = `msg_${responseId}`;
@@ -714,6 +718,8 @@ export async function createServer(
       } catch (err: any) {
         pool.releaseAccount(accountUsed.id, { code: 500, message: err.message });
         reply.raw.end();
+      } finally {
+        stopSseHeartbeat();
       }
       return;
     }

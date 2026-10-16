@@ -408,6 +408,7 @@ curl http://localhost:3000/v1/models \
 | `defaultMaxConcurrency` | - | `5` | 单个账号允许的最大并发请求数 |
 | `cooldownSeconds` | - | `60` | 遇到 429 限流时的静默冷却时间（秒） |
 | `tokenRefreshIntervalMs`| - | `180000` | 后台 Token 自动续期轮询周期（毫秒，默认 3 分钟） |
+| `streamKeepaliveMs` | - | `15000` | 长思考 SSE 流向客户端发送保活注释的间隔（毫秒） |
 
 ---
 

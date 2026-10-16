@@ -12,6 +12,7 @@ import {
   resolveThinkingConfig,
 } from './models.js';
 import { attachUpstreamSessionId, extractSessionKey } from './session.js';
+import { startSseHeartbeat } from './streaming.js';
 
 interface AnthropicMessageParam {
   role: 'user' | 'assistant';
@@ -604,6 +605,7 @@ export function registerAnthropicRoutes(
       reply.raw.setHeader('Cache-Control', 'no-cache, no-transform');
       reply.raw.setHeader('Connection', 'keep-alive');
       reply.raw.setHeader('X-Accel-Buffering', 'no');
+      const stopSseHeartbeat = startSseHeartbeat(reply, config.streamKeepaliveMs);
 
       let released = false;
       let completed = false;
@@ -844,6 +846,7 @@ export function registerAnthropicRoutes(
           reply.raw.end();
         }
       } finally {
+        stopSseHeartbeat();
         completed = true;
         abortUpstream();
         cleanup();

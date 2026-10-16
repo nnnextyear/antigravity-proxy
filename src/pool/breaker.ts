@@ -297,6 +297,8 @@ export class RequestExecutor {
       .replace(/streamGenerateContent/i, 'countTokens')
       .replace(/[?&]alt=sse\b/i, '')
       .replace(/[?&]$/, '');
+    const { sessionId: _sessionId, ...countRequest } = payload.request;
+    const serializedCountPayload = JSON.stringify({ request: countRequest });
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       // Token counting is an auxiliary control-plane call. It may establish
@@ -326,7 +328,6 @@ export class RequestExecutor {
         // and adds avoidable proxy/TLS failure points.
         // Google countTokens does not need the generation session ID; keep the
         // upstream affinity token exclusive to the actual generation call.
-        const { sessionId: _sessionId, ...countRequest } = payload.request;
         const res = await request(countUrl, {
           method: 'POST',
           headers: {
@@ -335,7 +336,7 @@ export class RequestExecutor {
             'User-Agent': 'antigravity/2.14.0',
             'x-goog-api-client': 'gl-node/22.7.0 grpc-web/1.0.0'
           },
-          body: JSON.stringify({ request: countRequest }),
+          body: serializedCountPayload,
           headersTimeout: 120000,
           bodyTimeout: 120000,
           dispatcher
@@ -381,6 +382,9 @@ export class RequestExecutor {
         );
       } catch (err: any) {
         if (err instanceof UpstreamRequestError) throw err;
+        const errorCode = err?.code || err?.cause?.code || (err?.name && err.name !== 'Error' ? err.name : 'unknown');
+        const errorKind = errorCode === 'unknown' ? 'processing error' : 'network error';
+        console.warn(`[Executor] countTokens ${errorKind} for account ${account.email} (attempt ${attempt}/${maxRetries}, code=${errorCode}, payload=${Buffer.byteLength(serializedCountPayload)} bytes):`, err.message);
         const retryProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
         resetDispatcher(retryProxy, { timeoutMs: 60000 });
         this.pool.releaseAccount(account.id);
@@ -408,6 +412,7 @@ export class RequestExecutor {
     const family: 'claude' | 'gemini' = (model.includes('claude') || model.includes('opus') || model.includes('sonnet') || model.includes('gpt') || model.includes('oss'))
       ? 'claude'
       : 'gemini';
+    const serializedPayload = JSON.stringify(payload);
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       const account = await this.acquireRequestAccount(triedAccountIds, family, sessionKey, signal);
@@ -460,6 +465,7 @@ export class RequestExecutor {
         }
       }
 
+      const attemptStartedAt = Date.now();
       try {
         const effectiveProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
         const dispatcher = getOrCreateDispatcher(effectiveProxy, { timeoutMs: 60000 });
@@ -473,7 +479,7 @@ export class RequestExecutor {
         const res = await request(this.config.upstreamUrl, {
           method: 'POST',
           headers: upstreamHeaders,
-          body: JSON.stringify(payload),
+          body: serializedPayload,
           headersTimeout: 600000,
           bodyTimeout: 600000,
           dispatcher,
@@ -583,7 +589,8 @@ export class RequestExecutor {
         }
         // 网络层异常只影响本次请求。保留会话绑定并有限重试同一账号，
         // 避免普通代理抖动把整个会话永久迁移到另一个账号。
-        console.error(`[Executor] Network or connection error for account ${account.email} (attempt ${attempt}/${maxRetries}):`, err.message);
+        const errorCode = err?.code || err?.cause?.code || (err?.name && err.name !== 'Error' ? err.name : 'unknown');
+        console.error(`[Executor] Network or connection error for account ${account.email} (attempt ${attempt}/${maxRetries}, code=${errorCode}, elapsed=${Date.now() - attemptStartedAt}ms, payload=${Buffer.byteLength(serializedPayload)} bytes):`, err.message);
         const retryProxy = account.proxyUrl || this.config.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
         resetDispatcher(retryProxy, { timeoutMs: 60000 });
         this.pool.releaseAccount(account.id);

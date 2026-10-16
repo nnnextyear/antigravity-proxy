@@ -46,6 +46,8 @@ export interface AppConfig {
   defaultMaxConcurrency: number;
   cooldownSeconds: number;      // 遇到 429 冷却时长（秒）
   tokenRefreshIntervalMs: number;
+  /** Downstream SSE keep-alive interval for long thinking streams. */
+  streamKeepaliveMs?: number;
   routingStrategy?: RoutingStrategy;
   oauthClientId?: string;
   oauthClientSecret?: string;

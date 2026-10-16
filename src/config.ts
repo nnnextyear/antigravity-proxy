@@ -17,6 +17,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   defaultMaxConcurrency: 5,
   cooldownSeconds: 60,
   tokenRefreshIntervalMs: 3 * 60 * 1000, // 3 分钟检查一次
+  streamKeepaliveMs: 15 * 1000,
   routingStrategy: (process.env.ROUTING_STRATEGY as any) || 'zero-waste',
   oauthClientId: process.env.OAUTH_CLIENT_ID || DEFAULT_OAUTH_CLIENT_ID,
   oauthClientSecret: process.env.OAUTH_CLIENT_SECRET || DEFAULT_OAUTH_CLIENT_SECRET,
