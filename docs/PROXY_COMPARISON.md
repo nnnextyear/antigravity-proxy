@@ -14,7 +14,7 @@
 | 能力 | 当前项目 | 主流实现方式 | 本项目决策 |
 | --- | --- | --- | --- |
 | 多账号路由 | 本地号池、会话粘性、5 小时/周额度 | LiteLLM Router/least-busy；One-API channel group + retry | 保留本地 Google 额度调度，增加紧迫度高于粘性的规则 |
-| 故障转移 | 429/401/403/503 分类处理 | 按可重试状态重放原请求，失败通道降权/禁用 | 保留分类；协议 400 不换号，网络/5xx/429 才重试 |
+| 故障转移 | 429/401/403/503 分类处理 | 按可重试状态重放原请求，失败通道降权/禁用 | 保留分类；400/429/403 不换号直接返回，只有未提交生成的网络错误与 503/401(刷新后) 才重试 |
 | 会话缓存 | session -> account 绑定 | sticky routing/cache key，跨 worker 通常用 Redis | 保留内存粘性；后续可插拔 Redis，不改变单机行为 |
 | 上下文压缩 | 由客户端原生会话压缩负责 | Claude Code Proxy 优先原生压缩/compact 事件 | 代理不改写会话历史，只返回真实 usage 和上游错误 |
 | Token 统计 | Google usageMetadata + countTokens | Provider 原始 usage，聚合层按请求结算 | 保留真实值，禁止估算值；新增工具调用后的 usage 校验 |
@@ -27,7 +27,7 @@
 1. **协议级工具调用**：OpenAI assistant `tool_calls` 转为 Google `functionCall`，tool 消息转为 `functionResponse`；上游函数调用再转回 OpenAI SSE/non-stream 响应。
 2. **原生压缩信号**：Anthropic `message_start.usage.input_tokens` 使用 Google `countTokens` 实际结果，匹配 Claude Code 的自动压缩判断；`message_delta` 只发送输出 usage。
 3. **原生压缩边界**：代理不实现第二套历史压缩算法，避免服务端临时改写和客户端本地会话状态分叉。
-4. **重试边界**：上下文 400 不轮换账号；429/网络错误/可恢复 5xx 才进入账号级重试。
+4. **重试边界**：上下文 400 不轮换账号；429 按 Retry-After 冷却账号后原样返回，不在本次请求内换号放大；只有"请求体尚未提交"的网络错误与 503、401（刷新 Token 一次后）才进入账号级重试。已经提交生成的请求即使失败也不再自动重放（结果未知，避免重复生成）。
 5. **额度紧迫度优先**：周重置和 5 小时临期账号可以打破普通 session sticky，避免缓存粘性造成额度浪费。
 
 ## 当前仍保留的优势

@@ -2306,3 +2306,21 @@ input[type="number"] {
   font-weight: 600;
   box-shadow: 0 0 10px rgba(99, 102, 241, 0.25);
 }
+
+.text-warn { color: #f5a524; }
+
+.acc-last-error {
+  flex-basis: 100%;
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-muted, #8b949e);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.acc-last-error::before {
+  content: "最近错误：";
+  color: #f5a524;
+}

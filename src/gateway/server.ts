@@ -14,7 +14,7 @@ import { registerAdminRoutes } from '../admin/routes.js';
 import { registerAnthropicRoutes } from './anthropic.js';
 import { QuotaManager } from '../pool/quota-manager.js';
 import { attachUpstreamSessionId, extractSessionKey } from './session.js';
-import { startSseHeartbeat } from './streaming.js';
+import { prepareSseResponse, sendGatewayError, startRequestLifecycle } from './streaming.js';
 
 export async function createServer(
   config: AppConfig,
@@ -134,10 +134,11 @@ export async function createServer(
   const handleGetModels = async (req: FastifyRequest, reply: FastifyReply) => {
     verifyClientAuth(req, reply);
     if (reply.sent) return;
+    const lifecycle = startRequestLifecycle(req, reply, false);
     try {
       const query = req.query as { refresh?: string } | undefined;
       const forceRefresh = query?.refresh === '1' || query?.refresh === 'true';
-      const result = await executor.fetchAvailableModels(3, { forceRefresh });
+      const result = await executor.fetchAvailableModels(3, { forceRefresh }, lifecycle.signal);
       reply.header('Cache-Control', 'no-store');
       const data = toPublicModelCatalog(result).map(({ id: normalizedId, info, sourceId }) => {
         const contextLength = Number(info.inputTokenLimit ?? info.maxTokens ?? info.contextLength ?? info.context_length) || 1048576;
@@ -170,12 +171,14 @@ export async function createServer(
     } catch (err: any) {
       const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
       applyRetryAfter(reply, err);
-      return reply.status(statusCode).send({
+      // Uniform rule: once a lifecycle is armed, errors go through
+      // sendGatewayError so a hijacked reply can never swallow them.
+      return sendGatewayError(reply, statusCode, {
         error: {
           message: err instanceof UpstreamRequestError ? err.message : `Antigravity model catalog unavailable: ${err.message}`,
           type: statusCode === 400 ? 'invalid_request_error' : 'api_error'
         }
-      });
+      }, 'chat', { retryAfterSeconds: getRetryAfterHeader(err) });
     }
   };
 
@@ -276,81 +279,70 @@ export async function createServer(
       });
     }
 
+    // The lifecycle starts before model discovery: that wait needs the
+    // keepalive, and a disconnected client must cancel it.
+    const isStream = Boolean(chatReq.stream);
+    const lifecycle = startRequestLifecycle(req, reply, isStream, config.streamKeepaliveMs);
+
     let converted: ReturnType<typeof convertOpenAIToCloudCode>;
     try {
-      converted = convertOpenAIToCloudCode(chatReq, await executor.fetchAvailableModels());
+      converted = convertOpenAIToCloudCode(chatReq, await executor.fetchAvailableModels(3, {}, lifecycle.signal));
     } catch (err: any) {
+      lifecycle.abort();
       const statusCode = err instanceof ModelRequestError ? 400 : err instanceof UpstreamRequestError ? err.statusCode : 503;
       applyRetryAfter(reply, err);
-      return reply.status(statusCode).send({ error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' } });
+      return sendGatewayError(reply, statusCode, {
+        error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' }
+      }, 'chat', { retryAfterSeconds: getRetryAfterHeader(err) });
     }
     const { payload } = converted;
-    const isStream = Boolean(chatReq.stream);
     const completionId = `chatcmpl-${crypto.randomBytes(12).toString('hex')}`;
 
     // 提取稳定会话唯一指纹（用于强会话粘性，最大化利用 Google 上游 Prompt Cache）
     const sessionKey = extractSessionKey(req.headers as Record<string, unknown>, chatReq, 'openai');
     attachUpstreamSessionId(payload, sessionKey);
 
-    const abortController = new AbortController();
-    const abortUpstream = () => {
-      if (!abortController.signal.aborted) abortController.abort();
-    };
-    req.raw.once('aborted', abortUpstream);
     let upstreamRes: any = null;
     try {
-      upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey, abortController.signal);
+      upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey, lifecycle.signal, req.id);
     } catch (err: any) {
       if (err instanceof ContextOverflowError) {
-        return reply.status(400).send({
+        return sendGatewayError(reply, 400, {
           error: { message: 'Request context exceeds the upstream limit. The client must compact its conversation and retry.', type: 'invalid_request_error' }
-        });
+        }, 'chat', { retryAfterSeconds: getRetryAfterHeader(err) });
       }
       if (err instanceof LocationNotSupportedError) {
-        return reply.status(400).send({
+        return sendGatewayError(reply, 400, {
           error: {
             message: 'Google Upstream 拒绝访问：当前代理出口 IP 地区不受支持 (User location is not supported for the API use)。请在代理软件（如 Clash）中将节点切换至美国(US)、日本(JP)、新加坡(SG)等 Google 支持的地区，避免使用香港(HK)节点或直连。',
             type: 'invalid_request_error'
           }
-        });
+        }, 'chat', { retryAfterSeconds: getRetryAfterHeader(err) });
       }
       const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
       const message = err instanceof UpstreamRequestError ? err.message : `Antigravity upstream unavailable: ${err.message}`;
       applyRetryAfter(reply, err);
-      return reply.status(statusCode).send({
+      return sendGatewayError(reply, statusCode, {
         error: { message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' }
-      });
+      }, 'chat', { retryAfterSeconds: getRetryAfterHeader(err) });
     }
 
     const { bodyStream, accountUsed } = upstreamRes;
+    let released = false;
+    const cleanup = (err?: any) => {
+      if (released) return;
+      released = true;
+      pool.releaseAccount(accountUsed.id, err);
+    };
 
     if (isStream) {
       // 开启 SSE 模式
-      reply.raw.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-      reply.raw.setHeader('Cache-Control', 'no-cache, no-transform');
-      reply.raw.setHeader('Connection', 'keep-alive');
-      reply.raw.setHeader('X-Accel-Buffering', 'no');
-      const stopSseHeartbeat = startSseHeartbeat(reply, config.streamKeepaliveMs);
+      prepareSseResponse(reply);
 
       let buffer = '';
       const decoder = new StringDecoder('utf-8');
       let usageMetadata: any = null;
       const toolCalls: Array<{ id?: string; name: string; arguments: string }> = [];
-
-      let released = false;
-      let completed = false;
-      const cleanup = (err?: any) => {
-        if (released) return;
-        released = true;
-        pool.releaseAccount(accountUsed.id, err);
-      };
-
-      const onClientClose = () => {
-        if (!completed) abortUpstream();
-        cleanup({ code: 499, message: 'Client disconnected' });
-      };
-      req.raw.once('aborted', onClientClose);
-      reply.raw.once('close', onClientClose);
 
       try {
         for await (const chunk of bodyStream) {
@@ -392,22 +384,18 @@ export async function createServer(
         // 发送终止标志
         reply.raw.write('data: [DONE]\n\n');
         reply.raw.end();
-        completed = true;
         if (usageMetadata) pool.recordTokenUsage(usageMetadata);
       } catch (e: any) {
         console.error('[Gateway] SSE Streaming error:', e.message);
-        if (!reply.raw.destroyed && !reply.raw.writableEnded) {
-          reply.raw.write(`data: ${JSON.stringify({
-            error: { message: `Upstream stream failed: ${e.message}`, type: 'api_error' }
-          })}\n\n`);
-          reply.raw.write('data: [DONE]\n\n');
-          reply.raw.end();
-        }
+        const statusCode = e instanceof UpstreamRequestError ? e.statusCode : 502;
+        sendGatewayError(reply, statusCode, {
+          error: { message: `Upstream stream failed: ${e.message}`, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' }
+        }, 'chat', { retryAfterSeconds: getRetryAfterHeader(e) });
       } finally {
-        stopSseHeartbeat();
-        completed = true;
-        abortUpstream();
-        cleanup();
+        // Capture the disconnect state before abort() flips it for every exit.
+        const clientGone = lifecycle.signal.aborted;
+        lifecycle.abort();
+        cleanup(clientGone ? { code: 499, message: 'Client disconnected' } : undefined);
       }
     } else {
       // 非流式，聚合文本一次性返回
@@ -445,7 +433,7 @@ export async function createServer(
         }
         buffer += decoder.end();
 
-        pool.releaseAccount(accountUsed.id);
+        cleanup();
         if (usageMetadata) pool.recordTokenUsage(usageMetadata);
 
         return reply.send({
@@ -477,10 +465,12 @@ export async function createServer(
           }
         });
       } catch (err: any) {
-        pool.releaseAccount(accountUsed.id, { code: 500, message: err.message });
-        return reply.status(500).send({
+        cleanup(lifecycle.signal.aborted
+          ? { code: 499, message: 'Client disconnected' }
+          : { code: 500, message: err.message });
+        return sendGatewayError(reply, 500, {
           error: { message: `Stream parsing error: ${err.message}`, type: 'api_error' }
-        });
+        }, 'chat');
       }
     }
   };
@@ -560,44 +550,51 @@ export async function createServer(
       responseReq.response_format = { type: 'json_object' };
     }
 
+    const lifecycle = startRequestLifecycle(req, reply, Boolean(input.stream), config.streamKeepaliveMs);
+
     let converted: ReturnType<typeof convertOpenAIToCloudCode>;
     try {
-      converted = convertOpenAIToCloudCode(responseReq, await executor.fetchAvailableModels());
+      converted = convertOpenAIToCloudCode(responseReq, await executor.fetchAvailableModels(3, {}, lifecycle.signal));
     } catch (err: any) {
+      lifecycle.abort();
       const statusCode = err instanceof ModelRequestError ? 400 : err instanceof UpstreamRequestError ? err.statusCode : 503;
       applyRetryAfter(reply, err);
-      return reply.status(statusCode).send({ error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' } });
+      return sendGatewayError(reply, statusCode, {
+        error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' }
+      }, 'responses', { retryAfterSeconds: getRetryAfterHeader(err) });
     }
     const { payload } = converted;
     const responseId = `resp_${crypto.randomBytes(12).toString('hex')}`;
     const sessionKey = extractSessionKey(req.headers as Record<string, unknown>, input, 'responses');
     attachUpstreamSessionId(payload, sessionKey);
 
-    const abortController = new AbortController();
-    req.raw.once('aborted', () => {
-      if (!abortController.signal.aborted) abortController.abort();
-    });
     let upstreamRes: any;
     try {
-      upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey, abortController.signal);
+      upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey, lifecycle.signal, req.id);
     } catch (err: any) {
       if (err instanceof ContextOverflowError) {
-        return reply.status(400).send({ error: { message: 'Request context exceeds the upstream limit.', type: 'invalid_request_error' } });
+        return sendGatewayError(reply, 400, { error: { message: 'Request context exceeds the upstream limit.', type: 'invalid_request_error' } }, 'responses', { retryAfterSeconds: getRetryAfterHeader(err) });
       }
       if (err instanceof LocationNotSupportedError) {
-        return reply.status(400).send({
+        return sendGatewayError(reply, 400, {
           error: {
             message: 'Google Upstream 拒绝访问：当前代理出口 IP 地区不受支持 (User location is not supported for the API use)。请在代理软件（如 Clash）中将节点切换至美国(US)、日本(JP)、新加坡(SG)等 Google 支持的地区，避免使用香港(HK)节点或直连。',
             type: 'invalid_request_error'
           }
-        });
+        }, 'responses', { retryAfterSeconds: getRetryAfterHeader(err) });
       }
       const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
       applyRetryAfter(reply, err);
-      return reply.status(statusCode).send({ error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' } });
+      return sendGatewayError(reply, statusCode, { error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' } }, 'responses', { retryAfterSeconds: getRetryAfterHeader(err) });
     }
 
     const { bodyStream, accountUsed } = upstreamRes;
+    let released = false;
+    const cleanup = (err?: any) => {
+      if (released) return;
+      released = true;
+      pool.releaseAccount(accountUsed.id, err);
+    };
     let fullText = '';
     let buffer = '';
     const decoder = new StringDecoder('utf-8');
@@ -665,25 +662,24 @@ export async function createServer(
     };
 
     if (input.stream) {
-      reply.raw.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-      reply.raw.setHeader('Cache-Control', 'no-cache, no-transform');
-      reply.raw.setHeader('Connection', 'keep-alive');
-      reply.raw.flushHeaders?.();
-      const stopSseHeartbeat = startSseHeartbeat(reply, config.streamKeepaliveMs);
-      writeResponseEvent('response.created', { response: responseObject('in_progress') });
-      writeResponseEvent('response.in_progress', { response: responseObject('in_progress') });
       const messageId = `msg_${responseId}`;
-      writeResponseEvent('response.output_item.added', {
-        output_index: 0,
-        item: { id: messageId, type: 'message', status: 'in_progress', role: 'assistant', content: [] }
-      });
-      writeResponseEvent('response.content_part.added', {
-        item_id: messageId,
-        output_index: 0,
-        content_index: 0,
-        part: { type: 'output_text', text: '', annotations: [] }
-      });
+      // Everything that touches the socket lives inside the try so the lease
+      // can never be stranded by a failure while opening the stream.
       try {
+        prepareSseResponse(reply);
+        reply.raw.flushHeaders?.();
+        writeResponseEvent('response.created', { response: responseObject('in_progress') });
+        writeResponseEvent('response.in_progress', { response: responseObject('in_progress') });
+        writeResponseEvent('response.output_item.added', {
+          output_index: 0,
+          item: { id: messageId, type: 'message', status: 'in_progress', role: 'assistant', content: [] }
+        });
+        writeResponseEvent('response.content_part.added', {
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: 'output_text', text: '', annotations: [] }
+        });
         for await (const chunk of bodyStream) {
           buffer += decoder.write(chunk);
           const lines = buffer.split('\n');
@@ -698,7 +694,7 @@ export async function createServer(
           }
         }
         buffer += decoder.end();
-        pool.releaseAccount(accountUsed.id);
+        cleanup();
         if (usageMetadata) pool.recordTokenUsage(usageMetadata);
         const output = buildOutput(messageId);
         if (fullText || !toolCalls.length) {
@@ -716,10 +712,14 @@ export async function createServer(
         reply.raw.write('data: [DONE]\n\n');
         reply.raw.end();
       } catch (err: any) {
-        pool.releaseAccount(accountUsed.id, { code: 500, message: err.message });
-        reply.raw.end();
+        cleanup({ code: lifecycle.signal.aborted ? 499 : 500, message: err.message });
+        const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 502;
+        sendGatewayError(reply, statusCode, {
+          error: { message: `Upstream stream failed: ${err.message}`, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' }
+        }, 'responses', { retryAfterSeconds: getRetryAfterHeader(err) });
       } finally {
-        stopSseHeartbeat();
+        lifecycle.abort();
+        cleanup();
       }
       return;
     }
@@ -737,13 +737,13 @@ export async function createServer(
           }
         }
       }
-      pool.releaseAccount(accountUsed.id);
+      cleanup();
       if (usageMetadata) pool.recordTokenUsage(usageMetadata);
       const output = buildOutput(`msg_${responseId}`);
       return reply.send({ ...responseObject('completed', output), output_text: fullText });
     } catch (err: any) {
-      pool.releaseAccount(accountUsed.id, { code: 500, message: err.message });
-      return reply.status(500).send({ error: { message: `Stream parsing error: ${err.message}`, type: 'api_error' } });
+      cleanup({ code: lifecycle.signal.aborted ? 499 : 500, message: err.message });
+      return sendGatewayError(reply, 500, { error: { message: `Stream parsing error: ${err.message}`, type: 'api_error' } }, 'responses');
     }
   };
 

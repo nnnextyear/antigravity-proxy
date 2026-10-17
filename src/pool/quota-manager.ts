@@ -1,13 +1,51 @@
 import { request } from 'undici';
 import { Account, AccountQuota, AppConfig } from '../types.js';
 import { AccountPool } from './account-pool.js';
-import { getOrCreateDispatcher, resetDispatcher } from './dispatcher.js';
-import { isPolicyBlockedError } from './error-policy.js';
+import { getOrCreateDispatcher } from './dispatcher.js';
+import { isPolicyBlockedError, retryAfterMs } from './error-policy.js';
+import { jittered } from './transport.js';
+
+/** How often a validation-flagged account is re-probed before giving up. */
+const VALIDATION_RECHECK_MS = 30 * 60 * 1000;
+
+export interface QuotaPollGate {
+  /** Timestamp until which the quota endpoint asked us to stay away. */
+  pausedUntil?: number;
+  /** Last time we actually tried to poll this account. */
+  lastAttemptAt?: number;
+  /** Operator-initiated refresh: bypasses cooldown/pause/validation waits. */
+  force?: boolean;
+}
+
+/**
+ * Background quota polling must never touch an account the request path is
+ * deliberately resting: dead/disabled accounts, accounts inside their 429
+ * cooldown, accounts the quota endpoint asked us to pause, and accounts whose
+ * token is stale.
+ *
+ * A validation-flagged account is the exception: its flag is only ever cleared
+ * by a successful poll, so skipping it forever would freeze its quota forever.
+ * Re-probe it on a slow cadence instead.
+ */
+export function shouldPollQuota(acc: Account, now: number, gate: QuotaPollGate = {}): boolean {
+  if (acc.status === 'dead' || acc.status === 'disabled') return false;
+  if (!gate.force) {
+    if (acc.status === 'cooldown' && now < acc.cooldownUntil) return false;
+    if (now < (gate.pausedUntil ?? 0)) return false;
+    if (acc.validationUrl && now - (gate.lastAttemptAt ?? 0) < VALIDATION_RECHECK_MS) return false;
+  }
+  if (!acc.accessToken || now >= acc.accessTokenExpiresAt) return false;
+  return true;
+}
 
 export class QuotaManager {
   private pollTimer: NodeJS.Timeout | null = null;
   private quotaInFlight = new Map<string, Promise<AccountQuota | null>>();
   private quotaLastAttemptAt = new Map<string, number>();
+  /** Per-account quiet period requested by the quota endpoint itself. */
+  private quotaPausedUntil = new Map<string, number>();
+  private sweepRunning = false;
+  private sweepPromise: Promise<void> | null = null;
   private readonly minFetchIntervalMs = 30 * 1000;
 
   constructor(
@@ -45,12 +83,12 @@ export class QuotaManager {
   private async fetchQuotaForAccountInternal(account: Account): Promise<AccountQuota | null> {
 
     try {
-      const effectiveProxy = account.proxyUrl || this.config?.defaultProxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-      const dispatcher = getOrCreateDispatcher(effectiveProxy, { timeoutMs: 30000 });
+        const effectiveProxy = account.proxyUrl || this.config?.defaultProxyUrl;
     let res: any;
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
+        const dispatcher = effectiveProxy ? getOrCreateDispatcher(effectiveProxy, { timeoutMs: 30000 }) : undefined;
         res = await request('https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary', {
           method: 'POST',
           headers: {
@@ -67,8 +105,7 @@ export class QuotaManager {
         break;
       } catch (err: any) {
         if (attempt < 2) {
-          resetDispatcher(effectiveProxy, { timeoutMs: 30000 });
-          await new Promise(r => setTimeout(r, 1500));
+          await new Promise(r => setTimeout(r, jittered(1500)));
           continue;
         }
         console.warn(`[QuotaManager] Network error fetching quota for ${account.email} (transient socket drop, will retry next cycle):`, err.message);
@@ -77,8 +114,25 @@ export class QuotaManager {
     }
 
       if (res.statusCode !== 200) {
-        const errText = await res.body.text();
+        let errText = '';
+        try {
+          errText = await res.body.text();
+        } catch {
+          errText = '';
+        }
         console.warn(`[QuotaManager] Failed to fetch quota for ${account.email} (HTTP ${res.statusCode}): ${errText.substring(0, 100)}`);
+        // Honour the endpoint's own pacing signal instead of coming back at a
+        // fixed 3-minute cadence against an account it just throttled.
+        if (res.statusCode === 429 || res.statusCode === 503) {
+          const delay = retryAfterMs(
+            res.headers as Record<string, unknown>,
+            errText,
+            (this.config?.cooldownSeconds ?? 60) * 1000
+          );
+          this.quotaPausedUntil.set(account.id, Date.now() + delay);
+          console.warn(`[QuotaManager] Quota endpoint throttled ${account.email}; pausing quota polling for ${Math.ceil(delay / 1000)}s.`);
+          return null;
+        }
         if (isPolicyBlockedError(res.statusCode, errText)) {
           // Quota polling is another upstream request. A policy 403 must
           // isolate the account here too, otherwise the background worker
@@ -192,14 +246,48 @@ export class QuotaManager {
 
   /**
    * 刷新账号池内所有活跃账号的额度
+   *
+   * A background tick must not overlap the previous sweep (that would probe
+   * every account far more often than the nominal interval), but an explicit
+   * operator refresh must never be silently dropped: it waits for the running
+   * sweep and then runs its own pass.
    */
-  public async fetchAllQuotas(options: { forceRefresh?: boolean } = {}): Promise<void> {
-    const accounts = this.pool.getAllAccounts();
-    for (const acc of accounts) {
-      if (acc.status === 'dead' || acc.status === 'disabled') continue;
-      await this.fetchQuotaForAccount(acc, options);
-      // 适度防抖
-      await new Promise(r => setTimeout(r, 600));
+  public async fetchAllQuotas(options: { forceRefresh?: boolean } = {}): Promise<{ ran: boolean }> {
+    if (this.sweepRunning) {
+      await this.sweepPromise?.catch(() => {});
+      if (!options.forceRefresh) {
+        console.log('[QuotaManager] Previous quota sweep still running; skipping this tick.');
+        return { ran: false };
+      }
+    }
+    const sweep = this.runSweep(options);
+    this.sweepPromise = sweep;
+    try {
+      await sweep;
+      return { ran: true };
+    } finally {
+      if (this.sweepPromise === sweep) this.sweepPromise = null;
+    }
+  }
+
+  private async runSweep(options: { forceRefresh?: boolean }): Promise<void> {
+    this.sweepRunning = true;
+    try {
+      for (const acc of this.pool.getAllAccounts()) {
+        // Re-read the clock per account: a long pool sweep must notice an
+        // account that went into cooldown (or lost its token) mid-sweep.
+        const now = Date.now();
+        if (!shouldPollQuota(acc, now, {
+          pausedUntil: this.quotaPausedUntil.get(acc.id) ?? 0,
+          lastAttemptAt: this.quotaLastAttemptAt.get(acc.id) ?? acc.quota?.lastCheckedAt ?? 0,
+          force: options.forceRefresh
+        })) continue;
+        await this.fetchQuotaForAccount(acc, options);
+        // 适度防抖
+        await new Promise(r => setTimeout(r, jittered(600)));
+      }
+    } finally {
+      this.sweepRunning = false;
     }
   }
 

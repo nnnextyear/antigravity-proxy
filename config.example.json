@@ -4,11 +4,13 @@
   "apiMasterKey": "sk-antigravity",
   "adminPassword": "admin123",
   "upstreamUrl": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse",
+  "defaultProxyUrl": "http://127.0.0.1:7897",
   "defaultMaxConcurrency": 5,
   "cooldownSeconds": 60,
   "tokenRefreshIntervalMs": 180000,
   "streamKeepaliveMs": 15000,
   "routingStrategy": "zero-waste",
   "oauthClientId": "",
-  "oauthClientSecret": ""
+  "oauthClientSecret": "",
+  "upstreamTimeoutMs": 900000
 }

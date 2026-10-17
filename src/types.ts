@@ -35,6 +35,11 @@ export interface Account {
   lastError?: string;
   quota?: AccountQuota;
   validationUrl?: string;
+  /** 429 累计次数：在被限频但还没被冷却隔离之前给出预警信号。 */
+  rateLimitHits?: number;
+  lastRateLimitAt?: number;
+  /** 连续的可恢复 403 / 新 token 被拒次数，用于逐级升级到终止状态。 */
+  forbiddenCount?: number;
 }
 
 export interface AppConfig {
@@ -48,6 +53,18 @@ export interface AppConfig {
   tokenRefreshIntervalMs: number;
   /** Downstream SSE keep-alive interval for long thinking streams. */
   streamKeepaliveMs?: number;
+  /**
+   * Response-header / inter-chunk budget for one generation POST. A long
+   * thinking generation can stay silent for minutes; this must stay well above
+   * the downstream keep-alive interval. Default 900000 (15 分钟).
+   */
+  upstreamTimeoutMs?: number;
+  /**
+   * Minimum spacing between two generation starts on one account (ms).
+   * Spreads a burst across an account instead of firing every slot at once.
+   * 0 disables the pacing.
+   */
+  minRequestIntervalMs?: number;
   routingStrategy?: RoutingStrategy;
   oauthClientId?: string;
   oauthClientSecret?: string;

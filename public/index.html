@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Antigravity Proxy Gateway 控制台</title>
-  <link rel="stylesheet" href="/admin/style.css?v=4.6">
+  <link rel="stylesheet" href="/admin/style.css?v=4.8">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -364,8 +364,8 @@
           </div>
           <div class="form-group">
             <label>独立出口代理 Proxy URL (可选)</label>
-            <input type="text" id="input-acc-proxy" placeholder="如 http://user:pass@127.0.0.1:7890 或留空走系统默认" />
-            <small class="hint">留空自动走系统默认代理 (127.0.0.1:7897)，若配置专号专代可物理隔离 IP 防风控</small>
+            <input type="text" id="input-acc-proxy" placeholder="如 http://user:pass@127.0.0.1:7890，留空跟随全局配置" />
+            <small class="hint">留空跟随全局代理；全局留空时由系统路由接管（如 Clash TUN/VPN）。若只开传统系统代理而不开 TUN，请填写 HTTP/HTTPS 代理地址。支持的 HTTP 代理会通过 CONNECT 建立 HTTP/2 隧道并定时 PING 保活。</small>
           </div>
           <div class="form-group">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
@@ -422,8 +422,8 @@
         <input type="hidden" id="proxy-modal-acc-id" />
         <div class="form-group">
           <label>独立出口代理 (Proxy URL)</label>
-          <input type="text" id="input-edit-proxy" placeholder="如 http://127.0.0.1:7897 或 socks5://127.0.0.1:1080" />
-          <small class="hint">支持 http / https / socks5 协议。留空则代表直连出口。</small>
+          <input type="text" id="input-edit-proxy" placeholder="如 http://127.0.0.1:7897（仅支持 HTTP/HTTPS）" />
+          <small class="hint">仅支持 http / https 代理（不支持 SOCKS）。留空表示跟随全局 defaultProxyUrl；全局为空时由系统路由接管。不开 TUN、只用传统系统代理时，请在此填写代理地址。HTTP 代理路径使用 CONNECT + HTTP/2 PING 保活。</small>
         </div>
 
         <!-- 常用预设快捷按钮 -->
@@ -434,7 +434,6 @@
             <button type="button" class="preset-chip" id="preset-clash-7897" data-url="http://127.0.0.1:7897" onclick="applyProxyPreset('http://127.0.0.1:7897')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>Clash 7897</button>
             <button type="button" class="preset-chip" id="preset-clash-7890" data-url="http://127.0.0.1:7890" onclick="applyProxyPreset('http://127.0.0.1:7890')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>Clash 7890</button>
             <button type="button" class="preset-chip" id="preset-v2ray-10809" data-url="http://127.0.0.1:10809" onclick="applyProxyPreset('http://127.0.0.1:10809')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>V2Ray 10809</button>
-            <button type="button" class="preset-chip" id="preset-socks-1080" data-url="socks5://127.0.0.1:1080" onclick="applyProxyPreset('socks5://127.0.0.1:1080')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M2 12h20"/><circle cx="12" cy="12" r="4"/></svg>SOCKS5 1080</button>
           </div>
         </div>
 
@@ -493,6 +492,6 @@
     </div>
   </div>
 
-  <script src="/admin/app.js?v=4.6"></script>
+  <script src="/admin/app.js?v=4.8"></script>
 </body>
 </html>

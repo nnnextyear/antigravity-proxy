@@ -124,8 +124,13 @@ export function extractSessionKey(headers: HeadersLike, body: any, protocol: 'an
 }
 
 /** Attach a deterministic Antigravity request.sessionId to generation calls. */
-export function attachUpstreamSessionId(payload: { request?: { sessionId?: string } }, sessionKey?: string): void {
-  if (!sessionKey || !payload.request || payload.request.sessionId) return;
+export function attachUpstreamSessionId(
+  payload: { request?: { sessionId?: string } },
+  sessionKey?: string,
+  force = false
+): void {
+  if (!sessionKey || !payload.request) return;
+  if (payload.request.sessionId && !force) return;
   const digest = crypto.createHash('sha256').update(`antigravity-session\0${sessionKey}`).digest('hex');
   const value = BigInt(`0x${digest.slice(0, 15)}`) & BigInt('0x7fffffffffffffff');
   payload.request.sessionId = `-${value.toString()}`;

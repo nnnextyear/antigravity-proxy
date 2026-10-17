@@ -71,6 +71,7 @@ export class AccountPool {
   private routingStrategy: RoutingStrategy = 'zero-waste';
   private sessionBindings: Map<string, { accountId: string; lastUsedAt: number }> = new Map();
   private sessionCleanTimer: NodeJS.Timeout | null = null;
+  private fileWatcher: fs.FSWatcher | null = null;
 
   constructor(initialStrategy: RoutingStrategy = 'zero-waste') {
     this.routingStrategy = initialStrategy;
@@ -104,10 +105,12 @@ export class AccountPool {
     }
 
     try {
-      fs.watch(ACCOUNTS_FILE, (eventType) => {
+      this.fileWatcher = fs.watch(ACCOUNTS_FILE, (eventType) => {
         if (this.isInternalSaving) return;
         if (this.reloadDebounceTimer) clearTimeout(this.reloadDebounceTimer);
         this.reloadDebounceTimer = setTimeout(() => {
+          // Re-check at fire time: our own write may have been slow to surface.
+          if (this.isInternalSaving) return;
           console.log('[AccountPool] Detected external change to accounts.json, reloading from disk...');
           this.loadAccounts();
         }, 300);
@@ -117,17 +120,53 @@ export class AccountPool {
     }
   }
 
+  /** Stop the maintenance timers and the file watcher (shutdown and tests). */
+  public dispose(): void {
+    if (this.sessionCleanTimer) {
+      clearInterval(this.sessionCleanTimer);
+      this.sessionCleanTimer = null;
+    }
+    if (this.reloadDebounceTimer) {
+      clearTimeout(this.reloadDebounceTimer);
+      this.reloadDebounceTimer = null;
+    }
+    this.fileWatcher?.close();
+    this.fileWatcher = null;
+  }
+
   public loadAccounts(): void {
     if (fs.existsSync(ACCOUNTS_FILE)) {
       try {
         const raw = fs.readFileSync(ACCOUNTS_FILE, 'utf-8');
         const list: Account[] = JSON.parse(raw);
-        this.accounts.clear();
+        const live = this.accounts;
+        const next = new Map<string, Account>();
         for (const acc of list) {
-          // 重置瞬态状态
-          acc.activeConcurrency = 0;
-          this.accounts.set(acc.id, acc);
+          const previous = live.get(acc.id);
+          // The persisted file never carries concurrency. Zeroing it while
+          // requests are in flight would stop counting them and over-admit the
+          // account, so carry the in-memory lease count across the reload.
+          const inFlight = previous?.activeConcurrency ?? 0;
+          acc.activeConcurrency = Number.isFinite(inFlight) && inFlight > 0 ? inFlight : 0;
+          // A terminal in-memory state must never be undone by reloading a
+          // stale copy of the file.
+          if (previous && (previous.status === 'dead' || previous.status === 'disabled') && acc.status !== previous.status) {
+            acc.status = previous.status;
+            acc.lastError = previous.lastError;
+            acc.validationUrl = previous.validationUrl;
+          }
+          // An unexpired cooldown is the main anti-ban throttle. A stale file
+          // copy (an editor tab, a second process) must not erase it.
+          if (previous
+            && previous.status === 'cooldown'
+            && previous.cooldownUntil > Date.now()
+            && (acc.status !== 'cooldown' || acc.cooldownUntil < previous.cooldownUntil)) {
+            acc.status = 'cooldown';
+            acc.cooldownUntil = previous.cooldownUntil;
+          }
+          next.set(acc.id, acc);
         }
+        this.accounts = next;
         console.log(`[AccountPool] Loaded ${this.accounts.size} account(s) from storage.`);
       } catch (e) {
         console.error('[AccountPool] Failed to load accounts.json:', e);
@@ -454,11 +493,28 @@ export class AccountPool {
   }
 
   /**
+   * Quota exhaustion is remembered as a zeroed fraction plus a reset time.
+   * When upstream never said when the window resets, the account would be
+   * selected again on the very next request; fall back to the cooldown window.
+   */
+  private ensureFamilyBlockedUntil(acc: Account, family: 'claude' | 'gemini', retryMs: number): void {
+    if (!acc.quota) return;
+    const resetField = family === 'claude' ? 'claudeResetTime' : 'geminiResetTime';
+    const current = acc.quota[resetField];
+    const currentMs = current ? new Date(current).getTime() : 0;
+    if (!Number.isFinite(currentMs) || currentMs <= Date.now()) {
+      // Floor at the quota poll period: a shorter window would expire before
+      // the next poll can confirm whether the quota really came back.
+      acc.quota[resetField] = new Date(Date.now() + Math.max(retryMs, 3 * 60_000)).toISOString();
+    }
+  }
+
+  /**
    * 释放借出的账号，并处理错误与状态更新
    */
   public releaseAccount(
     accId: string,
-    error?: { code: number; message: string; retryAfterMs?: number },
+    error?: { code: number; message: string; retryAfterMs?: number; recoverable?: boolean },
     family?: 'claude' | 'gemini',
     sessionKey?: string
   ): void {
@@ -466,40 +522,62 @@ export class AccountPool {
     if (!acc) return;
 
     acc.activeConcurrency = Math.max(0, acc.activeConcurrency - 1);
+    // A completed request proves the account is usable again: clear the
+    // escalation counter used for unrecognised 403s.
+    if (!error) acc.forbiddenCount = 0;
 
     if (error) {
       acc.failedRequests++;
       acc.lastError = `[HTTP ${error.code}] ${error.message}`;
+      // A late 429 from a request that was already in flight must not downgrade
+      // an account that has since been judged terminal back into a recoverable
+      // state (cooldown expires by itself, dead does not).
+      const isTerminal = acc.status === 'dead' || acc.status === 'disabled';
 
       if (error.code === 429) {
+        acc.rateLimitHits = (acc.rateLimitHits ?? 0) + 1;
+        acc.lastRateLimitAt = Date.now();
         // Only a quota exhaustion response may affect one model family.
         // A plain rate-limit response must cool the whole account.
         const isQuotaExhausted = classifyUpstreamError(error.code, error.message).kind === 'quota';
         const retryMs = error.retryAfterMs ?? retryAfterMs(undefined, error.message, 60 * 1000);
 
+        if (isTerminal) {
+          console.warn(`[CircuitBreaker] 账号 ${acc.email} 已处于终态 (${acc.status})，忽略其迟到请求的 429，不会自动复活。`);
+          this.clearSessionBinding(sessionKey, accId);
+          this.saveAccounts();
+          return;
+        }
+
         if (isQuotaExhausted && family === 'claude') {
           // 仅 Claude / 3p 额度耗尽：精准置零 Claude 5h 额度，账号全局状态依然保持 active，Gemini 请求不受任何影响！
           if (acc.quota) {
             acc.quota.claude5hFraction = 0.0;
+            // 只有 5h 分数的账号在重置时间缺失或已过期时会被立刻重新选中，
+            // 于是反复撞上已耗尽的账号。补一个兜底重置时间，等下一次额度
+            // 轮询给出真实时间再覆盖。
+            this.ensureFamilyBlockedUntil(acc, 'claude', retryMs);
           }
           if (!acc.quota) {
             acc.status = 'cooldown';
-            acc.cooldownUntil = Date.now() + retryMs;
+            acc.cooldownUntil = Math.max(acc.cooldownUntil, Date.now() + retryMs);
           }
           console.warn(`[CircuitBreaker] 账号 ${acc.email} Claude/GPT 5h 额度耗尽，已标记 Claude 耗尽，账号保持 Active 供 Gemini 继续使用。`);
         } else if (isQuotaExhausted && family === 'gemini') {
           if (acc.quota) {
             acc.quota.gemini5hFraction = 0.0;
+            this.ensureFamilyBlockedUntil(acc, 'gemini', retryMs);
           }
           if (!acc.quota) {
             acc.status = 'cooldown';
-            acc.cooldownUntil = Date.now() + retryMs;
+            acc.cooldownUntil = Math.max(acc.cooldownUntil, Date.now() + retryMs);
           }
           console.warn(`[CircuitBreaker] 账号 ${acc.email} Gemini 5h 额度耗尽，已标记 Gemini 耗尽，账号保持 Active 供 Claude 继续使用。`);
         } else {
-          // 通用 RPM 频率限制（非特定模型额度用尽），遵守上游给出的冷却时间
+          // 通用 RPM 频率限制（非特定模型额度用尽），遵守上游给出的冷却时间。
+          // 取最大值：并发返回的多个 429 不能用一个更短的窗口覆盖更长的冷却。
           acc.status = 'cooldown';
-          acc.cooldownUntil = Date.now() + retryMs;
+          acc.cooldownUntil = Math.max(acc.cooldownUntil, Date.now() + retryMs);
           console.warn(`[CircuitBreaker] 账号 ${acc.email} 触发通用 429 限频，进入冷却 ${Math.ceil(retryMs / 1000)} 秒。`);
         }
 
@@ -509,19 +587,58 @@ export class AccountPool {
         // 某个模型或某个会话的 429 全部失去粘性。
         this.clearSessionBinding(sessionKey, accId);
       } else if (error.code === 401) {
-        // 凭证失效。只允许上层执行一次刷新，失败后账号保持隔离，不能在后台循环重试。
-        acc.status = 'dead';
-        console.warn(`[CircuitBreaker] Account ${acc.email} returned 401 and was isolated until manual re-authentication.`);
+        if (error.recoverable) {
+          // A freshly minted token was rejected (auth replication lag, a
+          // hiccup on Google's side). Park the account instead of killing it:
+          // a repeated offender still escalates to dead below.
+          const strikes = (acc.forbiddenCount ?? 0) + 1;
+          acc.forbiddenCount = strikes;
+          if (strikes >= 3) {
+            acc.status = 'dead';
+            acc.lastError = `[UNAUTHORIZED_REPEATED] ${error.message}`;
+            console.error(`[CircuitBreaker] Account ${acc.email} 连续 ${strikes} 次拒绝新 token，已隔离。`);
+          } else {
+            const parkedMs = Math.max(error.retryAfterMs ?? 0, 15 * 60 * 1000 * strikes);
+            acc.status = 'cooldown';
+            acc.cooldownUntil = Math.max(acc.cooldownUntil, Date.now() + parkedMs);
+            console.warn(`[CircuitBreaker] Account ${acc.email} 第 ${strikes} 次拒绝新 token，停车 ${Math.ceil(parkedMs / 60000)} 分钟。`);
+          }
+        } else {
+          // 凭证失效。只允许上层执行一次刷新，失败后账号保持隔离，不能在后台循环重试。
+          acc.status = 'dead';
+          console.warn(`[CircuitBreaker] Account ${acc.email} returned 401 and was isolated until manual re-authentication.`);
+        }
         this.clearSessionBinding(sessionKey, accId);
         this.saveAccounts();
       } else if (error.code === 403) {
         const classified = classifyUpstreamError(error.code, error.message);
-        // 政策类 403 和其他权限类 403 都是终止状态。不能继续轮换账号探测。
-        acc.status = 'dead';
         if (classified.kind === 'policy_blocked') {
+          acc.status = 'dead';
           acc.lastError = `[POLICY_BLOCKED] ${error.message}`;
           console.error(`[CircuitBreaker] Account ${acc.email} marked as POLICY_BLOCKED; automatic retries are disabled.`);
+          this.clearSessionBinding(sessionKey, accId);
+          this.saveAccounts();
+          return;
+        }
+        if (error.recoverable) {
+          // Unknown/recoverable 403 (permission, quota-flavoured, unrecognised
+          // wording). Park it, but escalate: an account that keeps answering
+          // 403 must not be re-probed every cooldown window forever.
+          const strikes = (acc.forbiddenCount ?? 0) + 1;
+          acc.forbiddenCount = strikes;
+          if (strikes >= 3) {
+            acc.status = 'dead';
+            acc.lastError = `[FORBIDDEN_REPEATED] ${error.message}`;
+            console.error(`[CircuitBreaker] Account ${acc.email} 连续 ${strikes} 次 403，已判定为终止状态，停止继续探测。`);
+          } else {
+            const parkedMs = Math.max(error.retryAfterMs ?? 0, 5 * 60 * 1000 * strikes);
+            acc.status = 'cooldown';
+            acc.cooldownUntil = Math.max(acc.cooldownUntil, Date.now() + parkedMs);
+            console.warn(`[CircuitBreaker] Account ${acc.email} 第 ${strikes} 次可恢复 403，停车 ${Math.ceil(parkedMs / 1000)}s。`);
+          }
         } else {
+          // 政策类 403 和其他权限类 403 都是终止状态。不能继续轮换账号探测。
+          acc.status = 'dead';
           console.error(`[CircuitBreaker] Account ${acc.email} marked as DEAD due to 403 Forbidden.`);
         }
         this.clearSessionBinding(sessionKey, accId);

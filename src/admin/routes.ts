@@ -5,6 +5,7 @@ import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { AccountPool } from '../pool/account-pool.js';
 import { TokenRefresher } from '../pool/refresher.js';
 import { QuotaManager } from '../pool/quota-manager.js';
+import { assertSupportedProxyUrl } from '../pool/dispatcher.js';
 import { AppConfig } from '../types.js';
 import { saveConfig } from '../config.js';
 import { DEFAULT_OAUTH_CLIENT_ID, DEFAULT_OAUTH_CLIENT_SECRET } from '../config.js';
@@ -128,8 +129,15 @@ export function registerAdminRoutes(
         updates.proxyUrl = undefined;
       } else {
         let norm = raw;
-        if (!/^https?:\/\/|^socks5?:\/\//i.test(norm)) {
+        if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(norm)) {
           norm = 'http://' + norm;
+        }
+        // Fail at save time with an actionable message instead of failing
+        // every future request with an obscure connector error.
+        try {
+          assertSupportedProxyUrl(norm);
+        } catch (err: any) {
+          return reply.status(400).send({ error: err.message });
         }
         updates.proxyUrl = norm;
       }
@@ -165,8 +173,12 @@ export function registerAdminRoutes(
 
     acc.status = 'active';
     acc.cooldownUntil = 0;
-    acc.activeConcurrency = 0;
+    // Keep the in-flight lease count: zeroing it while requests are running
+    // would let the account admit maxConcurrency extra requests at once.
     acc.lastError = undefined;
+    // A manual reset must also clear the validation flag, otherwise the quota
+    // worker would keep waiting out its recheck window.
+    acc.validationUrl = undefined;
     pool.saveAccounts();
 
     return { message: 'Account status reset to active', account: acc };
@@ -175,7 +187,7 @@ export function registerAdminRoutes(
   // 6.1 手动启用或停用账号。停用账号保留凭据与历史数据，但不会再参与调度。
   app.put('/api/admin/accounts/:id/status', { preHandler: [requireAdminAuth] }, async (req: FastifyRequest, reply) => {
     const params = req.params as { id: string };
-    const body = req.body as { status?: string };
+    const body = req.body as { status?: string; force?: boolean };
     if (body.status !== 'active' && body.status !== 'disabled') {
       return reply.status(400).send({ error: 'status must be active or disabled' });
     }
@@ -185,9 +197,22 @@ export function registerAdminRoutes(
       return reply.status(404).send({ error: 'Account not found' });
     }
 
+    // Reviving a policy-blocked account re-sends requests to an account Google
+    // has switched off, which is how a warning becomes a permanent ban. Make
+    // the operator acknowledge that explicitly.
+    if (body.status === 'active' && acc.status === 'dead' && /POLICY_BLOCKED/.test(acc.lastError ?? '') && body.force !== true) {
+      return reply.status(409).send({
+        error: 'Account is POLICY_BLOCKED. Confirm the ban was resolved before reactivating.',
+        hint: 'POST again with {"status":"active","force":true} to override.'
+      });
+    }
+
     acc.status = body.status;
     acc.cooldownUntil = 0;
-    if (body.status === 'active') acc.lastError = undefined;
+    if (body.status === 'active') {
+      acc.lastError = undefined;
+      acc.validationUrl = undefined;
+    }
     pool.saveAccounts();
     return { success: true, message: body.status === 'disabled' ? '账号已停用，不会参与后续调度' : '账号已重新启用', account: acc };
   });
@@ -216,16 +241,24 @@ export function registerAdminRoutes(
       return reply.status(500).send({ error: 'QuotaManager not initialized' });
     }
     for (const acc of pool.getAllAccounts()) {
+      // Do not burn OAuth calls (or touch) accounts that are switched off.
+      if (acc.status === 'dead' || acc.status === 'disabled') continue;
       if (!acc.accessToken || Date.now() >= acc.accessTokenExpiresAt) {
         await refresher.refreshSingleAccount(acc).catch(() => {});
       }
     }
-    await quotaManager.fetchAllQuotas({ forceRefresh: true });
-    return { success: true, message: 'All account quotas updated successfully' };
+    const { ran } = await quotaManager.fetchAllQuotas({ forceRefresh: true });
+    return {
+      success: true,
+      ran,
+      message: ran ? 'All account quotas updated successfully' : 'Quota refresh skipped: another sweep was already running'
+    };
   });
 
   // 9. 查看与更新系统配置
   app.get('/api/admin/config', { preHandler: [requireAdminAuth] }, async () => {
+    const proxy = config.defaultProxyUrl?.trim() || '';
+    const accountProxyCount = pool.getAllAccounts().filter(account => Boolean(account.proxyUrl?.trim())).length;
     return {
       port: config.port,
       apiMasterKey: config.apiMasterKey,
@@ -233,6 +266,11 @@ export function registerAdminRoutes(
       defaultMaxConcurrency: config.defaultMaxConcurrency,
       cooldownSeconds: config.cooldownSeconds,
       defaultProxyUrl: config.defaultProxyUrl,
+      networkMode: proxy ? 'explicit-proxy' : 'system-network',
+      accountProxyCount,
+      networkDescription: proxy
+        ? `生成与 countTokens 使用 HTTP CONNECT 隧道、原生 HTTP/2，每 15 秒 PING 保活。账号专属代理优先；当前有 ${accountProxyCount} 个账号配置了专属代理。`
+        : `未配置全局 HTTP 代理，连接由系统路由接管（例如 TUN/VPN）；传统系统代理开关不会被 Node 自动读取。长请求每 15 秒发送 HTTP/2 PING。当前有 ${accountProxyCount} 个账号配置了专属代理。`,
       hasOauthCredentials: Boolean(config.oauthClientId)
     };
   });
@@ -243,7 +281,20 @@ export function registerAdminRoutes(
     if (body.adminPassword) config.adminPassword = body.adminPassword;
     if (body.upstreamUrl) config.upstreamUrl = body.upstreamUrl;
     if (body.cooldownSeconds) config.cooldownSeconds = body.cooldownSeconds;
-    if (body.defaultProxyUrl !== undefined) config.defaultProxyUrl = body.defaultProxyUrl;
+    if (body.defaultProxyUrl !== undefined) {
+      const raw = String(body.defaultProxyUrl || '').trim();
+      if (!raw || raw.toLowerCase() === 'direct' || raw === '直连') {
+        config.defaultProxyUrl = undefined;
+      } else {
+        const norm = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+        try {
+          assertSupportedProxyUrl(norm);
+        } catch (err: any) {
+          return reply.status(400).send({ error: err.message });
+        }
+        config.defaultProxyUrl = norm;
+      }
+    }
 
     saveConfig(config);
     return { message: 'Configuration updated', config };

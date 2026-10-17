@@ -38,16 +38,36 @@ export function isLocationError(statusCode: number, body: string): boolean {
   return (statusCode === 400 || statusCode === 403) && (
     /user location is not supported/i.test(body) ||
     /location is not supported/i.test(body) ||
+    /not (?:available|supported) in your country/i.test(body) ||
+    /unsupported country/i.test(body) ||
     (/failed_precondition/i.test(body) && /location/i.test(body))
   );
 }
 
+/** Upstream reasons that mean "this account is finished", not "retry later". */
+const TERMINAL_POLICY_REASONS = new Set([
+  'TOS_VIOLATION',
+  'POLICY_VIOLATION',
+  'SUSPENDED_ACCOUNT',
+  'USER_SUSPENDED',
+  'ACCOUNT_DISABLED',
+  'ACCOUNT_SUSPENDED',
+  'ABUSE_DETECTED'
+]);
+
+/**
+ * Account-level terminations arrive as 403 with a handful of shapes. Missing
+ * one means the background workers keep probing an account Google has already
+ * switched off, so err on the side of recognising more of them.
+ */
 export function isPolicyBlockedError(statusCode: number, body: string): boolean {
   if (statusCode !== 403) return false;
   const fields = errorFields(body);
-  return fields.reason?.toUpperCase() === 'TOS_VIOLATION' ||
-    /service has been disabled in this account/i.test(body) ||
-    /violation of terms of service/i.test(body);
+  if (fields.reason && TERMINAL_POLICY_REASONS.has(fields.reason.toUpperCase())) return true;
+  return /service has been disabled in this account/i.test(body) ||
+    /violation of terms of service/i.test(body) ||
+    /(?:this |the )account has been (?:suspended|disabled|terminated|deactivated)/i.test(body) ||
+    /account (?:is )?(?:suspended|disabled|terminated)/i.test(body);
 }
 
 export function isInvalidGrantError(statusCode: number, body: string): boolean {

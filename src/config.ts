@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { AppConfig } from './types.js';
+import { assertSupportedProxyUrl } from './pool/dispatcher.js';
 
 const CONFIG_PATH = path.resolve(process.cwd(), 'config.json');
 
@@ -16,19 +17,38 @@ export const DEFAULT_CONFIG: AppConfig = {
   upstreamUrl: process.env.UPSTREAM_URL || 'https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse',
   defaultMaxConcurrency: 5,
   cooldownSeconds: 60,
-  tokenRefreshIntervalMs: 3 * 60 * 1000, // 3 分钟检查一次
-  streamKeepaliveMs: 15 * 1000,
+  tokenRefreshIntervalMs: envInt('TOKEN_REFRESH_INTERVAL_MS', 3 * 60 * 1000), // 3 分钟检查一次
+  streamKeepaliveMs: envInt('STREAM_KEEPALIVE_MS', 15 * 1000),
+  upstreamTimeoutMs: envInt('UPSTREAM_TIMEOUT_MS', 15 * 60 * 1000), // 单次生成等首字节/等下一块的上限
+  minRequestIntervalMs: envInt('MIN_REQUEST_INTERVAL_MS', 1000), // 同账号两次生成的启动间隔，避免瞬时并发被风控
   routingStrategy: (process.env.ROUTING_STRATEGY as any) || 'zero-waste',
   oauthClientId: process.env.OAUTH_CLIENT_ID || DEFAULT_OAUTH_CLIENT_ID,
   oauthClientSecret: process.env.OAUTH_CLIENT_SECRET || DEFAULT_OAUTH_CLIENT_SECRET,
   defaultProxyUrl: process.env.DEFAULT_PROXY_URL || 'http://127.0.0.1:7897'
 };
 
+/** Environment overrides for the numeric knobs an operator tunes most often. */
+function envInt(name: string, fallback: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 export function loadConfig(): AppConfig {
   if (fs.existsSync(CONFIG_PATH)) {
     try {
       const data = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
-      return { ...DEFAULT_CONFIG, ...data };
+      const merged = { ...DEFAULT_CONFIG, ...data };
+      // Warn instead of throwing: the server must still boot so the operator
+      // can fix the value from the dashboard.
+      for (const [label, value] of [['defaultProxyUrl', merged.defaultProxyUrl]] as const) {
+        if (!value) continue;
+        try {
+          assertSupportedProxyUrl(value);
+        } catch (err: any) {
+          console.error(`[Config] ${label} 配置有问题：${err.message}`);
+        }
+      }
+      return merged;
     } catch (e) {
       console.error('Failed to parse config.json, using defaults:', e);
     }

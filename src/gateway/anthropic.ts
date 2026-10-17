@@ -12,7 +12,7 @@ import {
   resolveThinkingConfig,
 } from './models.js';
 import { attachUpstreamSessionId, extractSessionKey } from './session.js';
-import { startSseHeartbeat } from './streaming.js';
+import { anthropicErrorType, prepareSseResponse, sendGatewayError, startRequestLifecycle } from './streaming.js';
 
 interface AnthropicMessageParam {
   role: 'user' | 'assistant';
@@ -362,9 +362,12 @@ export function registerAnthropicRoutes(
       return reply.status(400).send({ type: 'error', error: { type: 'invalid_request_error', message: 'messages is required and must be an array' } });
     }
 
+    // Start the lifecycle before model discovery: that wait must be covered
+    // by the keepalive and cancelled when the client goes away.
+    const lifecycle = startRequestLifecycle(req, reply, false);
     let modelDef: ResolvedModel;
     try {
-      modelDef = resolveDynamicUpstreamModel(body.model, await executor.fetchAvailableModels());
+      modelDef = resolveDynamicUpstreamModel(body.model, await executor.fetchAvailableModels(3, {}, lifecycle.signal));
     } catch (err: any) {
       const statusCode = err instanceof ModelRequestError ? 400 : err instanceof UpstreamRequestError ? err.statusCode : 503;
       applyRetryAfter(reply, err);
@@ -389,12 +392,15 @@ export function registerAnthropicRoutes(
 
     try {
       const sessionKey = extractSessionKeyFromAnthropic(req, body);
-      const counted = await executor.countTokens({ project: 'aicode-consumers', model: modelDef.upstreamModel, request }, 3, sessionKey);
+      const counted = await executor.countTokens({ project: 'aicode-consumers', model: modelDef.upstreamModel, request }, 3, sessionKey, lifecycle.signal, req.id);
       return reply.send({ input_tokens: counted.totalTokens });
     } catch (err: any) {
       const statusCode = err.statusCode && err.statusCode >= 400 && err.statusCode < 500 ? err.statusCode : 503;
       applyRetryAfter(reply, err);
-      return reply.status(statusCode).send({ type: 'error', error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message: `Unable to count request tokens: ${err.message}` } });
+      return sendGatewayError(reply, statusCode, {
+        type: 'error',
+        error: { type: anthropicErrorType(statusCode), message: `Unable to count request tokens: ${err.message}` }
+      }, 'anthropic', { retryAfterSeconds: getRetryAfterHeader(err) });
     }
   };
 
@@ -410,16 +416,27 @@ export function registerAnthropicRoutes(
       });
     }
 
+    // The lifecycle starts here so the keepalive covers model discovery too
+    // (and a disconnected client cancels it).
+    const isStream = Boolean(body.stream);
+    const lifecycle = startRequestLifecycle(req, reply, isStream, config.streamKeepaliveMs);
+
     // 1. 动态思考预算检测
     let thinking: ReturnType<typeof resolveFrameworkThinking>;
     let modelDef: ResolvedModel;
     try {
       thinking = resolveFrameworkThinking(body);
-      modelDef = resolveDynamicUpstreamModel(body.model, await executor.fetchAvailableModels());
+      modelDef = resolveDynamicUpstreamModel(body.model, await executor.fetchAvailableModels(3, {}, lifecycle.signal));
     } catch (err: any) {
       const statusCode = err instanceof ModelRequestError ? 400 : err instanceof UpstreamRequestError ? err.statusCode : 503;
       applyRetryAfter(reply, err);
-      return reply.status(statusCode).send({ type: 'error', error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message: err.message } });
+      // Model discovery can outlive the first keepalive, so this must not use
+      // reply.send(): on a hijacked reply it is a silent no-op that leaves the
+      // client on an endless 200 SSE stream.
+      return sendGatewayError(reply, statusCode, {
+        type: 'error',
+        error: { type: anthropicErrorType(statusCode), message: err.message }
+      }, 'anthropic', { retryAfterSeconds: getRetryAfterHeader(err) });
     }
     const { effort, budgetTokens } = thinking;
 
@@ -443,10 +460,10 @@ export function registerAnthropicRoutes(
     const outputFormat = body.output_config?.format;
     if (outputFormat) {
       if (outputFormat.type !== 'json_schema' || !outputFormat.schema || typeof outputFormat.schema !== 'object' || Array.isArray(outputFormat.schema)) {
-        return reply.status(400).send({
+        return sendGatewayError(reply, 400, {
           type: 'error',
           error: { type: 'invalid_request_error', message: 'Unsupported output_config.format; expected json_schema with an object schema' }
-        });
+        }, 'anthropic');
       }
       generationConfig.responseMimeType = 'application/json';
       generationConfig.responseSchema = sanitizeGoogleSchema(outputFormat.schema);
@@ -517,7 +534,6 @@ export function registerAnthropicRoutes(
       request: innerRequest
     };
 
-    const isStream = Boolean(body.stream);
     const messageId = `msg_${crypto.randomBytes(12).toString('hex')}`;
 
     // 提取稳定会话唯一指纹（用于强会话粘性，最大化利用 Google 上游 Prompt Cache）
@@ -537,94 +553,90 @@ export function registerAnthropicRoutes(
     // generation so custom endpoints get the same signal as api.anthropic.com.
     let inputTokenCount = 0;
     try {
-      const counted = await executor.countTokens(payload, 3, accountLeaseKey);
+      const counted = await executor.countTokens(payload, 3, accountLeaseKey, lifecycle.signal, req.id);
       inputTokenCount = counted.totalTokens;
       console.info(`[AnthropicGateway] Preflight countTokens: ${inputTokenCount} input tokens (session ${sessionKey || 'none'})`);
     } catch (countErr: any) {
-      const statusCode = countErr instanceof LocationNotSupportedError
-        ? 400
-        : countErr instanceof UpstreamRequestError
-          ? countErr.statusCode
-          : 503;
-      const message = countErr instanceof LocationNotSupportedError
-        ? 'Google Upstream 拒绝访问：当前代理出口 IP 地区不受支持 (User location is not supported for the API use)。'
-        : countErr instanceof UpstreamRequestError
-          ? countErr.message
-          : `Unable to count request tokens safely: ${countErr.message}`;
-      console.error(`[AnthropicGateway] Preflight countTokens failed; generation was blocked: ${countErr.message}`);
-      applyRetryAfter(reply, countErr);
-      clearEphemeralAccountLease();
-      return reply.status(statusCode).send({
-        type: 'error',
-        error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message }
-      });
+      if (lifecycle.signal.aborted) {
+        // The client is gone: drop the ephemeral lease instead of leaving a
+        // dead binding behind for this request key.
+        clearEphemeralAccountLease();
+        return;
+      }
+      // The preflight is an auxiliary control-plane call. Only an upstream
+      // decision that already condemns this request (quota, policy, region,
+      // auth) may block generation; a transport blip must not turn a valid
+      // request into a client-visible failure, and must not cost Google a
+      // second generation request just to learn the same error twice.
+      // 5xx is transient: the generation path itself retries 503, so a flaky
+      // count endpoint must not cancel the whole turn.
+      const isUpstreamDecision = countErr instanceof UpstreamRequestError && countErr.statusCode < 500;
+      if (!isUpstreamDecision) {
+        console.warn(`[AnthropicGateway] Preflight countTokens unavailable (${countErr.message}); continuing with an unknown input token count.`);
+        inputTokenCount = 0;
+      } else {
+        const statusCode = countErr instanceof LocationNotSupportedError ? 400 : countErr.statusCode;
+        const message = countErr instanceof LocationNotSupportedError
+          ? 'Google Upstream 拒绝访问：当前代理出口 IP 地区不受支持 (User location is not supported for the API use)。'
+          : countErr.message;
+        console.error(`[AnthropicGateway] Preflight countTokens rejected by upstream; generation was blocked: ${countErr.message}`);
+        applyRetryAfter(reply, countErr);
+        clearEphemeralAccountLease();
+        return sendGatewayError(reply, statusCode, {
+          type: 'error',
+          error: { type: anthropicErrorType(statusCode), message }
+        }, 'anthropic', { retryAfterSeconds: getRetryAfterHeader(countErr) });
+      }
     }
 
-    const abortController = new AbortController();
-    const abortUpstream = () => {
-      if (!abortController.signal.aborted) abortController.abort();
-    };
-    req.raw.once('aborted', abortUpstream);
     let upstreamRes: any;
     try {
-      upstreamRes = await executor.executeWithRetry(payload, 3, accountLeaseKey, abortController.signal);
+      upstreamRes = await executor.executeWithRetry(payload, 3, accountLeaseKey, lifecycle.signal, req.id);
     } catch (err: any) {
       clearEphemeralAccountLease();
+      if (lifecycle.signal.aborted) return;
       if (err instanceof ContextOverflowError) {
         // Claude Code owns conversation compaction. Never rewrite the history
         // here: returning the native upstream error lets the client compact its
         // local transcript and issue the next request with the compacted state.
-        return reply.status(400).send({
+        applyRetryAfter(reply, err);
+        return sendGatewayError(reply, 400, {
           type: 'error',
           error: { type: 'invalid_request_error', message: 'Request context exceeds the upstream limit. Claude Code must compact the conversation and retry.' }
-        });
+        }, 'anthropic', { retryAfterSeconds: getRetryAfterHeader(err) });
       }
       if (err instanceof LocationNotSupportedError) {
-        return reply.status(400).send({
+        applyRetryAfter(reply, err);
+        return sendGatewayError(reply, 400, {
           type: 'error',
           error: {
             type: 'invalid_request_error',
             message: 'Google Upstream 拒绝访问：当前代理出口 IP 地区不受支持 (User location is not supported for the API use)。请在代理软件（如 Clash）中将节点切换至美国(US)、日本(JP)、新加坡(SG)等 Google 支持的地区，避免使用香港(HK)节点或直连。'
           }
-        });
+        }, 'anthropic', { retryAfterSeconds: getRetryAfterHeader(err) });
       }
       const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
       const message = err instanceof UpstreamRequestError ? err.message : `Antigravity upstream unavailable: ${err.message}`;
       applyRetryAfter(reply, err);
-      return reply.status(statusCode).send({
+      return sendGatewayError(reply, statusCode, {
         type: 'error',
-        error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message }
-      });
+        error: { type: anthropicErrorType(statusCode), message }
+      }, 'anthropic', { retryAfterSeconds: getRetryAfterHeader(err) });
     }
 
     const { bodyStream, accountUsed } = upstreamRes;
 
     if (isStream) {
       // Anthropic SSE 流式协议
-      reply.raw.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-      reply.raw.setHeader('Cache-Control', 'no-cache, no-transform');
-      reply.raw.setHeader('Connection', 'keep-alive');
-      reply.raw.setHeader('X-Accel-Buffering', 'no');
-      const stopSseHeartbeat = startSseHeartbeat(reply, config.streamKeepaliveMs);
+      prepareSseResponse(reply);
 
       let released = false;
-      let completed = false;
       const cleanup = (err?: any) => {
         if (released) return;
         released = true;
         pool.releaseAccount(accountUsed.id, err);
         clearEphemeralAccountLease();
       };
-      const onClientClose = () => {
-        if (!completed) {
-          console.warn(`[AnthropicGateway] ⚠️ 客户端主动中断连接 (Client aborted/timeout, req: ${req.id})`);
-          abortUpstream();
-        }
-        cleanup({ code: 499, message: 'Client disconnected' });
-      };
-      req.raw.once('aborted', onClientClose);
-      reply.raw.once('close', onClientClose);
-
       try {
         // 1. message_start
         const startMsg = {
@@ -832,27 +844,31 @@ export function registerAnthropicRoutes(
         // 5. message_stop
         reply.raw.write(`event: message_stop\ndata: {"type":"message_stop"}\n\n`);
         reply.raw.end();
-        completed = true;
         console.info(`[AnthropicGateway] ✅ 流式响应成功交付 (req: ${req.id}, 产出: ${lastUsageMetadata?.candidatesTokenCount ?? 0} tokens)`);
 
         if (lastUsageMetadata) pool.recordTokenUsage(lastUsageMetadata);
       } catch (err: any) {
         console.error('[AnthropicGateway] Stream error:', err.message);
-        if (!reply.raw.destroyed && !reply.raw.writableEnded) {
-          reply.raw.write(`event: error\ndata: ${JSON.stringify({
-            type: 'error',
-            error: { type: 'api_error', message: `Upstream stream failed: ${err.message}` }
-          })}\n\n`);
-          reply.raw.end();
-        }
+        const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 502;
+        sendGatewayError(reply, statusCode, {
+          type: 'error',
+          error: { type: anthropicErrorType(statusCode), message: `Upstream stream failed: ${err.message}` }
+        }, 'anthropic', { retryAfterSeconds: getRetryAfterHeader(err) });
       } finally {
-        stopSseHeartbeat();
-        completed = true;
-        abortUpstream();
-        cleanup();
+        // Capture the disconnect state before abort() flips it for every exit.
+        const clientGone = lifecycle.signal.aborted;
+        lifecycle.abort();
+        cleanup(clientGone ? { code: 499, message: 'Client disconnected' } : undefined);
       }
     } else {
       // 非流式 Anthropic JSON
+      let nonStreamReleased = false;
+      const releaseNonStream = (err?: any) => {
+        if (nonStreamReleased) return;
+        nonStreamReleased = true;
+        pool.releaseAccount(accountUsed.id, err);
+        clearEphemeralAccountLease();
+      };
       let fullText = '';
       let fullThinking = '';
       let lastSignature: string | undefined;
@@ -898,8 +914,7 @@ export function registerAnthropicRoutes(
           }
         }
 
-        pool.releaseAccount(accountUsed.id);
-        clearEphemeralAccountLease();
+        releaseNonStream();
 
         if (lastUsageMetadata) pool.recordTokenUsage(lastUsageMetadata);
 
@@ -933,12 +948,13 @@ export function registerAnthropicRoutes(
           }
         });
       } catch (err: any) {
-        pool.releaseAccount(accountUsed.id, { code: 500, message: err.message });
-        clearEphemeralAccountLease();
-        return reply.status(500).send({
+        releaseNonStream(lifecycle.signal.aborted
+          ? { code: 499, message: 'Client disconnected' }
+          : { code: 500, message: err.message });
+        return sendGatewayError(reply, 500, {
           type: 'error',
           error: { type: 'api_error', message: `Stream parsing error: ${err.message}` }
-        });
+        }, 'anthropic');
       }
     }
   };

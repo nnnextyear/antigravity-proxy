@@ -2,6 +2,12 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { test } from 'node:test';
 import { createServer } from '../src/gateway/server.js';
+
+// The executor falls back to the ambient proxy env vars when no proxy is
+// configured, which would route loopback requests through a real proxy.
+delete process.env.HTTPS_PROXY;
+delete process.env.HTTP_PROXY;
+delete process.env.DEFAULT_PROXY_URL;
 import { RequestExecutor, UpstreamRequestError } from '../src/pool/breaker.js';
 import type { Account, AppConfig, GoogleCloudCodePayload } from '../src/types.js';
 
@@ -43,7 +49,8 @@ function config(upstreamUrl: string): AppConfig {
     upstreamUrl,
     defaultMaxConcurrency: 5,
     cooldownSeconds: 60,
-    tokenRefreshIntervalMs: 60_000
+    tokenRefreshIntervalMs: 60_000,
+    minRequestIntervalMs: 0
   };
 }
 
@@ -200,5 +207,35 @@ test('429 Retry-After is returned to API clients', async () => {
     assert.equal(response.headers['retry-after'], '11');
   } finally {
     await app.close();
+  }
+});
+
+test('does not replay a generation after the request was sent but the socket closes', async () => {
+  let calls = 0;
+  const upstream = await withUpstream((req) => {
+    calls++;
+    req.socket.destroy();
+  });
+  const acc = account();
+  const pool = {
+    acquireAccount: () => { acc.activeConcurrency++; return acc; },
+    releaseAccount: () => { acc.activeConcurrency = Math.max(0, acc.activeConcurrency - 1); },
+    getAllAccounts: () => [acc]
+  };
+  const executor = new RequestExecutor(pool as any, { refreshSingleAccount: async () => true } as any, config(upstream.url));
+  const payload: GoogleCloudCodePayload = {
+    model: 'gemini-3.8-flash',
+    request: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] }
+  };
+
+  try {
+    await assert.rejects(
+      executor.executeWithRetry(payload, 3),
+      (error: any) => error?.statusCode === 502 && /Automatic replay stopped/.test(error.message)
+    );
+    assert.equal(calls, 1);
+    assert.equal(acc.activeConcurrency, 0);
+  } finally {
+    await new Promise<void>(resolve => upstream.server.close(() => resolve()));
   }
 });

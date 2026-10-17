@@ -685,9 +685,11 @@ function isPolicyBlockedAccount(acc) {
 }
 
 function getMetaClusterHtml(acc) {
-  const proxyText = acc.proxyUrl 
+  // An empty proxyUrl follows the global setting. When the global setting is
+  // empty, the operating system / Clash TUN path handles the egress.
+  const proxyText = acc.proxyUrl
     ? acc.proxyUrl.replace(/:\/\/[^@]+@/, '://***@')
-    : '直连出口';
+    : '跟随全局出口';
   const isCustomProxy = Boolean(acc.proxyUrl);
 
   const tokenTimeLeft = acc.accessTokenExpiresAt > Date.now()
@@ -708,7 +710,26 @@ function getMetaClusterHtml(acc) {
     <span class="meta-pill" title="Token 剩余有效期">
       <span>Token:</span> <strong>${tokenTimeLeft}</strong>
     </span>
+    ${renderRateLimitPill(acc)}
+    ${renderLastErrorHtml(acc)}
   `;
+}
+
+/** Early warning: an account that is being rate limited before it dies. */
+function renderRateLimitPill(acc) {
+  const hits = Number(acc.rateLimitHits) || 0;
+  if (!hits) return '';
+  const when = acc.lastRateLimitAt ? new Date(acc.lastRateLimitAt).toLocaleString() : '未知时间';
+  return `
+    <span class="meta-pill" title="累计被上游限频 429 次数（最近一次：${escapeHtml(when)}）">
+      <span>限频:</span> <strong class="text-warn">${hits}</strong> <span>次</span>
+    </span>
+  `;
+}
+
+function renderLastErrorHtml(acc) {
+  if (!acc.lastError) return '';
+  return `<div class="acc-last-error" title="${escapeHtml(acc.lastError)}">${escapeHtml(acc.lastError)}</div>`;
 }
 
 function getCardHtml(acc) {
@@ -1128,7 +1149,7 @@ window.handleAddAccount = async function() {
     return;
   }
 
-  if (proxy && !/^https?:\/\/|^socks5?:\/\//i.test(proxy)) {
+  if (proxy && !/^https?:\/\//i.test(proxy)) {
     proxy = 'http://' + proxy;
   }
 
@@ -1176,7 +1197,7 @@ window.handleSaveProxyConfig = async function() {
   if (!accId) return;
 
   let proxyUrl = proxyInput ? proxyInput.value.trim() : '';
-  if (proxyUrl && !/^https?:\/\/|^socks5?:\/\//i.test(proxyUrl)) {
+  if (proxyUrl && !/^https?:\/\//i.test(proxyUrl)) {
     proxyUrl = 'http://' + proxyUrl;
     if (proxyInput) proxyInput.value = proxyUrl;
   }
