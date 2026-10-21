@@ -20,14 +20,16 @@ export async function requestUpstream(url: string, options: any, proxyUrl?: stri
 
   const target = new URL(url);
   const connectTimeoutMs = Number(options.connectTimeout) > 0 ? Number(options.connectTimeout) : 60_000;
+  const attempt = options.transportAttempt;
   const tunnel = proxyUrl ? await openConnectTunnel(proxyUrl, target, options.signal, connectTimeoutMs) : undefined;
-  const secureSocket = tunnel ? await wrapTargetTls(tunnel, target, options.signal, connectTimeoutMs) : undefined;
+  const secureSocket = tunnel ? await wrapTargetTls(tunnel, target, options.signal, connectTimeoutMs, attempt) : undefined;
   const session = http2.connect(target.origin, {
     rejectUnauthorized: true,
     keepAlive: true,
     keepAliveInitialDelay: 15_000,
     ...(secureSocket ? { createConnection: () => secureSocket } : {})
   } as any);
+  session.once('connect', () => attempt?.markConnected());
   let pingTimer: NodeJS.Timeout | undefined;
   const cleanup = () => {
     if (pingTimer) clearInterval(pingTimer);
@@ -48,6 +50,7 @@ export async function requestUpstream(url: string, options: any, proxyUrl?: stri
     ':path': `${target.pathname}${target.search}`,
     ...headers
   });
+  req.once('ready', () => attempt?.markSent());
 
   pingTimer = setInterval(() => {
     if (session.destroyed || session.closed || session.connecting) return;
@@ -77,6 +80,7 @@ export async function requestUpstream(url: string, options: any, proxyUrl?: stri
     timeout.unref?.();
 
     req.once('response', (headers) => {
+      attempt?.markHeaders();
       responseHeaders = headers;
       clearTimeout(timeout);
       const statusCode = Number(headers[':status'] || 0);
@@ -127,8 +131,11 @@ export async function requestUpstream(url: string, options: any, proxyUrl?: stri
       }
     });
 
-    if (options.body !== undefined && options.body !== null) req.end(options.body);
-    else req.end();
+    if (options.body !== undefined && options.body !== null) {
+      req.end(options.body, () => attempt?.markUploaded());
+    } else {
+      req.end(() => attempt?.markUploaded());
+    }
   });
 }
 
@@ -136,7 +143,7 @@ function abortError(): Error {
   return Object.assign(new Error('Upstream request aborted by client.'), { code: 'ABORT_ERR' });
 }
 
-export async function openConnectTunnel(proxyUrl: string, target: URL, signal?: AbortSignal, timeoutMs = 60_000): Promise<Duplex> {
+export async function openConnectTunnel(proxyUrl: string, target: URL, signal?: AbortSignal, timeoutMs = 60_000, attempt?: any): Promise<Duplex> {
   const proxy = new URL(proxyUrl);
   if (!['http:', 'https:'].includes(proxy.protocol) || !proxy.hostname) {
     throw new Error(`Unsupported HTTP proxy URL: ${proxyUrl}`);
@@ -193,7 +200,7 @@ export async function openConnectTunnel(proxyUrl: string, target: URL, signal?: 
   return socket;
 }
 
-async function wrapTargetTls(tunnel: Duplex, target: URL, signal?: AbortSignal, timeoutMs = 60_000): Promise<tls.TLSSocket> {
+async function wrapTargetTls(tunnel: Duplex, target: URL, signal?: AbortSignal, timeoutMs = 60_000, attempt?: any): Promise<tls.TLSSocket> {
   return await new Promise((resolve, reject) => {
     const secure = tls.connect({ socket: tunnel, servername: target.hostname, ALPNProtocols: ['h2'], rejectUnauthorized: true });
     let settled = false;
@@ -213,6 +220,7 @@ async function wrapTargetTls(tunnel: Duplex, target: URL, signal?: AbortSignal, 
     }
     secure.once('error', fail);
     secure.once('secureConnect', () => {
+      attempt?.markConnected();
       settled = true;
       clearTimeout(timeout);
       if (signal) signal.removeEventListener('abort', onAbort);

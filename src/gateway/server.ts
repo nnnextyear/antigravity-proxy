@@ -13,7 +13,8 @@ import { ModelRequestError, toPublicModelCatalog } from './models.js';
 import { registerAdminRoutes } from '../admin/routes.js';
 import { registerAnthropicRoutes } from './anthropic.js';
 import { QuotaManager } from '../pool/quota-manager.js';
-import { attachUpstreamSessionId, extractSessionKey } from './session.js';
+import { AccountSchedulingError } from '../pool/scheduling.js';
+import { attachUpstreamSessionId, extractSessionIdentity, logSessionIdentity } from './session.js';
 import { prepareSseResponse, sendGatewayError, startRequestLifecycle } from './streaming.js';
 
 export async function createServer(
@@ -299,7 +300,9 @@ export async function createServer(
     const completionId = `chatcmpl-${crypto.randomBytes(12).toString('hex')}`;
 
     // 提取稳定会话唯一指纹（用于强会话粘性，最大化利用 Google 上游 Prompt Cache）
-    const sessionKey = extractSessionKey(req.headers as Record<string, unknown>, chatReq, 'openai');
+    const sessionIdentity = extractSessionIdentity(req.headers as Record<string, unknown>, chatReq, 'openai');
+    const sessionKey = sessionIdentity?.rootKey;
+    logSessionIdentity(sessionIdentity, req.id);
     attachUpstreamSessionId(payload, sessionKey);
 
     let upstreamRes: any = null;
@@ -308,7 +311,7 @@ export async function createServer(
     } catch (err: any) {
       if (err instanceof ContextOverflowError) {
         return sendGatewayError(reply, 400, {
-          error: { message: 'Request context exceeds the upstream limit. The client must compact its conversation and retry.', type: 'invalid_request_error' }
+          error: { message: err.clientMessage, code: err.code, type: 'invalid_request_error' }
         }, 'chat', { retryAfterSeconds: getRetryAfterHeader(err) });
       }
       if (err instanceof LocationNotSupportedError) {
@@ -323,7 +326,8 @@ export async function createServer(
       const message = err instanceof UpstreamRequestError ? err.message : `Antigravity upstream unavailable: ${err.message}`;
       applyRetryAfter(reply, err);
       return sendGatewayError(reply, statusCode, {
-        error: { message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' }
+        error: { message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error',
+          ...(err instanceof AccountSchedulingError ? { code: err.code } : {}) }
       }, 'chat', { retryAfterSeconds: getRetryAfterHeader(err) });
     }
 
@@ -332,7 +336,8 @@ export async function createServer(
     const cleanup = (err?: any) => {
       if (released) return;
       released = true;
-      pool.releaseAccount(accountUsed.id, err);
+      if (upstreamRes.release) upstreamRes.release(err);
+      else pool.releaseAccount(accountUsed.id, err);
     };
 
     if (isStream) {
@@ -565,7 +570,9 @@ export async function createServer(
     }
     const { payload } = converted;
     const responseId = `resp_${crypto.randomBytes(12).toString('hex')}`;
-    const sessionKey = extractSessionKey(req.headers as Record<string, unknown>, input, 'responses');
+    const sessionIdentity = extractSessionIdentity(req.headers as Record<string, unknown>, input, 'responses');
+    const sessionKey = sessionIdentity?.rootKey;
+    logSessionIdentity(sessionIdentity, req.id);
     attachUpstreamSessionId(payload, sessionKey);
 
     let upstreamRes: any;
@@ -573,7 +580,7 @@ export async function createServer(
       upstreamRes = await executor.executeWithRetry(payload, 3, sessionKey, lifecycle.signal, req.id);
     } catch (err: any) {
       if (err instanceof ContextOverflowError) {
-        return sendGatewayError(reply, 400, { error: { message: 'Request context exceeds the upstream limit.', type: 'invalid_request_error' } }, 'responses', { retryAfterSeconds: getRetryAfterHeader(err) });
+        return sendGatewayError(reply, 400, { error: { message: err.clientMessage, code: err.code, type: 'invalid_request_error' } }, 'responses', { retryAfterSeconds: getRetryAfterHeader(err) });
       }
       if (err instanceof LocationNotSupportedError) {
         return sendGatewayError(reply, 400, {
@@ -585,7 +592,8 @@ export async function createServer(
       }
       const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 503;
       applyRetryAfter(reply, err);
-      return sendGatewayError(reply, statusCode, { error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' } }, 'responses', { retryAfterSeconds: getRetryAfterHeader(err) });
+      return sendGatewayError(reply, statusCode, { error: { message: err.message, type: statusCode === 400 ? 'invalid_request_error' : 'api_error',
+        ...(err instanceof AccountSchedulingError ? { code: err.code } : {}) } }, 'responses', { retryAfterSeconds: getRetryAfterHeader(err) });
     }
 
     const { bodyStream, accountUsed } = upstreamRes;
@@ -593,7 +601,8 @@ export async function createServer(
     const cleanup = (err?: any) => {
       if (released) return;
       released = true;
-      pool.releaseAccount(accountUsed.id, err);
+      if (upstreamRes.release) upstreamRes.release(err);
+      else pool.releaseAccount(accountUsed.id, err);
     };
     let fullText = '';
     let buffer = '';

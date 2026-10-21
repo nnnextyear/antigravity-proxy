@@ -12,5 +12,11 @@
   "routingStrategy": "zero-waste",
   "oauthClientId": "",
   "oauthClientSecret": "",
-  "upstreamTimeoutMs": 900000
+  "upstreamTimeoutMs": 900000,
+  "minRequestIntervalMs": 1000,
+  "accountQueueTimeoutMs": 120000,
+  "maxAccountQueue": 100,
+  "maxConversationQueue": 32,
+  "maxTotalQueue": 1000,
+  "activeConversationTtlMs": 900000
 }

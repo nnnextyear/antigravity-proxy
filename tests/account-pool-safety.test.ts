@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test, before, after } from 'node:test';
+import { extractSessionKey } from '../src/gateway/session.js';
 
 // AccountPool resolves ./data against the process cwd at import time, so give
 // it a throwaway directory and never touch the real accounts file. The modules
@@ -60,6 +61,56 @@ after(() => {
   try { fs.rmSync(sandbox, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
+test('eight conversations spread across six accounts and retain their bindings', () => {
+  const pool = makePool();
+  const accounts = Array.from({ length: 6 }, (_, i) => seed(pool, {
+    quota: quota({ geminiResetTime: new Date(Date.now() + (i + 1) * 60_000).toISOString() })
+  }));
+  const assignments = Array.from({ length: 8 }, (_, i) => {
+    const acc = pool.acquireAccount(new Set(), 'gemini', `conversation-${i}`);
+    assert.ok(acc);
+    pool.releaseAccount(acc.id);
+    return acc.id;
+  });
+  assert.equal(new Set(assignments.slice(0, 6)).size, 6);
+  assert.deepEqual(accounts.map(a => assignments.filter(id => id === a.id).length).sort(), [1, 1, 1, 1, 2, 2]);
+  assignments.forEach((id, i) => {
+    const acc = pool.acquireAccount(new Set(), 'gemini', `conversation-${i}`);
+    assert.equal(acc.id, id);
+    pool.releaseAccount(acc.id);
+  });
+});
+
+test('equal conversation counts prefer spare concurrency before quota reset priority', () => {
+  const pool = makePool();
+  const busy = seed(pool, { quota: quota({ geminiResetTime: new Date(Date.now() + 60_000).toISOString() }) });
+  const idle = seed(pool, { quota: quota() });
+  const first = pool.acquireAccount(new Set(), 'gemini', 'a');
+  assert.equal(first.id, busy.id);
+  const second = pool.acquireAccount(new Set(), 'gemini', 'b');
+  assert.equal(second.id, idle.id);
+  pool.releaseAccount(second.id);
+  assert.equal(pool.acquireAccount(new Set(), 'gemini', 'c').id, idle.id);
+});
+
+test('subagents share the parent account and a full parent does not block another conversation', () => {
+  const pool = makePool();
+  seed(pool, { maxConcurrency: 2 });
+  seed(pool, { maxConcurrency: 2 });
+  const key = (session: string, agent: string) => extractSessionKey({}, {
+    metadata: { user_id: JSON.stringify({ session_id: session, agent_id: agent }) }
+  }, 'anthropic');
+  const parent = pool.acquireAccount(new Set(), 'gemini', key('a', 'main'));
+  const child = pool.acquireAccount(new Set(), 'gemini', key('a', 'worker'));
+  assert.equal(parent.id, child.id);
+  assert.equal(pool.acquireAccount(new Set(), 'gemini', key('a', 'worker-2')), null);
+  const other = pool.acquireAccount(new Set(), 'gemini', key('b', 'main'));
+  assert.ok(other);
+  assert.notEqual(parent.id, other.id);
+  pool.releaseAccount(child.id);
+  assert.equal(pool.acquireAccount(new Set(), 'gemini', key('a', 'worker-2')).id, parent.id);
+});
+
 test('a 429 puts the account in cooldown and out of the candidate list', () => {
   const pool = makePool();
   const acc = seed(pool);
@@ -86,15 +137,16 @@ test('quota exhaustion zeroes only that family and keeps the account usable for 
   const pool = makePool();
   const acc = seed(pool, { quota: quota() });
 
-  pool.releaseAccount(acc.id, { code: 429, message: 'Resource has been exhausted', retryAfterMs: 60_000 }, 'claude', 'sess');
+  pool.releaseAccount(acc.id, { code: 429, message: 'Individual quota reached', retryAfterMs: 60_000 }, 'claude', 'sess');
 
   assert.equal(acc.quota!.claude5hFraction, 0);
   assert.equal(acc.status, 'active', 'the account stays usable for the other family');
   assert.equal(acc.quota!.gemini5hFraction, 1);
   assert.ok(
-    acc.quota!.claudeResetTime && new Date(acc.quota!.claudeResetTime).getTime() > Date.now(),
-    'a missing reset time must get a floor so the account is not re-selected immediately'
+    acc.quotaBlockedUntil?.claude && acc.quotaBlockedUntil.claude > Date.now(),
+    'a rejection deadline must prevent immediate re-selection without fabricating a 5h reset'
   );
+  assert.equal(acc.quota!.claudeResetTime, undefined);
   // The claude family must be skipped, the gemini family must still be served.
   assert.equal(pool.acquireAccount(new Set(), 'claude', 'sess'), null);
   assert.ok(pool.acquireAccount(new Set(), 'gemini', 'sess'));

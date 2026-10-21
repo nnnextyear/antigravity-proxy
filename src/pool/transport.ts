@@ -28,6 +28,7 @@ channel('undici:request:headers').subscribe((event: any) => {
 
 export class TransportAttempt {
   readonly startedAt = Date.now();
+  connectedAt?: number;
   sentAt?: number;
   uploadedAt?: number;
   headersAt?: number;
@@ -38,6 +39,11 @@ export class TransportAttempt {
     return currentAttempt.run(this, operation);
   }
 
+  markConnected(): void { this.connectedAt ??= Date.now(); }
+  markSent(): void { this.sentAt ??= Date.now(); }
+  markUploaded(): void { this.uploadedAt ??= Date.now(); }
+  markHeaders(): void { this.headersAt ??= Date.now(); }
+
   // A generation can be replayed only when its body was never fully sent.
   // `sendHeaders` alone means the request may still be in the upload phase.
   get requestSent(): boolean { return this.uploadedAt !== undefined; }
@@ -45,9 +51,10 @@ export class TransportAttempt {
   describe(): string {
     const phase = this.headersAt ? 'reading-body'
       : this.uploadedAt ? 'waiting-for-headers'
-        : this.sentAt ? 'uploading' : 'connecting';
+        : this.sentAt ? 'uploading'
+          : this.connectedAt ? 'connected' : 'connecting';
     const elapsed = (time?: number) => time === undefined ? 'pending' : `${time - this.startedAt}ms`;
-    return `req=${this.requestId ?? 'unknown'}, dispatcher=${getDispatcherId(this.dispatcher)}, phase=${phase}, elapsed=${Date.now() - this.startedAt}ms, sent=${elapsed(this.sentAt)}, uploaded=${elapsed(this.uploadedAt)}, headers=${elapsed(this.headersAt)}`;
+    return `req=${this.requestId ?? 'unknown'}, dispatcher=${getDispatcherId(this.dispatcher)}, phase=${phase}, elapsed=${Date.now() - this.startedAt}ms, connected=${elapsed(this.connectedAt)}, sent=${elapsed(this.sentAt)}, uploaded=${elapsed(this.uploadedAt)}, headers=${elapsed(this.headersAt)}`;
   }
 }
 

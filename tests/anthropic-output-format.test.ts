@@ -21,10 +21,11 @@ test('Claude Code /goal JSON schema reaches the Google generation request', asyn
   let captured: GoogleCloudCodePayload | undefined;
   const executor = {
     fetchAvailableModels: async () => ({ models: { 'claude-sonnet-4-6': { maxOutputTokens: 64000 } } }),
-    countTokens: async () => ({ totalTokens: 42 }),
-    executeWithRetry: async (payload: GoogleCloudCodePayload) => {
+    executeWithRetry: async (payload: GoogleCloudCodePayload, _retries: number, _key: string, _signal: AbortSignal, _id: string, preflight: boolean) => {
+      assert.equal(preflight, true);
       captured = payload;
       return {
+        inputTokenCount: 42,
         accountUsed: { id: 'test' },
         bodyStream: (async function* () {
           yield Buffer.from('data: {"response":{"candidates":[{"content":{"parts":[{"text":"{\\"ok\\":true,\\"reason\\":\\"Done\\"}"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":42,"candidatesTokenCount":10}}}\n\n');
@@ -85,12 +86,14 @@ test('Claude Code /goal JSON schema reaches the Google generation request', asyn
   }
 });
 
-test('Anthropic generation stops when countTokens returns a policy error', async () => {
+test('Anthropic gateway preserves a policy error from the executor preflight', async () => {
   const app = fastify();
-  let generationCalls = 0;
+  let executionCalls = 0;
   const executor = {
     fetchAvailableModels: async () => ({ models: { 'claude-sonnet-4-6': { maxOutputTokens: 64000 } } }),
-    countTokens: async () => {
+    executeWithRetry: async (_payload: unknown, _retries: number, _key: string, _signal: AbortSignal, _id: string, preflight: boolean) => {
+      assert.equal(preflight, true);
+      executionCalls++;
       throw new UpstreamRequestError(403, JSON.stringify({
         error: {
           code: 403,
@@ -98,10 +101,6 @@ test('Anthropic generation stops when countTokens returns a policy error', async
           message: 'This service has been disabled in this account for violation of Terms of Service.'
         }
       }));
-    },
-    executeWithRetry: async () => {
-      generationCalls++;
-      throw new Error('generation must not be called');
     }
   };
 
@@ -123,9 +122,42 @@ test('Anthropic generation stops when countTokens returns a policy error', async
       }
     });
     assert.equal(response.statusCode, 403, response.body);
-    assert.equal(generationCalls, 0);
+    assert.equal(executionCalls, 1);
     assert.match(response.body, /TOS_VIOLATION/);
   } finally {
     await app.close();
   }
+});
+
+test('Anthropic stream corrects input usage for subagents when preflight is unavailable and a terminal chunk is sparse', async () => {
+  const app = fastify();
+  const executor = {
+    fetchAvailableModels: async () => ({ models: { 'gemini-test': {} } }),
+    executeWithRetry: async () => ({
+      accountUsed: { id: 'test' },
+      inputTokenCount: undefined,
+      bodyStream: (async function* () {
+        yield Buffer.from('data: ' + JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: 'ok' }] } }],
+          usageMetadata: { promptTokenCount: 950000, candidatesTokenCount: 1, cachedContentTokenCount: 800000 } } }) + '\n\n');
+        yield Buffer.from('data: ' + JSON.stringify({ response: { usageMetadata: { promptTokenCount: 0, candidatesTokenCount: 2 } } }) + '\n\n');
+      })()
+    })
+  };
+  let recorded: any;
+  registerAnthropicRoutes(app, {} as AppConfig, { releaseAccount() {}, recordTokenUsage(usage: any) { recorded = usage; } } as any, executor as any, () => {});
+  try {
+    for (const stream of [true, false]) {
+      const response = await app.inject({ method: 'POST', url: '/v1/messages', payload: { model: 'gemini-test[1M]', stream,
+        metadata: { user_id: JSON.stringify({ session_id: 'parent', agent_id: 'child' }) }, messages: [{ role: 'user', content: 'Continue task' }] } });
+      assert.equal(response.statusCode, 200, response.body);
+      if (stream) {
+        const frames = response.body.split('\n').filter(line => line.startsWith('data:')).map(line => JSON.parse(line.slice(5)));
+        assert.equal(frames.find(frame => frame.type === 'message_start').message.usage.input_tokens, 0);
+        assert.equal(frames.find(frame => frame.type === 'message_delta').usage.input_tokens, 950000);
+        assert.equal(frames.find(frame => frame.type === 'message_delta').usage.output_tokens, 2);
+      } else assert.equal(response.json().usage.input_tokens, 950000);
+      assert.equal(recorded.promptTokenCount, 950000);
+      assert.equal(recorded.cachedContentTokenCount, 800000);
+    }
+  } finally { await app.close(); }
 });

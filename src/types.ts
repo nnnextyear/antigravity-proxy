@@ -2,14 +2,14 @@ export type AccountStatus = 'active' | 'cooldown' | 'dead' | 'disabled';
 export type RoutingStrategy = 'zero-waste' | 'sequential-drain' | 'round-robin';
 
 export interface AccountQuota {
-  geminiWeeklyFraction: number; // 0.0 - 1.0 (周期总额度)
-  gemini5hFraction: number;      // 0.0 - 1.0 (5小时额度)
+  geminiWeeklyFraction?: number; // 0.0 - 1.0 (周期总额度)
+  gemini5hFraction?: number;      // 0.0 - 1.0 (5小时额度)
   geminiResetTime?: string;      // 5小时重置时间 (ISO timestamp)
   geminiWeeklyResetTime?: string; // 周期总额度重置时间 (ISO timestamp)
   gemini5hDesc?: string;         // Google 官方 5 小时描述
   geminiWeeklyDesc?: string;     // Google 官方周度描述
-  claudeWeeklyFraction: number;  // 0.0 - 1.0 (周期总额度剩余比例)
-  claude5hFraction: number;      // 0.0 - 1.0 (5小时额度剩余比例)
+  claudeWeeklyFraction?: number;  // 0.0 - 1.0 (周期总额度剩余比例)
+  claude5hFraction?: number;      // 0.0 - 1.0 (5小时额度剩余比例)
   claudeResetTime?: string;      // 5小时重置时间 (ISO timestamp)
   claudeWeeklyResetTime?: string; // 周期总额度重置时间 (ISO timestamp)
   claude5hDesc?: string;         // Google 官方 5 小时描述
@@ -34,6 +34,8 @@ export interface Account {
   createdAt: number;
   lastError?: string;
   quota?: AccountQuota;
+  /** Upstream rejection takes precedence over a stale quota polling snapshot. */
+  quotaBlockedUntil?: Partial<Record<'claude' | 'gemini', number>>;
   validationUrl?: string;
   /** 429 累计次数：在被限频但还没被冷却隔离之前给出预警信号。 */
   rateLimitHits?: number;
@@ -65,6 +67,13 @@ export interface AppConfig {
    * 0 disables the pacing.
    */
   minRequestIntervalMs?: number;
+  /** Local queue limits; generation holds one slot across preflight and streaming. */
+  accountQueueTimeoutMs?: number;
+  maxAccountQueue?: number;
+  maxConversationQueue?: number;
+  maxTotalQueue?: number;
+  /** Recent conversation occupancy used only for new placements (default 15 min). */
+  activeConversationTtlMs?: number;
   routingStrategy?: RoutingStrategy;
   oauthClientId?: string;
   oauthClientSecret?: string;

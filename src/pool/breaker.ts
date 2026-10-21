@@ -5,17 +5,25 @@ import { AccountPool } from './account-pool.js';
 import { TokenRefresher } from './refresher.js';
 import { QuotaManager } from './quota-manager.js';
 import { getOrCreateDispatcher, resetDispatcher } from './dispatcher.js';
-import { isLocationError, isPolicyBlockedError, retryAfterMs } from './error-policy.js';
+import { classifyUpstreamError, contextOverflowMessage, isContextOverflow, isLocationError, isPolicyBlockedError, retryAfterMs } from './error-policy.js';
 import { jittered, TransportAttempt, waitForRetry } from './transport.js';
 import { attachUpstreamSessionId } from '../gateway/session.js';
 import type { LiveModelCatalog } from '../gateway/models.js';
 import { requestUpstream } from './h2-transport.js';
+import { AccountSchedulingError, accountUnavailableError, hasFamilyQuota } from './scheduling.js';
 
 export interface UpstreamExecutionResult {
   statusCode: number;
   headers: Record<string, any>;
   bodyStream: any;
   accountUsed: Account;
+  inputTokenCount?: number;
+  release?: (error?: { code: number; message: string; retryAfterMs?: number; recoverable?: boolean }) => void;
+}
+
+interface BorrowedCountLease {
+  account: Account;
+  release: (error?: { code: number; message: string; retryAfterMs?: number; recoverable?: boolean }) => void;
 }
 
 export interface UpstreamTokenCountResult {
@@ -41,9 +49,12 @@ export class UpstreamRequestError extends Error {
 }
 
 export class ContextOverflowError extends UpstreamRequestError {
+  readonly code = 'context_length_exceeded';
+  readonly clientMessage: string;
   constructor(statusCode: number, upstreamBody: string) {
     super(statusCode, upstreamBody);
     this.name = 'ContextOverflowError';
+    this.clientMessage = contextOverflowMessage(upstreamBody);
   }
 }
 
@@ -56,18 +67,11 @@ export class LocationNotSupportedError extends UpstreamRequestError {
 
 /** Return the upstream Retry-After value for a gateway response, if present. */
 export function getRetryAfterHeader(error: unknown): string | undefined {
+  if (error instanceof AccountSchedulingError && error.retryAfterSeconds) return String(error.retryAfterSeconds);
   if (!(error instanceof UpstreamRequestError)) return undefined;
   const value = error.upstreamHeaders?.['retry-after'] ?? error.upstreamHeaders?.['Retry-After'];
   if (Array.isArray(value)) return value.length ? String(value[0]) : undefined;
   return value === undefined || value === null ? undefined : String(value);
-}
-
-function isContextOverflow(statusCode: number, body: string): boolean {
-  return statusCode === 400 && (
-    /input token count exceeds the maximum number of tokens/i.test(body) ||
-    /maximum number of tokens allowed/i.test(body) ||
-    /CONTEXT_LENGTH_EXCEEDED/i.test(body)
-  );
 }
 
 function isLocationNotSupported(statusCode: number, body: string): boolean {
@@ -115,6 +119,7 @@ export class RequestExecutor {
   /** Minimum spacing between two generation starts on the same account. */
   private readonly minStartIntervalMs: number;
   private readonly lastGenerationStartAt = new Map<string, number>();
+  private readonly pacingTails = new Map<string, Promise<void>>();
 
   constructor(
     private pool: AccountPool,
@@ -136,11 +141,11 @@ export class RequestExecutor {
    *
    * @returns true when the session binding was dropped.
    */
-  private noteRefreshFailure(failures: Map<string, number>, accountId: string, sessionKey?: string): boolean {
+  private noteRefreshFailure(failures: Map<string, number>, accountId: string, sessionKey?: string, family?: 'claude' | 'gemini'): boolean {
     const count = (failures.get(accountId) ?? 0) + 1;
     failures.set(accountId, count);
     if (count >= 2 && sessionKey) {
-      this.pool.clearSessionBinding(sessionKey, accountId);
+      this.pool.clearSessionBinding(sessionKey, accountId, undefined, family, 'token_refresh_failed');
       console.warn('[Executor] 账号连续两次续期失败，已解除会话绑定，本次请求改由其他账号服务。');
       return true;
     }
@@ -148,17 +153,39 @@ export class RequestExecutor {
   }
 
   /**
-   * Space generation starts on one account. Filling every concurrency slot in
-   * the same tick is exactly the burst pattern upstream rate limiters look
-   * for; a small minimum interval spreads the starts without costing real
-   * throughput (a generation takes far longer than the interval).
+   * Serialize start reservations so simultaneous waiters cannot share a time.
+   * Requests already started retain their concurrency; a cancelled waiter is removed.
    */
   private async paceAccount(account: Account, signal?: AbortSignal): Promise<void> {
     if (this.minStartIntervalMs <= 0) return;
-    const last = this.lastGenerationStartAt.get(account.id) ?? 0;
-    const wait = last + this.minStartIntervalMs - Date.now();
-    if (wait > 0) await waitForRetry(jittered(wait), signal);
-    this.lastGenerationStartAt.set(account.id, Date.now());
+    // Queue gates describe ordering only; request failures must stay local.
+    const previous = (this.pacingTails.get(account.id) ?? Promise.resolve()).catch(() => {});
+    let unlock!: () => void;
+    const own = new Promise<void>(resolve => { unlock = resolve; });
+    // This gate is independent of the rejecting request promise. Cancellation
+    // resolves own in finally, while the predecessor still preserves FIFO.
+    const tail = previous.then(() => own);
+    this.pacingTails.set(account.id, tail);
+    let onAbort: (() => void) | undefined;
+    try {
+      if (signal?.aborted) throw new Error('Request aborted by client.');
+      await new Promise<void>((resolve, reject) => {
+        onAbort = () => reject(new Error('Request aborted by client.'));
+        signal?.addEventListener('abort', onAbort, { once: true });
+        previous.then(resolve, reject);
+      });
+      if (signal?.aborted) throw new Error('Request aborted by client.');
+      const wait = (this.lastGenerationStartAt.get(account.id) ?? 0) + this.minStartIntervalMs - Date.now();
+      if (wait > 0) await waitForRetry(wait, signal);
+      if (signal?.aborted) throw new Error('Request aborted by client.');
+      this.lastGenerationStartAt.set(account.id, Date.now());
+    } finally {
+      if (onAbort) signal?.removeEventListener('abort', onAbort);
+      unlock();
+      void tail.then(() => {
+        if (this.pacingTails.get(account.id) === tail) this.pacingTails.delete(account.id);
+      });
+    }
   }
 
   /**
@@ -172,48 +199,34 @@ export class RequestExecutor {
     sessionKey: string | undefined,
     signal?: AbortSignal,
     /** Preflight callers must not queue: the generation phase queues anyway. */
-    waitForBoundAccount = true
+    waitForBoundAccount = true,
+    requestId?: string
   ): Promise<Account | null> {
-    const maxWaitMs = 120000;
-    // Jittered: every waiter bound to one account must not wake up in the same
-    // tick and fire together the moment a slot frees.
-    const pollMs = 100 + Math.floor(Math.random() * 120);
-    const deadline = Date.now() + maxWaitMs;
-
-    while (true) {
+    // Small pool doubles used by downstream integrations retain the old interface.
+    if (this.pool.acquireAccountAsync) {
       if (signal?.aborted) throw new Error('Request aborted by client.');
-      const account = this.pool.acquireAccount(excludeIds, requiredFamily, sessionKey);
-      if (account) return account;
-
-      const binding = sessionKey ? this.pool.getSessionBinding(sessionKey) : undefined;
-      const bound = binding ? this.pool.getAccount(binding.accountId) : undefined;
-      const boundIsBusy = Boolean(
-        bound && bound.status === 'active' && !excludeIds.has(bound.id) && bound.activeConcurrency >= bound.maxConcurrency
-      );
-      if (!boundIsBusy) return null;
-      if (!waitForBoundAccount) return null;
-      if (Date.now() >= deadline) {
-        throw new Error(`会话绑定账号 ${bound!.email} 当前并发已满，等待 120 秒后仍未释放；本次请求未切换账号。`);
-      }
-      await new Promise<void>((resolve, reject) => {
-        let timer: NodeJS.Timeout;
-        const onAbort = () => {
-          clearTimeout(timer);
-          signal?.removeEventListener('abort', onAbort);
-          reject(new Error('Request aborted by client.'));
-        };
-        timer = setTimeout(() => {
-          signal?.removeEventListener('abort', onAbort);
-          resolve();
-        }, pollMs);
-        if (!signal) return;
-        if (signal.aborted) {
-          onAbort();
-          return;
-        }
-        signal.addEventListener('abort', onAbort, { once: true });
+      if (!waitForBoundAccount) return this.pool.acquireAccount(excludeIds, requiredFamily, sessionKey);
+      return this.pool.acquireAccountAsync(excludeIds, requiredFamily, sessionKey, {
+        signal, requestId, timeoutMs: this.config.accountQueueTimeoutMs,
+        maxAccountQueue: this.config.maxAccountQueue, maxConversationQueue: this.config.maxConversationQueue,
+        maxTotalQueue: this.config.maxTotalQueue
       });
     }
+    if (signal?.aborted) throw new Error('Request aborted by client.');
+    return this.pool.acquireAccount(excludeIds, requiredFamily, sessionKey);
+  }
+
+  private quotaFailoverAvailable(excluded: Set<string>, family: 'claude' | 'gemini'): boolean {
+    return this.pool.getAllAccounts().some(account => !excluded.has(account.id)
+      && (account.status === 'active' || (account.status === 'cooldown' && account.cooldownUntil <= Date.now()))
+      && hasFamilyQuota(account, family));
+  }
+
+  private rejected429(body: string, delayMs: number): AccountSchedulingError {
+    const quota = classifyUpstreamError(429, body).kind === 'quota';
+    return new AccountSchedulingError(quota ? 'quota_exhausted' : 'rate_limited',
+      quota ? '当前可选账号的模型额度已耗尽，请等待额度恢复。'
+        : '上游暂时限制请求频率，请稍后重试。', Math.ceil(delayMs / 1000));
   }
 
   /** Fetch the live model catalog from Antigravity. There is deliberately no
@@ -347,11 +360,7 @@ export class RequestExecutor {
             message: body,
             retryAfterMs: retryDelay
           });
-          throw new UpstreamRequestError(
-            res.statusCode,
-            body,
-            headersWithRetryAfter(res.headers as Record<string, any>, retryDelay)
-          );
+          throw this.rejected429(body, retryDelay);
         }
         // The catalog call must classify 403 the same way generation does,
         // otherwise a transient permission 403 permanently kills an account.
@@ -386,7 +395,7 @@ export class RequestExecutor {
         }
         throw new UpstreamRequestError(res.statusCode, body, res.headers as Record<string, any>);
       } catch (err: any) {
-        if (err instanceof UpstreamRequestError) throw err;
+        if (err instanceof UpstreamRequestError || err instanceof AccountSchedulingError) throw err;
         this.pool.releaseAccount(account.id);
         if (signal?.aborted) throw err;
         triedAccountIds.delete(account.id);
@@ -403,7 +412,8 @@ export class RequestExecutor {
     maxRetries = 3,
     sessionKey?: string,
     signal?: AbortSignal,
-    requestId?: string
+    requestId?: string,
+    borrowed?: BorrowedCountLease
   ): Promise<UpstreamTokenCountResult> {
     const triedAccountIds = new Set<string>();
     /** An account may only be re-tried once after its token was refreshed. */
@@ -416,31 +426,43 @@ export class RequestExecutor {
       .replace(/streamGenerateContent/i, 'countTokens')
       .replace(/[?&]alt=sse\b/i, '')
       .replace(/[?&]$/, '');
-    const { sessionId: _sessionId, ...countRequest } = payload.request;
+    const { sessionId: _sessionId, toolConfig: _toolConfig, ...countRequest } = payload.request;
     const serializedCountPayload = JSON.stringify({ request: countRequest });
+    let quotaRejections = 0;
+    const quotaBudget = this.pool.getAllAccounts?.().length ?? 1;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       // Token counting is an auxiliary control-plane call. It may establish
       // the request's local account lease, but it must not replace that lease
       // with another account before generation starts, and it must not queue
       // for a busy bound account: generation queues once, not twice.
-      const account = await this.acquireRequestAccount(triedAccountIds, family, sessionKey, signal, false);
+      const account = borrowed?.account ?? await this.acquireRequestAccount(triedAccountIds, family, sessionKey, signal, false, requestId);
       if (!account) throw new Error(`No available ${family} account for token counting.`);
       triedAccountIds.add(account.id);
+      const owned = !borrowed ? this.pool.trackLease?.(account, family, sessionKey) : undefined;
+      let released = false;
+      const releaseAccount = (error?: Parameters<AccountPool['releaseAccount']>[1]) => {
+        if (released) return;
+        released = true;
+        if (borrowed) { if (error) borrowed.release(error); }
+        else if (owned) owned.release(error);
+        else this.pool.releaseAccount(account.id, error, family, sessionKey);
+      };
+
 
       if (!account.accessToken || Date.now() >= account.accessTokenExpiresAt) {
         let ok = false;
         try {
           ok = await this.refresher.refreshSingleAccount(account, signal);
         } catch (err) {
-          this.pool.releaseAccount(account.id);
+          releaseAccount();
           throw err;
         }
         if (!ok) {
           if (account.status === 'dead') {
-            this.pool.releaseAccount(account.id, { code: 401, message: 'Token refresh failed during countTokens' }, family, sessionKey);
+            releaseAccount({ code: 401, message: 'Token refresh failed during countTokens' });
           } else {
-            this.pool.releaseAccount(account.id);
+            releaseAccount();
           }
           throw new UpstreamRequestError(401, 'Token refresh failed during countTokens; account requires re-authentication.');
         }
@@ -480,6 +502,7 @@ export class RequestExecutor {
           bodyTimeout: this.countTimeoutMs,
           connectTimeout: this.connectTimeoutMs,
           dispatcher,
+          transportAttempt: transport,
           signal
         }, effectiveProxy));
         const body = await readErrorBody(res);
@@ -489,7 +512,7 @@ export class RequestExecutor {
             parsed.totalTokens ?? parsed.total_tokens ?? parsed.promptTokenCount ?? parsed.usageMetadata?.promptTokenCount
           );
           if (Number.isFinite(totalTokens)) {
-            this.pool.releaseAccount(account.id);
+            releaseAccount();
             return { totalTokens, accountUsed: account };
           }
           // Let the surrounding transport-error path release this lease once.
@@ -497,10 +520,17 @@ export class RequestExecutor {
           // from another request sharing the same account.
           throw new Error(`countTokens response did not include totalTokens: ${body.slice(0, 300)}`);
         }
+        if (isContextOverflow(res.statusCode, body)) {
+          // The generation attempt owns a borrowed slot, even on this early exit.
+          releaseAccount();
+          console.warn('[Executor] context_overflow req=' + (requestId ?? 'unknown')
+            + ' account=' + account.id + ' model=' + payload.model + ' phase=preflight upstream=' + body.substring(0, 500));
+          throw new ContextOverflowError(res.statusCode, body);
+        }
 
         if (isLocationNotSupported(res.statusCode, body)) {
-          this.pool.releaseAccount(account.id);
-          this.pool.clearSessionBinding(sessionKey, account.id);
+          releaseAccount();
+          this.pool.clearSessionBinding(sessionKey, account.id, undefined, family, 'location_rejected');
           retirePool();
           console.warn('[Executor] countTokens 地区限制；本次请求停止，不在同一出口重复探测。');
           throw new LocationNotSupportedError(res.statusCode, body);
@@ -514,25 +544,25 @@ export class RequestExecutor {
             // generation path: park the account instead of killing a healthy
             // account whose refresh token still works.
             console.error(`[Executor] countTokens rejected a freshly refreshed token for ${account.email}; parking it.`);
-            this.pool.releaseAccount(account.id, {
+            releaseAccount({
               code: 401,
               message: body || 'Repeated 401 after token refresh',
               recoverable: true
-            }, family, sessionKey);
+            });
             throw new UpstreamRequestError(503, `Upstream rejected a freshly refreshed account token during token counting: ${body.substring(0, 300)}`);
           }
           console.warn(`[Executor] countTokens 401 for ${account.email}; refreshing the token once before isolating it.`);
           const refreshOk = await this.refresher.refreshSingleAccount(account);
           if (refreshOk) {
-            this.pool.releaseAccount(account.id);
+            releaseAccount();
             refreshedAccounts.add(account.id);
             triedAccountIds.delete(account.id);
             continue;
           }
           if (account.status === 'dead') {
-            this.pool.releaseAccount(account.id, { code: 401, message: 'Token refresh failed during countTokens' }, family, sessionKey);
+            releaseAccount({ code: 401, message: 'Token refresh failed during countTokens' });
           } else {
-            this.pool.releaseAccount(account.id);
+            releaseAccount();
           }
           throw new UpstreamRequestError(503, `Upstream rejected a freshly refreshed account token during token counting: ${body.substring(0, 300)}`);
         }
@@ -540,7 +570,7 @@ export class RequestExecutor {
         if (res.statusCode === 403) {
           const forbiddenKind = classifyForbidden(res.statusCode, body);
           if (forbiddenKind === 'policy') {
-            this.pool.releaseAccount(account.id, { code: 403, message: body || 'HTTP 403' }, family, sessionKey);
+            releaseAccount({ code: 403, message: body || 'HTTP 403' });
             throw new UpstreamRequestError(res.statusCode, body, res.headers as Record<string, any>);
           }
           const forbiddenCooldown = Math.max(
@@ -548,7 +578,7 @@ export class RequestExecutor {
             5 * 60 * 1000
           );
           console.warn(`[Executor] countTokens 403 (${forbiddenKind}) for ${account.email}; cooling down ${Math.ceil(forbiddenCooldown / 1000)}s.`);
-          this.pool.releaseAccount(account.id, { code: 403, message: body || 'HTTP 403', retryAfterMs: forbiddenCooldown, recoverable: true }, family, sessionKey);
+          releaseAccount({ code: 403, message: body || 'HTTP 403', retryAfterMs: forbiddenCooldown, recoverable: true });
           throw new UpstreamRequestError(
             res.statusCode,
             body,
@@ -559,11 +589,19 @@ export class RequestExecutor {
         const retryDelay = res.statusCode === 429
           ? retryAfterMs(res.headers as Record<string, unknown>, body, this.config.cooldownSeconds * 1000)
           : undefined;
-        this.pool.releaseAccount(account.id, {
+        // A transient auxiliary failure does not invalidate a borrowed generation slot.
+        if (!borrowed || res.statusCode < 500) releaseAccount({
           code: res.statusCode,
           message: body,
           ...(retryDelay === undefined ? {} : { retryAfterMs: retryDelay })
-        }, family, sessionKey);
+        });
+        if (res.statusCode === 429) {
+          if (!borrowed && classifyUpstreamError(429, body).kind === 'quota'
+            && ++quotaRejections <= quotaBudget && this.quotaFailoverAvailable(triedAccountIds, family)) {
+            attempt--; continue;
+          }
+          throw this.rejected429(body, retryDelay!);
+        }
         throw new UpstreamRequestError(
           res.statusCode,
           body,
@@ -572,8 +610,8 @@ export class RequestExecutor {
             : headersWithRetryAfter(res.headers as Record<string, any>, retryDelay)
         );
       } catch (err: any) {
-        if (err instanceof UpstreamRequestError) throw err;
-        this.pool.releaseAccount(account.id);
+        if (err instanceof UpstreamRequestError || err instanceof AccountSchedulingError) throw err;
+        releaseAccount();
         if (signal?.aborted) throw err;
         const errorCode = err?.code || err?.cause?.code || (err?.name && err.name !== 'Error' ? err.name : 'unknown');
         const errorKind = errorCode === 'unknown' ? 'processing error' : 'network error';
@@ -596,7 +634,8 @@ export class RequestExecutor {
     maxRetries = 3,
     sessionKey?: string,
     signal?: AbortSignal,
-    requestId?: string
+    requestId?: string,
+    preflight = false
   ): Promise<UpstreamExecutionResult> {
     const triedAccountIds = new Set<string>();
     /** An account may only be re-tried once after its token was refreshed. */
@@ -611,50 +650,27 @@ export class RequestExecutor {
     // id depends on the account); everything else is encoded once.
     const baseBody = sessionKey ? undefined : JSON.stringify(payload);
 
+    // Explicit quota rejections get a bounded pass across the available pool;
+    // network/transient retries still consume the original retry budget.
+    let quotaRejections = 0;
+    const quotaBudget = this.pool.getAllAccounts?.().length ?? 1;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      const account = await this.acquireRequestAccount(triedAccountIds, family, sessionKey, signal);
+      const account = await this.acquireRequestAccount(triedAccountIds, family, sessionKey, signal, true, requestId);
 
       if (!account) {
-        if (family === 'claude') {
-          let nearestDiff = Infinity;
-          for (const acc of this.pool.getAllAccounts()) {
-            if (acc.quota?.claudeResetTime) {
-              const diff = new Date(acc.quota.claudeResetTime).getTime() - Date.now();
-              if (diff > 0 && diff < nearestDiff) {
-                nearestDiff = diff;
-              }
-            }
-          }
-          const timeHint = nearestDiff !== Infinity
-            ? ` (最近回满倒计时: ${Math.floor(nearestDiff / 3600000)}小时${Math.floor((nearestDiff % 3600000) / 60000)}分)`
-            : '';
-          throw new Error(`当前账号池所有账号的 Claude/GPT 5小时额度均已耗尽${timeHint}。Gemini 额度依然充足可用，建议在客户端切换为 gemini-3.8-flash 等模型，或等待额度自动回满。`);
-        } else if (family === 'gemini') {
-          let nearestDiff = Infinity;
-          for (const acc of this.pool.getAllAccounts()) {
-            if (acc.quota?.geminiResetTime) {
-              const diff = new Date(acc.quota.geminiResetTime).getTime() - Date.now();
-              if (diff > 0 && diff < nearestDiff) {
-                nearestDiff = diff;
-              }
-            }
-          }
-          const timeHint = nearestDiff !== Infinity
-            ? ` (最近回满倒计时: ${Math.floor(nearestDiff / 3600000)}小时${Math.floor((nearestDiff % 3600000) / 60000)}分)`
-            : '';
-          throw new Error(`当前账号池所有账号的 Gemini 5小时额度均已耗尽${timeHint}。Claude / GPT 额度依然充足可用，建议在客户端切换为 claude-3-7-sonnet 等模型，或等待额度自动回满。`);
-        }
-        throw new Error('All accounts in the pool are busy, in cooldown, or exhausted.');
+        throw accountUnavailableError(this.pool.getAllAccounts(), family, triedAccountIds);
       }
 
       triedAccountIds.add(account.id);
+      const lease = this.pool.trackLease?.(account, family, sessionKey);
 
       // A cancellation during backoff must not release another request's lease.
       let released = false;
       const releaseAccount = (error?: Parameters<AccountPool['releaseAccount']>[1], leaseFamily?: 'claude' | 'gemini', leaseKey?: string) => {
         if (released) return;
         released = true;
-        this.pool.releaseAccount(account.id, error, leaseFamily, leaseKey);
+        if (lease) lease.release(error);
+        else this.pool.releaseAccount(account.id, error, leaseFamily, leaseKey);
       };
 
       // 检查 Token 是否需要刷新
@@ -674,7 +690,7 @@ export class RequestExecutor {
             releaseAccount();
             // 首次失败只重试同一账号（多为网络抖动）；连续两次才解除会话绑定换号，
             // 否则绑定失效的账号会把整个请求卡死并误报“额度耗尽”。
-            if (!this.noteRefreshFailure(refreshFailures, account.id, sessionKey)) {
+            if (!this.noteRefreshFailure(refreshFailures, account.id, sessionKey, family)) {
               triedAccountIds.delete(account.id);
             }
           }
@@ -698,7 +714,39 @@ export class RequestExecutor {
         resetDispatcher(effectiveProxy, { timeoutMs: this.connectTimeoutMs }, dispatcher);
       };
       try {
+        let inputTokenCount: number | undefined;
+        if (preflight) {
+          try {
+            const counted = await this.countTokens(payload, 1, sessionKey, signal, requestId,
+              { account, release: error => releaseAccount(error, family, sessionKey) });
+            inputTokenCount = counted.totalTokens;
+            console.info('[Executor] Preflight countTokens req=' + requestId + ' account=' + account.id + ' family=' + family + ' input=' + inputTokenCount);
+          } catch (error: any) {
+            if (signal?.aborted) throw error;
+            if (error instanceof ContextOverflowError) throw error;
+            if (error instanceof AccountSchedulingError && error.code === 'quota_exhausted') {
+              if (++quotaRejections <= quotaBudget && this.quotaFailoverAvailable(triedAccountIds, family)) {
+                console.info('[Scheduler] quota_failover req=' + requestId + ' account=' + account.id + ' family=' + family + ' phase=preflight');
+                attempt--; continue;
+              }
+              throw error;
+            }
+            if (released || error instanceof AccountSchedulingError
+              || (error instanceof UpstreamRequestError && error.statusCode < 500)) throw error;
+            console.warn('[Executor] Preflight countTokens unavailable req=' + requestId + '; generation continues with input usage pending: ' + error.message);
+          }
+        }
         await this.paceAccount(account, signal);
+        const current = this.pool.getAccount ? this.pool.getAccount(account.id) : account;
+        if (!current || current.status === 'dead' || current.status === 'disabled'
+          || (current.status === 'cooldown' && current.cooldownUntil > Date.now())
+          || !hasFamilyQuota(current, family) || (lease && !lease.isCurrent())) {
+          releaseAccount();
+          if (++quotaRejections <= quotaBudget && this.quotaFailoverAvailable(triedAccountIds, family)) {
+            attempt--; continue;
+          }
+          throw new AccountSchedulingError('unavailable', '等待启动期间账号已不可用，本次请求尚未发送，请稍后重试。');
+        }
         dispatcher = effectiveProxy ? getOrCreateDispatcher(effectiveProxy, { timeoutMs: this.connectTimeoutMs }) : undefined;
         transport = new TransportAttempt(dispatcher, requestId);
         // A conversation that migrates accounts must not present the same
@@ -715,6 +763,9 @@ export class RequestExecutor {
           'x-goog-api-client': 'gl-node/22.7.0 grpc-web/1.0.0'
         };
 
+        lease?.markGeneration();
+        console.info('[Executor] generation_start req=' + (requestId ?? 'unknown')
+          + ' account=' + account.id + ' family=' + family + ' model=' + payload.model);
         const res = await transport.run(() => requestUpstream(this.config.upstreamUrl, {
           method: 'POST',
           headers: upstreamHeaders,
@@ -723,6 +774,7 @@ export class RequestExecutor {
           bodyTimeout: this.upstreamTimeoutMs,
           connectTimeout: this.connectTimeoutMs,
           dispatcher,
+          transportAttempt: transport,
           signal
         }, effectiveProxy));
 
@@ -732,7 +784,9 @@ export class RequestExecutor {
             statusCode: res.statusCode,
             headers: res.headers,
             bodyStream: res.body,
-            accountUsed: account
+            accountUsed: account,
+            inputTokenCount,
+            release: error => releaseAccount(error, family, sessionKey)
           };
         }
 
@@ -742,13 +796,12 @@ export class RequestExecutor {
           const retryDelay = retryAfterMs(res.headers as Record<string, unknown>, errBody, this.config.cooldownSeconds * 1000);
           console.warn(`[Executor] 账号 ${account.email} 触发 429 限频/额度枯竭 (第 ${attempt}/${maxRetries} 次尝试)，已记录 ${Math.ceil(retryDelay / 1000)} 秒冷却并停止复用该账号:`, errBody.substring(0, 120));
           releaseAccount({ code: 429, message: errBody || 'HTTP 429', retryAfterMs: retryDelay }, family, sessionKey);
-          // Respect the upstream rate/quota decision for this request. Do not
-          // turn one 429 into a burst of retries across other accounts.
-          throw new UpstreamRequestError(
-            res.statusCode,
-            errBody,
-            headersWithRetryAfter(res.headers as Record<string, any>, retryDelay)
-          );
+          if (classifyUpstreamError(429, errBody).kind === 'quota'
+            && ++quotaRejections <= quotaBudget && this.quotaFailoverAvailable(triedAccountIds, family)) {
+            console.info('[Scheduler] quota_failover req=' + requestId + ' account=' + account.id + ' family=' + family + ' phase=generation');
+            attempt--; continue;
+          }
+          throw this.rejected429(errBody, retryDelay);
         }
 
         // 处理 401 Token 失效
@@ -787,7 +840,7 @@ export class RequestExecutor {
               releaseAccount({ code: 401, message: 'Token refresh failed' }, family, sessionKey);
             } else {
               releaseAccount();
-              if (!this.noteRefreshFailure(refreshFailures, account.id, sessionKey)) {
+              if (!this.noteRefreshFailure(refreshFailures, account.id, sessionKey, family)) {
                 triedAccountIds.delete(account.id);
               }
             }
@@ -801,7 +854,7 @@ export class RequestExecutor {
           const forbiddenKind = classifyForbidden(res.statusCode, errBody);
           if (forbiddenKind === 'location') {
             releaseAccount();
-            this.pool.clearSessionBinding(sessionKey, account.id);
+            this.pool.clearSessionBinding(sessionKey, account.id, undefined, family, 'location_rejected');
             retirePool();
             console.warn('[Executor] 生成请求地区限制；本次请求停止，不在同一出口重复探测。');
             throw new LocationNotSupportedError(res.statusCode, errBody);
@@ -848,10 +901,14 @@ export class RequestExecutor {
         const errBody = await readErrorBody(res);
         releaseAccount();
         if (isContextOverflow(res.statusCode, errBody)) {
+          console.warn('[Executor] context_overflow req=' + (requestId ?? 'unknown')
+            + ' account=' + account.id + ' model=' + payload.model + ' input=' + (inputTokenCount ?? 'unknown')
+            + ' max_output=' + (payload.request.generationConfig?.maxOutputTokens ?? 'default')
+            + ' upstream=' + errBody.substring(0, 500));
           throw new ContextOverflowError(res.statusCode, errBody);
         }
         if (isLocationNotSupported(res.statusCode, errBody)) {
-          this.pool.clearSessionBinding(sessionKey, account.id);
+          this.pool.clearSessionBinding(sessionKey, account.id, undefined, family, 'location_rejected');
           retirePool();
           console.error(`[Executor] 🚨 账号 ${account.email} 遭遇 Google 地区限制: User location is not supported for the API use. 本次请求已停止。`);
           console.error(`[Executor] 💡 原因定位：当前代理出口节点或其所属数据中心机房段 (ASN) 被 Google API 判定为不受支持地区。`);
@@ -863,6 +920,11 @@ export class RequestExecutor {
       } catch (err: any) {
         // 协议错误已完成账号释放，不允许被 catch 当成网络异常后再换号。
         if (err instanceof UpstreamRequestError) {
+          releaseAccount();
+          throw err;
+        }
+        if (err instanceof AccountSchedulingError) {
+          releaseAccount();
           throw err;
         }
         if (signal?.aborted) {

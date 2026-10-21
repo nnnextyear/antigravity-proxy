@@ -93,7 +93,7 @@ test('a malformed proxy URL still releases the account lease', async () => {
   }
 });
 
-test('a generation 429 cools the account down and is never rotated', async () => {
+test('an ambiguous generation 429 cools the account without rotating and returns local 503', async () => {
   let calls = 0;
   const upstream = await withUpstream((_req, res) => {
     calls++;
@@ -106,7 +106,7 @@ test('a generation 429 cools the account down and is never rotated', async () =>
   const executor = new RequestExecutor(pool as any, { refreshSingleAccount: async () => true } as any, config(upstream.url));
 
   try {
-    await assert.rejects(executor.executeWithRetry(payload(), 3), (error: any) => error?.statusCode === 429);
+    await assert.rejects(executor.executeWithRetry(payload(), 3), (error: any) => error?.statusCode === 503 && error?.code === 'rate_limited');
     assert.equal(calls, 1, 'one 429 must not become a burst of retries');
     assert.equal(acc.activeConcurrency, 0);
     assert.equal(pool.releases.length, 1, 'the lease must be released exactly once');

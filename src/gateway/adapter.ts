@@ -11,30 +11,7 @@ import {
   LiveModelCatalog
 } from './models.js';
 
-// CloudCode accepts a restricted protobuf-style schema. Keep the useful
-// structural fields and drop JSON-Schema keywords that routinely cause 400s.
-function sanitizeGoogleSchema(value: any): any {
-  // Google Schema uses one Schema object for array.items. JSON Schema also
-  // permits tuple arrays and omitted items, so collapse those forms to a
-  // concrete child schema instead of sending an empty Proto message.
-  if (Array.isArray(value)) {
-    return sanitizeGoogleSchema(value[0] || { type: 'string' });
-  }
-  if (!value || typeof value !== 'object') return value;
-  const result: any = {};
-  for (const [key, child] of Object.entries(value)) {
-    if (['$schema', '$id', '$defs', 'definitions', 'propertyNames', 'additionalProperties', 'unevaluatedProperties', 'exclusiveMinimum', 'exclusiveMaximum', 'minLength', 'maxLength', 'pattern', 'minItems', 'maxItems', 'uniqueItems'].includes(key)) continue;
-    result[key] = sanitizeGoogleSchema(child);
-  }
-  if (!result.type) {
-    result.type = result.properties ? 'object' : result.items ? 'array' : result.enum ? 'string' : 'string';
-  }
-  if (result.type === 'object' && !result.properties) result.properties = {};
-  if (result.type === 'array') {
-    result.items = sanitizeGoogleSchema(result.items || { type: 'string' });
-  }
-  return result;
-}
+import { sanitizeGoogleSchema } from './anthropic.js';
 
 /**
  * 将 OpenAI 格式的 chat completions 请求转换为 Google CloudCode / Gemini 内部 payload
@@ -174,14 +151,17 @@ export function convertOpenAIToCloudCode(req: OpenAIChatCompletionRequest, catal
     }];
   }
   if (req.tool_choice && req.tool_choice !== 'auto') {
-    innerRequest.toolConfig = {
-      functionCallingConfig: {
-        mode: req.tool_choice === 'required' ? 'ANY' : 'AUTO',
-        ...(req.tool_choice?.function?.name ? { allowedFunctionNames: [normalizeToolName(req.tool_choice.function.name)] } : {})
-      }
-    };
+    if (req.tool_choice === 'none') {
+      delete innerRequest.tools;
+    } else {
+      innerRequest.toolConfig = {
+        functionCallingConfig: {
+          mode: req.tool_choice === 'required' ? 'ANY' : 'AUTO',
+          ...(req.tool_choice?.function?.name ? { allowedFunctionNames: [normalizeToolName(req.tool_choice.function.name)] } : {})
+        }
+      };
+    }
   }
-
   const payload: GoogleCloudCodePayload = {
     project: 'aicode-consumers',
     model: modelDef.upstreamModel,

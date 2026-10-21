@@ -14,7 +14,7 @@ async function main() {
   console.log('====================================================');
 
   const config = loadConfig();
-  const pool = new AccountPool(config.routingStrategy || 'zero-waste');
+  const pool = new AccountPool(config.routingStrategy || 'zero-waste', undefined, config.activeConversationTtlMs);
   const refresher = new TokenRefresher(pool, config);
   const quotaManager = new QuotaManager(pool, config);
   const executor = new RequestExecutor(pool, refresher, config, quotaManager);
@@ -28,11 +28,6 @@ async function main() {
     pool.getAllAccounts().map(account => account.proxyUrl),
     config.defaultProxyUrl
   );
-  if (sharedEgress) {
-    console.warn(`\n⚠️  [账号隔离提醒] ${sharedEgress}。`);
-    console.warn('   共用出口 IP / 连接池 / TLS 会话会让 Google 把多个账号关联为同一实体，');
-    console.warn('   建议在 Web 控制台为每个账号单独配置出口代理 (proxyUrl)，实现真正的账号隔离。\n');
-  }
 
   // 启动 Web 服务
   const server = await createServer(config, pool, refresher, executor, quotaManager);
@@ -53,38 +48,48 @@ async function main() {
     console.log(`   👉 Model List:       http://localhost:${config.port}/v1/models`);
     console.log(`   🔑 Client API Key:   ${config.apiMasterKey}`);
 
-    // 出口代理连通性与节点地区自动探测
+    // 出口连通性与节点地区自动探测
     const activeProxy = config.defaultProxyUrl;
-    if (activeProxy) {
-      // A bad proxy URL must not abort the boot: the dashboard is the place to
-      // fix it, and every request already reports the same clear error.
-      let probeDisp: ReturnType<typeof getOrCreateDispatcher> | undefined;
+    // A bad proxy URL must not abort the boot: the dashboard is the place to
+    // fix it, and every request already reports the same clear error.
+    void (async () => {
       try {
-        probeDisp = getOrCreateDispatcher(activeProxy);
+        const probeDisp = activeProxy ? getOrCreateDispatcher(activeProxy) : undefined;
+        const response = await request('https://ipinfo.io/json', {
+          dispatcher: probeDisp,
+          headersTimeout: 5000,
+          bodyTimeout: 5000
+        });
+        if (response.statusCode !== 200) throw new Error(`ipinfo.io returned HTTP ${response.statusCode}`);
+        const info = (await response.body.json()) as { ip?: string; country?: string; city?: string; org?: string };
+        const region = [info.country, info.city].filter(Boolean).join(' - ') || '未知';
+        const isGoogleBlocked = ['HK', 'CN', 'MO', 'RU', 'IR'].includes(info.country || '');
+
+        console.log(`\n🌐 [代理出口诊断]:`);
+        console.log(`   📡 本地代理: ${activeProxy || 'direct'}`);
+        console.log(`   🌍 出口 IP:   ${info.ip || '未知'} (${region}) [${info.org || ''}]`);
+        if (isGoogleBlocked) {
+          console.log(`   🚨 地区警告:  当前出口为 ${info.country}，Google Gemini API 明确禁止此地区！请在 Clash 中切换为 US/JP/SG 节点！`);
+        } else {
+          console.log(`   ✅ 状态良好:  Google Gemini API 支持该地区 (${info.country || '未知'})`);
+        }
+
+        if (sharedEgress) {
+          console.warn(`\n⚠️  [账号隔离提醒] ${sharedEgress}。`);
+          console.warn(`   当前节点地区: ${region} (出口 IP: ${info.ip || '未知'})`);
+          console.warn('   共用出口 IP / 连接池 / TLS 会话会让 Google 把多个账号关联为同一实体，');
+          console.warn('   建议在 Web 控制台为每个账号单独配置出口代理 (proxyUrl)，实现真正的账号隔离。\n');
+        }
       } catch (err: any) {
-        console.error(`\n⚠️  [代理出口诊断]: ${err.message}`);
+        console.warn(`\n⚠️ [代理出口诊断]: 无法检测当前节点地区 (${err.message})。`);
+        if (sharedEgress) {
+          console.warn(`\n⚠️  [账号隔离提醒] ${sharedEgress}。`);
+          console.warn('   当前节点地区: 未知 (出口地区检测失败)');
+          console.warn('   共用出口 IP / 连接池 / TLS 会话会让 Google 把多个账号关联为同一实体，');
+          console.warn('   建议在 Web 控制台为每个账号单独配置出口代理 (proxyUrl)，实现真正的账号隔离。\n');
+        }
       }
-      if (probeDisp) {
-        request('https://ipinfo.io/json', { dispatcher: probeDisp, headersTimeout: 5000, bodyTimeout: 5000 })
-          .then(async r => {
-            if (r.statusCode === 200) {
-              const info = (await r.body.json()) as any;
-              const isGoogleBlocked = ['HK', 'CN', 'MO', 'RU', 'IR'].includes(info.country);
-              console.log(`\n🌐 [代理出口诊断]:`);
-              console.log(`   📡 本地代理: ${activeProxy}`);
-              console.log(`   🌍 出口 IP:   ${info.ip} (${info.country} - ${info.city || 'Unknown'}) [${info.org || ''}]`);
-              if (isGoogleBlocked) {
-                console.log(`   🚨 地区警告:  当前出口为 ${info.country}，Google Gemini API 明确禁止此地区！请在 Clash 中切换为 US/JP/SG 节点！`);
-              } else {
-                console.log(`   ✅ 状态良好:  Google Gemini API 支持该地区 (${info.country})`);
-              }
-            }
-          })
-          .catch(err => {
-            console.warn(`\n⚠️ [代理出口诊断]: 无法通过代理 ${activeProxy} 访问外网 (${err.message})，请确保 Clash 正在运行且端口正确。`);
-          });
-      }
-    }
+    })();
 
     console.log('\n====================================================\n');
   } catch (err) {

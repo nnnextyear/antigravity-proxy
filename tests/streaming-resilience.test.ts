@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import fastify from 'fastify';
 import { registerAnthropicRoutes } from '../src/gateway/anthropic.js';
 import { ContextOverflowError, LocationNotSupportedError, UpstreamRequestError } from '../src/pool/breaker.js';
+import { AccountSchedulingError } from '../src/pool/scheduling.js';
 import type { AppConfig } from '../src/types.js';
 
 // The gateway must never reach a real proxy or the real upstream from a test.
@@ -122,7 +123,8 @@ test('a context-overflow after the waiting keepalive reaches the client instead 
     assert.ok(elapsedMs < 6000, `error frame arrived after ${elapsedMs}ms`);
     assert.ok(body.includes('event: error'), `expected an SSE error event, got: ${body.slice(0, 300)}`);
     assert.match(body, /invalid_request_error/);
-    assert.match(body, /compact/i);
+    assert.match(body, /prompt is too long/i);
+    assert.match(body, /context_length_exceeded/);
   } finally {
     await app.close();
   }
@@ -149,13 +151,13 @@ test('a location block after the waiting keepalive reaches the client', async ()
   }
 });
 
-test('a 429 after the waiting keepalive still carries its retry hint in-band', async () => {
+test('a local rate limit after the waiting keepalive carries 503 and its retry hint in-band', async () => {
   const executor = {
     fetchAvailableModels: async () => catalog(),
     countTokens: async () => ({ totalTokens: 10 }),
     executeWithRetry: async () => {
       await sleep(KEEPALIVE_MS + 600);
-      throw new UpstreamRequestError(429, '{"error":{"status":"RESOURCE_EXHAUSTED"}}', { 'retry-after': '7' });
+      throw new AccountSchedulingError('rate_limited', 'Upstream temporarily limited request frequency.', 7);
     }
   };
   const { app, url } = await startGateway(executor, { releaseAccount() {}, recordTokenUsage() {} });
@@ -166,6 +168,9 @@ test('a 429 after the waiting keepalive still carries its retry hint in-band', a
     assert.ok(body.includes('event: error'), `expected an SSE error event, got: ${body.slice(0, 300)}`);
     assert.match(body, /retry_after/);
     assert.match(body, /"retry_after":"7"/);
+    assert.match(body, /"status":503/);
+    assert.match(body, /"code":"rate_limited"/);
+    assert.ok(!body.includes('429'));
   } finally {
     await app.close();
   }
@@ -175,25 +180,25 @@ test('errors before the first keepalive still use a real HTTP status', async () 
   const executor = {
     fetchAvailableModels: async () => catalog(),
     countTokens: async () => ({ totalTokens: 10 }),
-    executeWithRetry: async () => { throw new UpstreamRequestError(429, '{"error":"rate limited"}', { 'retry-after': '11' }); }
+    executeWithRetry: async () => { throw new AccountSchedulingError('rate_limited', 'Upstream temporarily limited request frequency.', 11); }
   };
   const { app, url } = await startGateway(executor, { releaseAccount() {}, recordTokenUsage() {} });
 
   try {
     const { response } = await streamRequest(url);
-    assert.equal(response.status, 429);
+    assert.equal(response.status, 503);
     assert.equal(response.headers.get('retry-after'), '11');
   } finally {
     await app.close();
   }
 });
 
-test('a transient countTokens failure no longer blocks generation', async () => {
+test('the gateway completes when the executor recovers from an auxiliary preflight failure', async () => {
   let generated = 0;
   const executor = {
     fetchAvailableModels: async () => catalog(),
-    countTokens: async () => { throw new Error('fetch failed'); },
-    executeWithRetry: async () => {
+    executeWithRetry: async (_payload: unknown, _retries: number, _key: string, _signal: AbortSignal, _id: string, preflight: boolean) => {
+      assert.equal(preflight, true);
       generated++;
       return {
         accountUsed: { id: 'acc-1' },
@@ -212,19 +217,18 @@ test('a transient countTokens failure no longer blocks generation', async () => 
   }
 });
 
-test('an account-level countTokens rejection still stops generation', async () => {
-  let generated = 0;
+test('an account-level preflight rejection from the executor reaches the gateway client', async () => {
+  let executions = 0;
   const executor = {
     fetchAvailableModels: async () => catalog(),
-    countTokens: async () => { throw new UpstreamRequestError(403, '{"error":{"reason":"TOS_VIOLATION"}}'); },
-    executeWithRetry: async () => { generated++; throw new Error('must not run'); }
+    executeWithRetry: async () => { executions++; throw new UpstreamRequestError(403, '{"error":{"reason":"TOS_VIOLATION"}}'); }
   };
   const { app, url } = await startGateway(executor, { releaseAccount() {}, recordTokenUsage() {} });
 
   try {
     const { response } = await streamRequest(url);
     assert.equal(response.status, 403);
-    assert.equal(generated, 0);
+    assert.equal(executions, 1);
   } finally {
     await app.close();
   }

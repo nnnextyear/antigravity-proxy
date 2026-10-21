@@ -232,7 +232,7 @@ export function registerAdminRoutes(
       await refresher.refreshSingleAccount(acc);
     }
     const quota = await quotaManager.fetchQuotaForAccount(acc, { forceRefresh: true });
-    return { success: Boolean(quota), quota, account: acc };
+    return { success: Boolean(quota), quota, account: pool.getAccount(params.id) ?? null };
   });
 
   // 8. 一键刷新全池所有账号的真实额度

@@ -8,6 +8,11 @@ import { jittered } from './transport.js';
 /** How often a validation-flagged account is re-probed before giving up. */
 const VALIDATION_RECHECK_MS = 30 * 60 * 1000;
 
+function parseFraction(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.round(Math.max(0, Math.min(1, value)) * 10000) / 10000 : undefined;
+}
+
 export interface QuotaPollGate {
   /** Timestamp until which the quota endpoint asked us to stay away. */
   pausedUntil?: number;
@@ -89,6 +94,7 @@ export class QuotaManager {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         const dispatcher = effectiveProxy ? getOrCreateDispatcher(effectiveProxy, { timeoutMs: 30000 }) : undefined;
+        // Antigravity 配额查询端点
         res = await request('https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary', {
           method: 'POST',
           headers: {
@@ -165,15 +171,15 @@ export class QuotaManager {
       const data = (await res.body.json()) as any;
       const groups = data.groups || [];
 
-      let geminiWeekly = 1.0;
-      let gemini5h = 1.0;
+      let geminiWeekly: number | undefined;
+      let gemini5h: number | undefined;
       let geminiResetTime = '';
       let geminiWeeklyResetTime = '';
       let gemini5hDesc = '';
       let geminiWeeklyDesc = '';
 
-      let claudeWeekly = 1.0;
-      let claude5h = 1.0;
+      let claudeWeekly: number | undefined;
+      let claude5h: number | undefined;
       let claudeResetTime = '';
       let claudeWeeklyResetTime = '';
       let claude5hDesc = '';
@@ -186,12 +192,12 @@ export class QuotaManager {
         if (dName.includes('gemini')) {
           for (const b of buckets) {
             if (b.window === 'weekly' || b.bucketId === 'gemini-weekly') {
-              geminiWeekly = typeof b.remainingFraction === 'number' ? b.remainingFraction : 1.0;
+              geminiWeekly = parseFraction(b.remainingFraction);
               if (b.resetTime) geminiWeeklyResetTime = b.resetTime;
               if (b.description) geminiWeeklyDesc = b.description;
             }
             if (b.window === '5h' || b.bucketId === 'gemini-5h') {
-              gemini5h = typeof b.remainingFraction === 'number' ? b.remainingFraction : 1.0;
+              gemini5h = parseFraction(b.remainingFraction);
               if (b.resetTime) geminiResetTime = b.resetTime;
               if (b.description) gemini5hDesc = b.description;
             }
@@ -199,12 +205,12 @@ export class QuotaManager {
         } else if (dName.includes('claude') || dName.includes('gpt')) {
           for (const b of buckets) {
             if (b.window === 'weekly' || b.bucketId === '3p-weekly') {
-              claudeWeekly = typeof b.remainingFraction === 'number' ? b.remainingFraction : 1.0;
+              claudeWeekly = parseFraction(b.remainingFraction);
               if (b.resetTime) claudeWeeklyResetTime = b.resetTime;
               if (b.description) claudeWeeklyDesc = b.description;
             }
             if (b.window === '5h' || b.bucketId === '3p-5h') {
-              claude5h = typeof b.remainingFraction === 'number' ? b.remainingFraction : 1.0;
+              claude5h = parseFraction(b.remainingFraction);
               if (b.resetTime) claudeResetTime = b.resetTime;
               if (b.description) claude5hDesc = b.description;
             }
@@ -213,14 +219,14 @@ export class QuotaManager {
       }
 
       const quota: AccountQuota = {
-        geminiWeeklyFraction: Math.round(geminiWeekly * 10000) / 10000,
-        gemini5hFraction: Math.round(gemini5h * 10000) / 10000,
+        geminiWeeklyFraction: geminiWeekly,
+        gemini5hFraction: gemini5h,
         geminiResetTime: geminiResetTime || undefined,
         geminiWeeklyResetTime: geminiWeeklyResetTime || undefined,
         gemini5hDesc: gemini5hDesc || undefined,
         geminiWeeklyDesc: geminiWeeklyDesc || undefined,
-        claudeWeeklyFraction: Math.round(claudeWeekly * 10000) / 10000,
-        claude5hFraction: Math.round(claude5h * 10000) / 10000,
+        claudeWeeklyFraction: claudeWeekly,
+        claude5hFraction: claude5h,
         claudeResetTime: claudeResetTime || undefined,
         claudeWeeklyResetTime: claudeWeeklyResetTime || undefined,
         claude5hDesc: claude5hDesc || undefined,
@@ -228,16 +234,18 @@ export class QuotaManager {
         lastCheckedAt: Date.now()
       };
 
-      const preserveTerminalReason = account.status === 'dead' || account.status === 'disabled';
-      account.quota = quota;
-      account.validationUrl = undefined;
-      if (!preserveTerminalReason) account.lastError = undefined;
-      this.pool.updateAccount(account.id, {
+      // A file reload can replace the account object while this poll is in flight.
+      // Commit against live state so a new quota rejection cannot be overwritten.
+      const current = this.pool.getAccount(account.id);
+      if (!current) return null;
+      const preserveReason = current.status === 'dead' || current.status === 'disabled'
+        || Object.values(current.quotaBlockedUntil ?? {}).some(until => until > Date.now());
+      const updated = this.pool.updateAccount(account.id, {
         quota,
         validationUrl: undefined,
-        ...(preserveTerminalReason ? {} : { lastError: undefined })
+        ...(preserveReason ? {} : { lastError: undefined })
       });
-      return quota;
+      return updated?.quota ?? null;
     } catch (err: any) {
       console.error(`[QuotaManager] Error fetching quota for ${account.email}:`, err.message);
       return null;

@@ -44,6 +44,29 @@ export function isLocationError(statusCode: number, body: string): boolean {
   );
 }
 
+/** Match prompt/context exhaustion without treating output-budget or schema errors as it. */
+export function isContextOverflow(statusCode: number, body: string): boolean {
+  if (statusCode !== 400 && statusCode !== 413) return false;
+  const fields = errorFields(body);
+  return /context_length_exceeded|context_window_exceeded|prompt_too_long/i.test([fields.reason, fields.status].join(' '))
+    || /prompt is too long|input is too long for requested model/i.test(fields.message || body)
+    || /(?:input|prompt) token (?:count|length).{0,100}(?:exceeds?|too (?:long|large))/i.test(fields.message || body)
+    || /input length and [`']?max_tokens[`']? exceed context limit/i.test(fields.message || body)
+    || /(?:context (?:length|window|limit).{0,60}(?:exceed|too (?:long|large))|exceed.{0,60}context (?:length|window|limit))/i.test(fields.message || body);
+}
+
+/** Claude Code uses these native phrases to enter its context recovery path. */
+export function contextOverflowMessage(body: string): string {
+  const message = (errorFields(body).message || body).trim();
+  if (/input length and [`']?max_tokens[`']? exceed context limit/i.test(message)) {
+    return 'input length and `max_tokens` exceed context limit';
+  }
+  const counts = message.match(/(?:prompt is too long|input token count)[^0-9]*(\d+)\s*(?:tokens?\s*)?>\s*(\d+)/i)
+    || message.match(/input token count[^0-9]*(\d+)[^0-9]+(?:maximum number of tokens|context limit)[^0-9]*(\d+)/i);
+  return counts ? `prompt is too long: ${counts[1]} tokens > ${counts[2]} maximum`
+    : 'prompt is too long: input exceeds the upstream model context window';
+}
+
 /** Upstream reasons that mean "this account is finished", not "retry later". */
 const TERMINAL_POLICY_REASONS = new Set([
   'TOS_VIOLATION',
@@ -88,8 +111,11 @@ export function classifyUpstreamError(statusCode: number, body: string): Classif
     return { kind: 'authentication', reason: fields.reason || (isInvalidGrantError(statusCode, body) ? 'invalid_grant' : undefined), message };
   }
   if (statusCode === 429) {
-    const lower = body.toLowerCase();
-    const kind = /quota|resource_exhausted|exhausted/i.test(lower) ? 'quota' : 'rate_limit';
+    // RESOURCE_EXHAUSTED is also used for short-term RPM throttling. Only
+    // explicit quota signals permit an account-local quota failover.
+    const kind = fields.reason?.toUpperCase() === 'QUOTA_EXHAUSTED'
+      || /individual quota reached|quota (?:has been |is )?(?:exhausted|reached)/i.test(message)
+      ? 'quota' : 'rate_limit';
     return { kind, reason: fields.reason, message };
   }
   if (statusCode === 408 || statusCode === 425 || statusCode >= 500) {
@@ -110,15 +136,13 @@ function parseDelay(value: unknown): number | undefined {
   if (Number.isFinite(numeric)) return Math.max(0, numeric * 1000);
   const dateMs = Date.parse(trimmed);
   if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
-  const match = trimmed.match(/^(\d+(?:\.\d+)?)(ms|s|m|h)$/i);
-  if (!match) return undefined;
-  const amount = Number(match[1]);
-  const unit = match[2].toLowerCase();
-  const multiplier = unit === 'ms' ? 1 : unit === 's' ? 1000 : unit === 'm' ? 60000 : 3600000;
-  return Math.max(0, amount * multiplier);
+  const parts = [...trimmed.matchAll(/(\d+(?:\.\d+)?)(ms|s|m|h)/gi)];
+  if (!parts.length || parts.map(part => part[0]).join('') !== trimmed) return undefined;
+  return parts.reduce((sum, part) => sum + Number(part[1]) *
+    ({ ms: 1, s: 1000, m: 60000, h: 3600000 }[part[2].toLowerCase()] ?? 0), 0);
 }
 
-/** Prefer upstream retry hints; cap them so a malformed response cannot block forever. */
+/** Quota resets are a lower bound even when Retry-After asks for a shorter wait. */
 export function retryAfterMs(
   headers?: Record<string, unknown>,
   body?: string,
@@ -126,16 +150,17 @@ export function retryAfterMs(
 ): number {
   const headerValue = headers?.['retry-after'] ?? headers?.['Retry-After'];
   const headerDelay = parseDelay(headerValue);
-  if (headerDelay !== undefined) return Math.min(Math.max(headerDelay, 1000), 24 * 60 * 60 * 1000);
+  const explicitQuota = !!body && classifyUpstreamError(429, body).kind === 'quota';
+  if (headerDelay !== undefined && !explicitQuota) return Math.min(Math.max(headerDelay, 1000), 24 * 60 * 60 * 1000);
 
   const parsed = body ? parseJson(body) : undefined;
   const details = parsed?.error?.details || parsed?.details;
   if (Array.isArray(details)) {
-    for (const detail of details) {
-      const delay = parseDelay(detail?.retryDelay ?? detail?.quotaResetDelay);
-      if (delay !== undefined) return Math.min(Math.max(delay, 1000), 24 * 60 * 60 * 1000);
-    }
+    const delays = details.flatMap((detail: any) => [detail?.retryDelay, detail?.quotaResetDelay,
+      detail?.metadata?.quotaResetTimeStamp, detail?.metadata?.quotaResetDelay])
+      .map(parseDelay).filter((delay: number | undefined): delay is number => delay !== undefined);
+    if (delays.length) return Math.min(Math.max(...delays, headerDelay ?? 0, 1000), 24 * 60 * 60 * 1000);
   }
 
-  return Math.min(Math.max(fallbackMs, 1000), 24 * 60 * 60 * 1000);
+  return Math.min(Math.max(headerDelay ?? fallbackMs, 1000), 24 * 60 * 60 * 1000);
 }

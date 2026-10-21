@@ -3,6 +3,12 @@ let pollTimer = null;
 let currentFilter = 'all'; // 'all' | 'active' | 'cooldown' | 'dead'
 let searchQuery = '';
 let cachedAccounts = [];
+let dataRefreshVersion = 0;
+let appliedDataRefreshVersion = 0;
+let dataPollingEpoch = 0;
+let confirmedRoutingStrategy = '';
+let strategySaving = false;
+let dashboardApiKey = null;
 
 // DOM 元素
 const loginOverlay = document.getElementById('login-overlay');
@@ -93,15 +99,9 @@ function initStrategyDropdown() {
   options.forEach(opt => {
     opt.addEventListener('click', async () => {
       const strategy = opt.getAttribute('data-strategy');
-      if (!strategy) return;
-
-      options.forEach(o => o.classList.remove('active'));
-      opt.classList.add('active');
-
+      if (!strategy || strategySaving) return;
+      strategySaving = true;
       const nameEl = opt.querySelector('.opt-name');
-      if (nameEl && strategyActiveName) {
-        strategyActiveName.innerText = nameEl.innerText;
-      }
 
       strategyDropdown.classList.remove('open');
 
@@ -110,15 +110,20 @@ function initStrategyDropdown() {
           method: 'POST',
           body: JSON.stringify({ strategy })
         });
-        showToast(res.message || `已切换为: ${nameEl.innerText}`, 'success');
+        syncStrategyDropdown(strategy);
+        showToast(res.message || `已切换为: ${nameEl?.textContent.trim() || strategy}`, 'success');
       } catch (err) {
+        syncStrategyDropdown(confirmedRoutingStrategy);
         showToast(`切换策略失败: ${err.message}`, 'error');
+      } finally {
+        strategySaving = false;
       }
     });
   });
 }
 
 function syncStrategyDropdown(strategy) {
+  confirmedRoutingStrategy = strategy;
   if (!strategyPopover || !strategyActiveName) return;
   const options = strategyPopover.querySelectorAll('.popover-option');
   options.forEach(opt => {
@@ -127,7 +132,7 @@ function syncStrategyDropdown(strategy) {
       options.forEach(o => o.classList.remove('active'));
       opt.classList.add('active');
       const nameEl = opt.querySelector('.opt-name');
-      if (nameEl) strategyActiveName.innerText = nameEl.innerText;
+      if (nameEl) strategyActiveName.innerText = nameEl.textContent.trim();
     }
   });
 }
@@ -156,12 +161,7 @@ function init() {
     loginOverlay.style.display = 'flex';
   });
 
-  btnRefreshData.addEventListener('click', () => {
-    btnRefreshData.disabled = true;
-    loadAllData().finally(() => {
-      setTimeout(() => { btnRefreshData.disabled = false; }, 300);
-    });
-  });
+  btnRefreshData.addEventListener('click', () => manualRefreshData(btnRefreshData));
 
   // 复制 API Base URL
   const apiBadge = document.getElementById('api-endpoint-badge');
@@ -180,11 +180,14 @@ function init() {
   const apiKeyBadge = document.getElementById('api-key-badge');
   if (apiKeyBadge) {
     apiKeyBadge.addEventListener('click', () => {
-      const codeEl = document.getElementById('api-key-text');
-      const key = codeEl ? codeEl.innerText.trim() : 'sk-antigravity';
+      const key = dashboardApiKey;
+      if (!key) {
+        showToast(key === '' ? '当前服务未设置 API Key' : 'API Key 尚未加载，请稍后重试', 'info');
+        return;
+      }
       navigator.clipboard.writeText(key).then(() => {
-        showToast(`已复制 API Key: ${key}`, 'success');
-      });
+        showToast('已复制 API Key', 'success');
+      }).catch(() => showToast('复制失败，请手动复制页面中的 API Key', 'error'));
     });
   }
 
@@ -305,8 +308,9 @@ async function apiRequest(url, options = {}) {
   const res = await fetch(url, fetchOptions);
   if (res.status === 401) {
     stopDataPolling();
-    loginOverlay.style.display = 'flex';
-    loginError.innerText = '密码错误或会话已失效，请重新输入';
+    adminPassword = '';
+    if (loginOverlay) loginOverlay.style.display = 'flex';
+    if (loginError) loginError.innerText = '密码错误或会话已失效，请重新输入';
     localStorage.removeItem('antigravity_admin_pass');
     throw new Error('Unauthorized');
   }
@@ -335,24 +339,52 @@ async function handleLogin() {
 }
 
 function startDataPolling() {
+  loadDashboardConfig();
   loadAllData();
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(loadAllData, 4000);
 }
 
 function stopDataPolling() {
+  dataPollingEpoch++;
+  dashboardApiKey = null;
+  const keyText = document.getElementById('api-key-text');
+  if (keyText) keyText.innerText = '未加载';
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
   }
 }
 
+async function loadDashboardConfig() {
+  const epoch = dataPollingEpoch;
+  const endpoint = document.getElementById('api-endpoint-text');
+  if (endpoint) endpoint.innerText = `${window.location.origin}/v1`;
+  try {
+    const config = await apiRequest('/api/admin/config');
+    if (epoch !== dataPollingEpoch) return;
+    dashboardApiKey = typeof config.apiMasterKey === 'string' ? config.apiMasterKey : '';
+    const keyText = document.getElementById('api-key-text');
+    if (keyText) keyText.innerText = dashboardApiKey || '未设置';
+  } catch {
+    if (epoch !== dataPollingEpoch) return;
+    dashboardApiKey = null;
+    const keyText = document.getElementById('api-key-text');
+    if (keyText) keyText.innerText = '加载失败';
+  }
+}
+
 async function loadAllData() {
+  const refreshVersion = ++dataRefreshVersion;
+  const pollingEpoch = dataPollingEpoch;
   try {
     const [stats, accountsData] = await Promise.all([
       apiRequest('/api/admin/stats'),
       apiRequest('/api/admin/accounts')
     ]);
+    // Ignore stale responses without starving updates when polling is slow.
+    if (pollingEpoch !== dataPollingEpoch || refreshVersion < appliedDataRefreshVersion) return;
+    appliedDataRefreshVersion = refreshVersion;
 
     cachedAccounts = accountsData.accounts || [];
 
@@ -385,7 +417,7 @@ async function loadAllData() {
     const badgeTextEl = document.getElementById('stat-active-badge-text');
     if (badgeTextEl) badgeTextEl.innerText = `${stats.activeAccounts} 活跃`;
 
-    if (stats && stats.routingStrategy) {
+    if (stats && stats.routingStrategy && !strategySaving) {
       syncStrategyDropdown(stats.routingStrategy);
     }
 
@@ -406,65 +438,55 @@ async function loadAllData() {
     if (cDead) cDead.innerText = deadCount;
 
     // 计算全局可用率与平均额度
-    let c5hSum = 0, cWeeklySum = 0, cCount = 0, cActiveAvail = 0;
-    let g5hSum = 0, gWeeklySum = 0, gCount = 0, gActiveAvail = 0;
-
-    for (const acc of cachedAccounts) {
-      if (acc.status !== 'disabled' && acc.quota) {
-        const c5h = (acc.quota.claude5hFraction ?? 1);
-        c5hSum += c5h;
-        cWeeklySum += (acc.quota.claudeWeeklyFraction ?? 1);
-        cCount++;
-        if (acc.status === 'active' && c5h > 0.05) cActiveAvail++;
-
-        const g5h = (acc.quota.gemini5hFraction ?? 1);
-        g5hSum += g5h;
-        gWeeklySum += (acc.quota.geminiWeeklyFraction ?? 1);
-        gCount++;
-        if (acc.status === 'active' && g5h > 0.05) gActiveAvail++;
-      }
-    }
-
-    const cAvg = cCount > 0 ? (c5hSum / cCount * 100) : 0;
-    const gAvg = gCount > 0 ? (g5hSum / gCount * 100) : 0;
-    const cWAvg = cCount > 0 ? (cWeeklySum / cCount * 100) : 0;
-    const gWAvg = gCount > 0 ? (gWeeklySum / gCount * 100) : 0;
+    const cSummary = summarizeFamilyQuota(cachedAccounts, 'claude');
+    const gSummary = summarizeFamilyQuota(cachedAccounts, 'gemini');
+    const cAvg = cSummary.shortAverage;
+    const gAvg = gSummary.shortAverage;
+    const cWAvg = cSummary.weeklyAverage;
+    const gWAvg = gSummary.weeklyAverage;
 
     // Claude 监控卡 (左侧水仓显示 5h 水位，右侧显示 7d 周度额度与最快刷新，底栏展示 5h 最快回满)
-    if (statClaude5h) statClaude5h.innerText = cCount > 0 ? `${cAvg.toFixed(1)}%` : '--%';
+    if (statClaude5h) statClaude5h.innerText = cAvg === null ? '--%' : `${cAvg.toFixed(1)}%`;
     if (statClaudeWaveFill) statClaudeWaveFill.style.height = `${Math.min(100, Math.max(0, cAvg))}%`;
-    if (statClaudeWeekly) statClaudeWeekly.innerText = cCount > 0 ? `${cWAvg.toFixed(1)}%` : '--%';
+    if (statClaudeWeekly) statClaudeWeekly.innerText = cWAvg === null ? '--%' : `${cWAvg.toFixed(1)}%`;
     if (statClaudeWeeklyBar) statClaudeWeeklyBar.style.width = `${Math.min(100, Math.max(0, cWAvg))}%`;
     if (statClaudeWeeklyRefresh) {
       statClaudeWeeklyRefresh.innerText = getPoolFastestWeeklyRefreshText(cachedAccounts, 'claude');
       statClaudeWeeklyRefresh.title = '全池 7 天额度最快刷新时间（各账号详细信息可在下方矩阵查看）';
     }
-    if (statClaudeAvail) statClaudeAvail.innerText = cCount > 0 ? `${cActiveAvail}/${cachedAccounts.length} 就绪` : '--';
+    if (statClaudeAvail) {
+      statClaudeAvail.innerText = `${cSummary.ready}/${cSummary.total} 就绪`;
+      statClaudeAvail.title = '启用且未失效的账号中，状态及已知额度可用的数量；未知额度不计入就绪，不代表空闲并发';
+    }
     if (statClaudeReset) {
       const cResetText = getPoolFastest5hRecoveryText(cachedAccounts, 'claude');
       statClaudeReset.innerText = cResetText;
       statClaudeReset.className = cResetText.includes('全部满格') ? 'pool-reset-hint full' : 'pool-reset-hint';
-      statClaudeReset.title = '全池 5 小时额度最快回满时间（各账号详细信息可在下方矩阵查看）';
+      statClaudeReset.title = '按上游报告的 5h 重置时间统计；限额等待与周额度限制单独提示，重置后需重新拉取确认';
     }
 
     // Gemini 监控卡 (左侧水仓显示 5h 水位，右侧显示 7d 周度额度与最快刷新，底栏展示 5h 最快回满)
-    if (statGemini5h) statGemini5h.innerText = gCount > 0 ? `${gAvg.toFixed(1)}%` : '--%';
+    if (statGemini5h) statGemini5h.innerText = gAvg === null ? '--%' : `${gAvg.toFixed(1)}%`;
     if (statGeminiWaveFill) statGeminiWaveFill.style.height = `${Math.min(100, Math.max(0, gAvg))}%`;
-    if (statGeminiWeekly) statGeminiWeekly.innerText = gCount > 0 ? `${gWAvg.toFixed(1)}%` : '--%';
+    if (statGeminiWeekly) statGeminiWeekly.innerText = gWAvg === null ? '--%' : `${gWAvg.toFixed(1)}%`;
     if (statGeminiWeeklyBar) statGeminiWeeklyBar.style.width = `${Math.min(100, Math.max(0, gWAvg))}%`;
     if (statGeminiWeeklyRefresh) {
       statGeminiWeeklyRefresh.innerText = getPoolFastestWeeklyRefreshText(cachedAccounts, 'gemini');
       statGeminiWeeklyRefresh.title = '全池 7 天额度最快刷新时间（各账号详细信息可在下方矩阵查看）';
     }
-    if (statGeminiAvail) statGeminiAvail.innerText = gCount > 0 ? `${gActiveAvail}/${cachedAccounts.length} 就绪` : '--';
+    if (statGeminiAvail) {
+      statGeminiAvail.innerText = `${gSummary.ready}/${gSummary.total} 就绪`;
+      statGeminiAvail.title = statClaudeAvail?.title || '状态及已知额度可用的账号数，不代表空闲并发';
+    }
     if (statGeminiReset) {
       const gResetText = getPoolFastest5hRecoveryText(cachedAccounts, 'gemini');
       statGeminiReset.innerText = gResetText;
       statGeminiReset.className = gResetText.includes('全部满格') ? 'pool-reset-hint full' : 'pool-reset-hint';
-      statGeminiReset.title = '全池 5 小时额度最快回满时间（各账号详细信息可在下方矩阵查看）';
+      statGeminiReset.title = '按上游报告的 5h 重置时间统计；限额等待与周额度限制单独提示，重置后需重新拉取确认';
     }
 
     const getHealthState = (pct) => {
+      if (pct === null) return { text: '● 尚未检测', cls: 'water-health-mid' };
       if (pct <= 0) return { text: '● 水位枯竭', cls: 'water-health-dead' };
       if (pct < 25) return { text: '● 水位紧张', cls: 'water-health-warn' };
       if (pct < 60) return { text: '● 水位适中', cls: 'water-health-mid' };
@@ -483,8 +505,9 @@ async function loadAllData() {
     }
 
     renderFilteredAccounts();
+    return { ok: true };
   } catch (e) {
-    // handled in apiRequest
+    return { ok: false, error: e.message };
   }
 }
 
@@ -528,16 +551,70 @@ function getAvatarColor(email) {
   return gradients[h % gradients.length];
 }
 
+function quotaFraction(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : null;
+}
+
+function familyQuota(acc, family) {
+  const quota = acc.quota || {};
+  return {
+    short: quotaFraction(quota[family + '5hFraction']),
+    weekly: quotaFraction(quota[family + 'WeeklyFraction']),
+    reset: quota[family + 'ResetTime'],
+    weeklyReset: quota[family + 'WeeklyResetTime'],
+    description: quota[family + '5hDesc'] || '',
+    blockedUntil: Number(acc.quotaBlockedUntil?.[family]) || 0
+  };
+}
+
+function quotaPoolAccounts(accounts) {
+  return (accounts || []).filter(acc => acc.status !== 'disabled' && acc.status !== 'dead');
+}
+
+function familyQuotaBlocked(q) {
+  return q.blockedUntil > Date.now() || q.short === 0 || q.weekly === 0;
+}
+
+function summarizeFamilyQuota(accounts, family) {
+  const eligible = quotaPoolAccounts(accounts);
+  const quotas = eligible.map(acc => familyQuota(acc, family));
+  const average = values => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length * 100 : null;
+  return {
+    total: eligible.length,
+    ready: eligible.filter((acc, i) => acc.status === 'active' && !acc.validationUrl
+      && quotas[i].short !== null && quotas[i].weekly !== null && !familyQuotaBlocked(quotas[i])).length,
+    shortAverage: average(quotas.map(q => q.short).filter(value => value !== null)),
+    weeklyAverage: average(quotas.map(q => q.weekly).filter(value => value !== null))
+  };
+}
+
 function formatResetTime(isoStr) {
   if (!isoStr) return '';
   const diffMs = new Date(isoStr).getTime() - Date.now();
-  if (diffMs <= 0) return '即将重置';
-  const days = Math.floor(diffMs / (24 * 3600000));
-  const hours = Math.floor((diffMs % (24 * 3600000)) / 3600000);
-  const mins = Math.floor((diffMs % 3600000) / 60000);
-  if (days > 0) return `${days}天${hours}h后`;
-  if (hours > 0) return `${hours}h${mins}m后`;
-  return `${mins}m后`;
+  if (!Number.isFinite(diffMs)) return '';
+  if (diffMs <= 0) return '待刷新确认';
+  return `${formatDurationCompact(diffMs)}后`;
+}
+
+function quotaResetHint(q) {
+  if (q.weekly === 0) return { text: '⏸ 周额度限制', full: false };
+  if (q.blockedUntil > Date.now()) return { text: '⏸ 限额等待', full: false };
+  if (q.short === null) return { text: '未检测', full: false };
+  if (q.short === 1) return { text: '✅ 满格', full: true };
+  const time = formatResetTime(q.reset);
+  return { text: time ? `⏳ ${time}` : '重置时间未知', full: false };
+}
+
+function formatDurationCompact(diffMs) {
+  if (!Number.isFinite(diffMs) || diffMs <= 0) return '';
+  const totalMinutes = Math.ceil(diffMs / 60000);
+  if (totalMinutes <= 1) return '不足1分钟';
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const mins = totalMinutes % 60;
+  if (days > 0) return `${days}天${hours}h`;
+  if (hours > 0) return `${hours}h${mins}m`;
+  return `${mins}m`;
 }
 
 function getShortEmailPrefix(email) {
@@ -545,19 +622,6 @@ function getShortEmailPrefix(email) {
   const prefix = email.split('@')[0];
   if (prefix.length <= 6) return prefix;
   return prefix.slice(0, 6);
-}
-
-function formatDurationCompact(diffMs) {
-  if (diffMs <= 0) return '即将回满';
-  const hours = Math.floor(diffMs / 3600000);
-  const mins = Math.floor((diffMs % 3600000) / 60000);
-  if (hours >= 24) {
-    const days = Math.floor(hours / 24);
-    const remH = hours % 24;
-    return `${days}d${remH}h`;
-  }
-  if (hours > 0) return `${hours}h${mins}m`;
-  return `${mins}m`;
 }
 
 window.scrollToAccount = function(accId) {
@@ -575,107 +639,60 @@ window.scrollToAccount = function(accId) {
 
 // 获取全池某模型家族 5 小时额度最快回满时间文本 (纯时间，不包含任何账号名称)
 function getPoolFastest5hRecoveryText(accounts, family) {
-  if (!accounts || accounts.length === 0) return '暂无账号';
-
-  const isClaude = family === 'claude';
-  let minDiffMs = Infinity;
-  let allFull = true;
-  let hasValidQuota = false;
+  const eligible = quotaPoolAccounts(accounts);
+  if (!eligible.length) return '暂无可调度账号';
+  const quotas = eligible.map(acc => familyQuota(acc, family));
+  if (quotas.every(q => q.short === 1 && !familyQuotaBlocked(q))) return '✅ 5h已全部满格';
   const now = Date.now();
-
-  for (const acc of accounts) {
-    if (!acc.quota) continue;
-    hasValidQuota = true;
-    const fraction = isClaude ? (acc.quota.claude5hFraction ?? 1) : (acc.quota.gemini5hFraction ?? 1);
-    const resetIso = isClaude ? acc.quota.claudeResetTime : acc.quota.geminiResetTime;
-
-    if (fraction < 0.99) {
-      allFull = false;
-      if (resetIso) {
-        const diff = new Date(resetIso).getTime() - now;
-        if (diff > 0 && diff < minDiffMs) {
-          minDiffMs = diff;
-        }
-      }
-    }
-  }
-
-  if (!hasValidQuota) return '⏳ 周期中';
-  if (allFull) return '✅ 5h已全部满格';
-  if (minDiffMs === Infinity) return '⏳ 5h即将回满';
-
-  const hours = Math.floor(minDiffMs / 3600000);
-  const mins = Math.floor((minDiffMs % 3600000) / 60000);
-
-  if (hours > 0) {
-    return mins > 0 ? `⏳ 5h最快 ${hours}h${mins}m后回满` : `⏳ 5h最快 ${hours}h后回满`;
-  }
-  if (mins > 0) {
-    return `⏳ 5h最快 ${mins}m后回满`;
-  }
-  return '⏳ 5h即将回满';
+  const resets = quotas.filter(q => q.short !== null && q.short < 1 && q.weekly !== 0 && q.blockedUntil <= now)
+    .map(q => Date.parse(q.reset || '') - now).filter(diff => Number.isFinite(diff) && diff > 0);
+  if (resets.length) return `⏳ 5h最快 ${formatDurationCompact(Math.min(...resets))}后重置`;
+  if (quotas.some(q => q.weekly === 0)) return '⏸ 部分账号受周额度限制';
+  if (quotas.some(q => q.blockedUntil > now)) return '⏸ 部分账号限额等待中';
+  if (quotas.every(q => q.short === null)) return '5h额度未检测';
+  return '5h重置时间待确认';
 }
 
 // 获取全池某模型家族 7 天周度额度最快刷新时间文本 (纯天数/小时，不包含任何账号名称)
 function getPoolFastestWeeklyRefreshText(accounts, family) {
-  if (!accounts || accounts.length === 0) return '--';
-
-  const isClaude = family === 'claude';
-  let minDiffMs = Infinity;
-  let hasValidReset = false;
+  const eligible = quotaPoolAccounts(accounts);
+  if (!eligible.length) return '--';
   const now = Date.now();
-
-  for (const acc of accounts) {
-    if (!acc.quota) continue;
-    const weeklyIso = isClaude ? acc.quota.claudeWeeklyResetTime : acc.quota.geminiWeeklyResetTime;
-    if (weeklyIso) {
-      hasValidReset = true;
-      const diff = new Date(weeklyIso).getTime() - now;
-      if (diff > 0 && diff < minDiffMs) {
-        minDiffMs = diff;
-      }
-    }
-  }
-
-  if (!hasValidReset || minDiffMs === Infinity) return '🔄 周期中';
-
-  const days = Math.floor(minDiffMs / (24 * 3600000));
-  const hours = Math.floor((minDiffMs % (24 * 3600000)) / 3600000);
-  const mins = Math.floor((minDiffMs % 3600000) / 60000);
-
-  if (days > 0) {
-    return `最快 ${days}天后刷新`;
-  }
-  if (hours > 0) {
-    return `最快 ${hours}h后刷新`;
-  }
-  if (mins > 0) {
-    return `最快 ${mins}m后刷新`;
-  }
-  return '今日刷新';
+  const quotas = eligible.map(acc => familyQuota(acc, family));
+  const resets = quotas.filter(q => q.weekly !== null && q.weekly < 1)
+    .map(q => Date.parse(q.weeklyReset || '') - now).filter(diff => Number.isFinite(diff) && diff > 0);
+  if (resets.length) return `最快 ${formatDurationCompact(Math.min(...resets))}后重置`;
+  return quotas.every(q => q.weekly === 1) ? '✅ 周额度满格' : '重置时间待确认';
 }
 
 function getStatusPill(acc) {
-  const isClaudeExhausted = acc.quota && acc.quota.claude5hFraction <= 0.01;
-  const isGeminiExhausted = acc.quota && acc.quota.gemini5hFraction <= 0.01;
+  const claude = familyQuota(acc, 'claude');
+  const gemini = familyQuota(acc, 'gemini');
+  const isClaudeExhausted = familyQuotaBlocked(claude);
+  const isGeminiExhausted = familyQuotaBlocked(gemini);
 
   if (acc.status === 'disabled') {
     return `<span class="status-badge-pill status-badge-disabled">已停用</span>`;
   } else if (acc.status === 'cooldown') {
-    const remainingSec = Math.max(0, Math.ceil((acc.cooldownUntil - Date.now()) / 1000));
-    return `<span class="status-badge-pill status-badge-cooldown"><span class="pulse-dot amber"></span>冷却 (${remainingSec}s)</span>`;
+    const remainingSec = Math.max(0, Math.ceil((Number(acc.cooldownUntil) - Date.now()) / 1000)) || 0;
+    return `<span class="status-badge-pill status-badge-cooldown"><span class="pulse-dot amber"></span>${remainingSec ? `冷却 (${remainingSec}s)` : '冷却到期待确认'}</span>`;
   } else if (acc.status === 'dead') {
     const policyBlocked = isPolicyBlockedAccount(acc);
     if (policyBlocked) {
       return `<span class="status-badge-pill status-badge-dead" title="上游报告账号服务被停用，需要人工处理">政策限制</span>`;
     }
     return `<span class="status-badge-pill status-badge-dead">异常失效</span>`;
-  } else if (isClaudeExhausted && !isGeminiExhausted) {
-    return `<span class="status-badge-pill status-badge-gemini" title="Claude 暂尽，Gemini 依然充足">Gemini可用</span>`;
-  } else if (!isClaudeExhausted && isGeminiExhausted) {
-    return `<span class="status-badge-pill status-badge-claude" title="Gemini 暂尽，Claude 依然充足">Claude可用</span>`;
+  } else if (acc.validationUrl) {
+    return `<span class="status-badge-pill status-badge-cooldown">需授权</span>`;
+  } else if (isClaudeExhausted && !isGeminiExhausted && gemini.short !== null && gemini.weekly !== null) {
+    return `<span class="status-badge-pill status-badge-gemini" title="Claude 额度受限，Gemini 已知额度可用">Gemini可用</span>`;
+  } else if (!isClaudeExhausted && isGeminiExhausted && claude.short !== null && claude.weekly !== null) {
+    return `<span class="status-badge-pill status-badge-claude" title="Gemini 额度受限，Claude 已知额度可用">Claude可用</span>`;
   } else if (isClaudeExhausted && isGeminiExhausted) {
     return `<span class="status-badge-pill status-badge-dead">双额度暂尽</span>`;
+  }
+  if ([claude.short, claude.weekly, gemini.short, gemini.weekly].some(value => value === null)) {
+    return `<span class="status-badge-pill status-badge-cooldown">额度待检测</span>`;
   }
   return `<span class="status-badge-pill status-badge-active"><span class="pulse-dot green"></span>正常可用</span>`;
 }
@@ -732,6 +749,39 @@ function renderLastErrorHtml(acc) {
   return `<div class="acc-last-error" title="${escapeHtml(acc.lastError)}">${escapeHtml(acc.lastError)}</div>`;
 }
 
+function getCardActionsHtml(acc) {
+  const isDisabled = acc.status === 'disabled';
+  const policyBlocked = isPolicyBlockedAccount(acc);
+
+  return `
+          <button class="card-action-btn action-quota" onclick="checkQuota('${acc.id}', this)" title="从 Google 实时拉取最新配额">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>
+            <span>查额度</span>
+          </button>
+          <button class="card-action-btn action-proxy" onclick="openProxyModal('${acc.id}')" title="配置该账号独立出口代理与并发">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+            <span>代理</span>
+          </button>
+          <button class="card-action-btn action-refresh" onclick="refreshToken('${acc.id}', this)" title="立即换新 Access Token">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+            <span>刷新</span>
+          </button>
+          ${isDisabled || policyBlocked ? '' : `
+            <button class="card-action-btn action-activate" onclick="resetAccount('${acc.id}', this)" title="解除冷却重置为活跃状态">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+              <span>激活</span>
+            </button>
+          `}
+          <button class="card-action-btn action-disable" onclick="toggleAccountDisabled('${acc.id}', ${isDisabled}, this)" title="${isDisabled ? '重新启用此账号并恢复调度' : '停用此账号，保留凭据和历史数据'}">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 12h8"/></svg>
+            <span>${isDisabled ? '启用' : '停用'}</span>
+          </button>
+          <button class="card-action-btn action-delete" onclick="deleteAccount('${acc.id}', this)" title="删除此账号">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          </button>
+  `;
+}
+
 function getCardHtml(acc) {
   const initial = (acc.email || 'A')[0].toUpperCase();
   const avatarGrad = getAvatarColor(acc.email);
@@ -739,8 +789,6 @@ function getCardHtml(acc) {
   const claudePod = renderPodHtml('claude', acc);
   const geminiPod = renderPodHtml('gemini', acc);
   const metaHtml = getMetaClusterHtml(acc);
-  const isDisabled = acc.status === 'disabled';
-  const policyBlocked = isPolicyBlockedAccount(acc);
 
   return `
     <div class="account-card" id="card-${acc.id}" data-id="${acc.id}">
@@ -771,32 +819,8 @@ function getCardHtml(acc) {
           ${metaHtml}
         </div>
 
-        <div class="card-actions-toolbar">
-          <button class="card-action-btn action-quota" onclick="checkQuota('${acc.id}', this)" title="从 Google 实时拉取最新配额">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>
-            <span>查额度</span>
-          </button>
-          <button class="card-action-btn action-proxy" onclick="openProxyModal('${acc.id}')" title="配置该账号独立出口代理与并发">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-            <span>代理</span>
-          </button>
-          <button class="card-action-btn action-refresh" onclick="refreshToken('${acc.id}', this)" title="立即换新 Access Token">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-            <span>刷新</span>
-          </button>
-          ${isDisabled || policyBlocked ? '' : `
-            <button class="card-action-btn action-activate" onclick="resetAccount('${acc.id}', this)" title="解除冷却重置为活跃状态">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-              <span>激活</span>
-            </button>
-          `}
-          <button class="card-action-btn action-disable" onclick="toggleAccountDisabled('${acc.id}', ${isDisabled}, this)" title="${isDisabled ? '重新启用此账号并恢复调度' : '停用此账号，保留凭据和历史数据'}">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 12h8"/></svg>
-            <span>${isDisabled ? '启用' : '停用'}</span>
-          </button>
-          <button class="card-action-btn action-delete" onclick="deleteAccount('${acc.id}', this)" title="删除此账号">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-          </button>
+        <div class="card-actions-toolbar" data-state="${acc.status}:${isPolicyBlockedAccount(acc)}">
+          ${getCardActionsHtml(acc)}
         </div>
       </div>
     </div>
@@ -826,6 +850,14 @@ function updateCardInPlace(acc) {
   const newMetaHtml = getMetaClusterHtml(acc);
   if (metaCluster && metaCluster.innerHTML !== newMetaHtml) {
     metaCluster.innerHTML = newMetaHtml;
+  }
+
+  // Update stateful actions without replacing in-flight buttons on every poll.
+  const toolbar = card.querySelector('.card-actions-toolbar');
+  const actionState = `${acc.status}:${isPolicyBlockedAccount(acc)}`;
+  if (toolbar && toolbar.dataset.state !== actionState) {
+    toolbar.innerHTML = getCardActionsHtml(acc);
+    toolbar.dataset.state = actionState;
   }
 }
 
@@ -872,7 +904,7 @@ function renderPodHtml(family, acc) {
           <span class="badge-alert-tag">需授权</span>
         </div>
         <div class="pod-alert-body">
-          <a href="${acc.validationUrl}" target="_blank" rel="noopener noreferrer" class="card-action-btn card-action-compact action-authorize">前往授权</a>
+          ${safeHttpUrl(acc.validationUrl) ? `<a href="${escapeHtml(safeHttpUrl(acc.validationUrl))}" target="_blank" rel="noopener noreferrer" class="card-action-btn card-action-compact action-authorize">前往授权</a>` : '<span>授权地址无效，请重新拉取</span>'}
           <button type="button" class="card-action-btn card-action-compact action-quota" onclick="checkQuota('${acc.id}', this)">拉取额度</button>
         </div>
       </div>
@@ -897,15 +929,11 @@ function renderPodHtml(family, acc) {
     `;
   }
 
-  const f5h = isClaude ? quota.claude5hFraction : quota.gemini5hFraction;
-  const fW = isClaude ? quota.claudeWeeklyFraction : quota.geminiWeeklyFraction;
-  const r5h = isClaude ? quota.claudeResetTime : quota.geminiResetTime;
-  const rW = isClaude ? quota.claudeWeeklyResetTime : quota.geminiWeeklyResetTime;
-
-  const p5h = (f5h * 100).toFixed(1);
-  const pW = (fW * 100).toFixed(1);
-  const p5hNum = parseFloat(p5h);
-  const pWNum = parseFloat(pW);
+  const q = familyQuota(acc, family);
+  const p5hNum = (q.short ?? 0) * 100;
+  const pWNum = (q.weekly ?? 0) * 100;
+  const p5h = q.short === null ? '--' : p5hNum.toFixed(1);
+  const pW = q.weekly === null ? '--' : pWNum.toFixed(1);
 
   // 颜色根据剩余额度动态变化
   const getTheme = (pct, isWeekly) => {
@@ -926,16 +954,13 @@ function renderPodHtml(family, acc) {
   const c5hTheme = getTheme(p5hNum, false);
   const cWTheme = getTheme(pWNum, true);
 
-  const time5h = formatResetTime(r5h);
-  const timeW = formatResetTime(rW);
-
-  const time5hTag = (p5hNum < 99.9 && time5h)
-    ? `<span class="pod-time-tag">⏳ ${time5h}</span>`
-    : `<span class="pod-time-tag full">✅ 满格</span>`;
-
-  const timeWTag = timeW
-    ? `<span class="pod-time-tag">🔄 ${timeW}</span>`
-    : `<span class="pod-time-tag">🔄 周期中</span>`;
+  const hint = quotaResetHint(q);
+  const details = [q.description];
+  if (q.weekly === 0) details.push('周额度耗尽；5h重置不代表账号恢复。');
+  if (q.blockedUntil > Date.now()) details.push(`限额等待 ${formatResetTime(q.blockedUntil)}再检查；此时间不代表5h重置或恢复保证。`);
+  const time5hTag = `<span class="pod-time-tag${hint.full ? ' full' : ''}" title="${escapeHtml(details.filter(Boolean).join(' '))}">${hint.text}</span>`;
+  const timeW = q.weekly === null ? '未检测' : formatResetTime(q.weeklyReset);
+  const timeWTag = `<span class="pod-time-tag">${q.weekly === 1 ? '✅ 满格' : `🔄 ${timeW || '重置时间未知'}`}</span>`;
 
   return `
     <div class="quota-pod ${isClaude ? 'pod-claude' : 'pod-gemini'}">
@@ -1099,6 +1124,7 @@ window.onConcurrencyInput = function(inputEl) {
   let val = parseInt(inputEl.value, 10);
   if (isNaN(val)) return;
   val = Math.max(1, Math.min(50, val));
+  inputEl.value = val;
   updateQuickChipsActive(inputEl.id, val);
 };
 
@@ -1114,13 +1140,16 @@ function updateQuickChipsActive(inputId, val) {
   });
 }
 
-window.manualRefreshData = function(btn) {
+window.manualRefreshData = async function(btn) {
   const b = btn || document.getElementById('btn-refresh-data');
   if (b) b.disabled = true;
-  loadAllData().finally(() => {
+  try {
+    const result = await loadAllData();
+    if (result?.ok) showToast('数据已刷新', 'info');
+    else if (result?.error) showToast('刷新失败: ' + result.error, 'error');
+  } finally {
     setTimeout(() => { if (b) b.disabled = false; }, 300);
-    showToast('数据已刷新', 'info');
-  });
+  }
 };
 
 window.handleLogout = function() {
@@ -1141,16 +1170,12 @@ window.handleAddAccount = async function() {
 
   const email = emailInput ? emailInput.value.trim() : '';
   const token = tokenInput ? tokenInput.value.trim() : '';
-  let proxy = proxyInput ? proxyInput.value.trim() : '';
-  const concurrency = concInput ? (parseInt(concInput.value, 10) || 5) : 5;
+  const proxy = normalizeProxyUrl(proxyInput?.value);
+  const concurrency = normalizeConcurrency(concInput?.value);
 
   if (!email || !token) {
     showToast('请填写 Google 邮箱和 Refresh Token', 'error');
     return;
-  }
-
-  if (proxy && !/^https?:\/\//i.test(proxy)) {
-    proxy = 'http://' + proxy;
   }
 
   const origText = submitBtn ? submitBtn.innerText : '';
@@ -1196,12 +1221,9 @@ window.handleSaveProxyConfig = async function() {
   const accId = idInput ? idInput.value : '';
   if (!accId) return;
 
-  let proxyUrl = proxyInput ? proxyInput.value.trim() : '';
-  if (proxyUrl && !/^https?:\/\//i.test(proxyUrl)) {
-    proxyUrl = 'http://' + proxyUrl;
-    if (proxyInput) proxyInput.value = proxyUrl;
-  }
-  const maxConcurrency = concInput ? (parseInt(concInput.value, 10) || 5) : 5;
+  const proxyUrl = normalizeProxyUrl(proxyInput?.value);
+  if (proxyInput) proxyInput.value = proxyUrl;
+  const maxConcurrency = normalizeConcurrency(concInput?.value);
 
   const origText = submitBtn ? submitBtn.innerText : '';
   if (submitBtn) {
@@ -1381,8 +1403,27 @@ function showToast(message, type = 'info') {
 }
 
 function escapeHtml(text) {
-  if (!text) return '';
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  return String(text ?? '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(value);
+    return ['https:', 'http:'].includes(url.protocol) ? url.href : '';
+  } catch {
+    return '';
+  }
+}
+
+function normalizeConcurrency(value) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? Math.max(1, Math.min(50, parsed)) : 5;
+}
+
+function normalizeProxyUrl(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw || raw.toLowerCase() === 'direct' || raw === '直连') return '';
+  return raw.includes('://') ? raw : 'http://' + raw;
 }
 
 document.addEventListener('DOMContentLoaded', init);

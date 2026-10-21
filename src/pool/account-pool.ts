@@ -3,9 +3,34 @@ import path from 'path';
 import crypto from 'crypto';
 import { Account, PoolStats, AccountStatus, RoutingStrategy } from '../types.js';
 import { classifyUpstreamError, retryAfterMs } from './error-policy.js';
+import { clearLegacyQuotaResetTimes, reconcileQuotaState } from './quota-state.js';
+import { AccountAcquireOptions, AccountSchedulingError, accountUnavailableError, hasFamilyQuota, ModelFamily } from './scheduling.js';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const ACCOUNTS_FILE = path.resolve(DATA_DIR, 'accounts.json');
+interface AccountWaiter {
+  excludeIds: Set<string>;
+  family: ModelFamily;
+  sessionKey?: string;
+  root: string;
+  createdAt: number;
+  deadline: number;
+  requestId?: string;
+  maxAccountQueue: number;
+  maxConversationQueue: number;
+  signal?: AbortSignal;
+  timer?: NodeJS.Timeout;
+  onAbort?: () => void;
+  resolve: (account: Account | null) => void;
+  reject: (error: Error) => void;
+}
+
+interface SessionBinding {
+  sessionKey: string;
+  family?: ModelFamily;
+  accountId: string;
+  lastUsedAt: number;
+  version: number;
+  generationStarted: boolean;
+}
 
 /**
  * Google may expose the same cache metric under different field names, and
@@ -25,6 +50,11 @@ export function mergeUsageMetadata<T extends Record<string, any>>(
     const numbers = finiteValues(...values);
     return numbers.length ? Math.max(...numbers) : undefined;
   };
+
+  // Some terminal chunks omit or zero prompt usage after an earlier chunk
+  // supplied it. Losing that value prevents clients from tracking context.
+  const prompt = maxValue(previous?.promptTokenCount, next.promptTokenCount);
+  if (prompt !== undefined) merged.promptTokenCount = prompt;
 
   const cacheRead = maxValue(
     previous?.cachedContentTokenCount,
@@ -55,8 +85,9 @@ export function mergeUsageMetadata<T extends Record<string, any>>(
 }
 
 export class AccountPool {
+  private readonly dataDirectory: string;
+  private readonly accountsFile: string;
   private accounts: Map<string, Account> = new Map();
-  private roundRobinCursor = 0;
   private startTime = Date.now();
   private totalRequestsServed = 0;
   private totalPromptTokens = 0;
@@ -67,13 +98,25 @@ export class AccountPool {
   private totalTokens = 0;
   private hasTokenUsage = false;
   private isInternalSaving = false;
+  private internalSaveTimer: NodeJS.Timeout | null = null;
   private reloadDebounceTimer: NodeJS.Timeout | null = null;
   private routingStrategy: RoutingStrategy = 'zero-waste';
-  private sessionBindings: Map<string, { accountId: string; lastUsedAt: number }> = new Map();
+  private sessionBindings = new Map<string, SessionBinding>();
+  private bindingVersion = 0;
+  private sessionLeases = new Map<string, number>();
+  private activeConversationTtlMs: number;
   private sessionCleanTimer: NodeJS.Timeout | null = null;
   private fileWatcher: fs.FSWatcher | null = null;
+  private waiters: AccountWaiter[] = [];
+  private readyRoots = new Map<string, string[]>();
+  private queueTimer?: NodeJS.Timeout;
+  private draining = false;
+  private disposed = false;
 
-  constructor(initialStrategy: RoutingStrategy = 'zero-waste') {
+  constructor(initialStrategy: RoutingStrategy = 'zero-waste', storageDirectory = path.resolve(process.cwd(), 'data'), activeConversationTtlMs = 15 * 60_000) {
+    this.activeConversationTtlMs = Math.max(1000, activeConversationTtlMs);
+    this.dataDirectory = path.resolve(storageDirectory);
+    this.accountsFile = path.join(this.dataDirectory, 'accounts.json');
     this.routingStrategy = initialStrategy;
     this.ensureDataDir();
     this.loadAccounts();
@@ -85,7 +128,9 @@ export class AccountPool {
     this.sessionCleanTimer = setInterval(() => {
       const now = Date.now();
       for (const [key, val] of this.sessionBindings.entries()) {
-        if (now - val.lastUsedAt > 60 * 60 * 1000) {
+        if (now - val.lastUsedAt > 60 * 60 * 1000
+          && !(this.accounts.get(val.accountId)?.activeConcurrency)
+          && !this.waiters.some(waiter => waiter.sessionKey === val.sessionKey && waiter.family === val.family)) {
           this.sessionBindings.delete(key);
         }
       }
@@ -93,19 +138,19 @@ export class AccountPool {
   }
 
   private ensureDataDir(): void {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(this.dataDirectory)) {
+      fs.mkdirSync(this.dataDirectory, { recursive: true });
     }
   }
 
   private setupFileWatcher(): void {
-    if (!fs.existsSync(ACCOUNTS_FILE)) {
+    if (!fs.existsSync(this.accountsFile)) {
       this.ensureDataDir();
-      fs.writeFileSync(ACCOUNTS_FILE, '[]', 'utf-8');
+      fs.writeFileSync(this.accountsFile, '[]', 'utf-8');
     }
 
     try {
-      this.fileWatcher = fs.watch(ACCOUNTS_FILE, (eventType) => {
+      this.fileWatcher = fs.watch(this.accountsFile, (eventType) => {
         if (this.isInternalSaving) return;
         if (this.reloadDebounceTimer) clearTimeout(this.reloadDebounceTimer);
         this.reloadDebounceTimer = setTimeout(() => {
@@ -122,6 +167,12 @@ export class AccountPool {
 
   /** Stop the maintenance timers and the file watcher (shutdown and tests). */
   public dispose(): void {
+    this.disposed = true;
+    for (const waiter of [...this.waiters]) {
+      this.finishWaiter(waiter, new AccountSchedulingError('unavailable', '账号池已停止。'));
+    }
+    if (this.queueTimer) clearInterval(this.queueTimer);
+    this.queueTimer = undefined;
     if (this.sessionCleanTimer) {
       clearInterval(this.sessionCleanTimer);
       this.sessionCleanTimer = null;
@@ -130,24 +181,38 @@ export class AccountPool {
       clearTimeout(this.reloadDebounceTimer);
       this.reloadDebounceTimer = null;
     }
+    if (this.internalSaveTimer) {
+      clearTimeout(this.internalSaveTimer);
+      this.internalSaveTimer = null;
+    }
+    this.isInternalSaving = false;
     this.fileWatcher?.close();
     this.fileWatcher = null;
   }
 
   public loadAccounts(): void {
-    if (fs.existsSync(ACCOUNTS_FILE)) {
+    if (fs.existsSync(this.accountsFile)) {
       try {
-        const raw = fs.readFileSync(ACCOUNTS_FILE, 'utf-8');
+        const raw = fs.readFileSync(this.accountsFile, 'utf-8');
         const list: Account[] = JSON.parse(raw);
         const live = this.accounts;
         const next = new Map<string, Account>();
         for (const acc of list) {
+          clearLegacyQuotaResetTimes(acc);
           const previous = live.get(acc.id);
           // The persisted file never carries concurrency. Zeroing it while
           // requests are in flight would stop counting them and over-admit the
           // account, so carry the in-memory lease count across the reload.
           const inFlight = previous?.activeConcurrency ?? 0;
           acc.activeConcurrency = Number.isFinite(inFlight) && inFlight > 0 ? inFlight : 0;
+          for (const family of ['gemini', 'claude'] as const) {
+            const blocked = previous?.quotaBlockedUntil?.[family] ?? 0;
+            if (blocked > Date.now()) {
+              acc.quotaBlockedUntil = { ...acc.quotaBlockedUntil, [family]: Math.max(blocked, acc.quotaBlockedUntil?.[family] ?? 0) };
+            }
+          }
+          if ((previous?.quota?.lastCheckedAt ?? 0) > (acc.quota?.lastCheckedAt ?? 0)) acc.quota = previous!.quota;
+          reconcileQuotaState(acc);
           // A terminal in-memory state must never be undone by reloading a
           // stale copy of the file.
           if (previous && (previous.status === 'dead' || previous.status === 'disabled') && acc.status !== previous.status) {
@@ -177,17 +242,23 @@ export class AccountPool {
   }
 
   public saveAccounts(): void {
+    // Only the latest save may end the self-write suppression window.
+    if (this.internalSaveTimer) clearTimeout(this.internalSaveTimer);
+    this.internalSaveTimer = null;
     try {
       this.isInternalSaving = true;
       const list = Array.from(this.accounts.values()).map(acc => ({
         ...acc,
         activeConcurrency: 0 // 持久化时不保留内存中的并发计数
       }));
-      fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(list, null, 2), 'utf-8');
+      fs.writeFileSync(this.accountsFile, JSON.stringify(list, null, 2), 'utf-8');
     } catch (e) {
       console.error('[AccountPool] Failed to save accounts.json:', e);
     } finally {
-      setTimeout(() => { this.isInternalSaving = false; }, 500);
+      this.internalSaveTimer = setTimeout(() => {
+        this.internalSaveTimer = null;
+        this.isInternalSaving = false;
+      }, 500);
     }
   }
 
@@ -199,14 +270,62 @@ export class AccountPool {
     return this.accounts.get(id);
   }
 
-  public getSessionBinding(sessionKey: string): { accountId: string; lastUsedAt: number } | undefined {
-    return this.sessionBindings.get(sessionKey);
+  private sessionBindingKey(sessionKey: string, family?: ModelFamily): string {
+    return (family ?? 'any') + '::' + sessionKey;
   }
 
-  public clearSessionBinding(sessionKey: string | undefined, accountId?: string): void {
+  public getSessionBinding(sessionKey: string, family?: ModelFamily): SessionBinding | undefined {
+    if (family) return this.sessionBindings.get(this.sessionBindingKey(sessionKey, family));
+    // Keep the inspection API usable for integrations that only use one family.
+    return this.sessionBindings.get(this.sessionBindingKey(sessionKey, 'gemini'))
+      ?? this.sessionBindings.get(this.sessionBindingKey(sessionKey, 'claude'))
+      ?? this.sessionBindings.get(this.sessionBindingKey(sessionKey));
+  }
+
+  public clearSessionBinding(sessionKey: string | undefined, accountId?: string, version?: number,
+    family?: ModelFamily, reason = 'explicit_clear'): void {
     if (!sessionKey) return;
-    const binding = this.sessionBindings.get(sessionKey);
-    if (!accountId || binding?.accountId === accountId) this.sessionBindings.delete(sessionKey);
+    const families = family ? [family] : ['gemini', 'claude', undefined] as const;
+    for (const targetFamily of families) {
+      const key = this.sessionBindingKey(sessionKey, targetFamily);
+      const binding = this.sessionBindings.get(key);
+      if (binding && (!accountId || binding.accountId === accountId) && (version === undefined || binding.version === version)) {
+        this.sessionBindings.delete(key);
+        console.info('[Scheduler] unbound root=' + crypto.createHash('sha256').update(sessionKey).digest('hex').slice(0, 12)
+          + ' family=' + (targetFamily ?? 'any') + ' account=' + binding.accountId + ' reason=' + reason);
+      }
+    }
+  }
+
+  /** A request owns exactly one release, including preflight and generation. */
+  public trackLease(account: Account, family: ModelFamily, sessionKey?: string) {
+    const key = sessionKey ? this.sessionBindingKey(sessionKey, family) : undefined;
+    const binding = key ? this.sessionBindings.get(key) : undefined;
+    const version = binding?.version;
+    if (key) this.sessionLeases.set(key, (this.sessionLeases.get(key) ?? 0) + 1);
+    let released = false;
+    return {
+      isCurrent: () => !key || (this.sessionBindings.get(key)?.version === version
+        && this.sessionBindings.get(key)?.accountId === account.id),
+      markGeneration: () => {
+        const current = key ? this.sessionBindings.get(key) : undefined;
+        if (current && current.version === version && current.accountId === account.id) current.generationStarted = true;
+      },
+      release: (error?: Parameters<AccountPool['releaseAccount']>[1]) => {
+        if (released) return;
+        released = true;
+        if (key) {
+          const remaining = Math.max(0, (this.sessionLeases.get(key) ?? 1) - 1);
+          if (remaining) this.sessionLeases.set(key, remaining); else this.sessionLeases.delete(key);
+          const current = this.sessionBindings.get(key);
+          if (current && current.version === version && current.accountId === account.id) {
+            current.lastUsedAt = Date.now();
+            if (!remaining && !current.generationStarted) this.sessionBindings.delete(key);
+          }
+        }
+        this.releaseAccount(account.id, error, family, sessionKey, version);
+      }
+    };
   }
 
   public addAccount(params: {
@@ -246,6 +365,7 @@ export class AccountPool {
     if (!acc) return null;
 
     Object.assign(acc, updates);
+    reconcileQuotaState(acc);
     if (updates.proxyUrl === undefined && 'proxyUrl' in updates) {
       delete (acc as any).proxyUrl;
     }
@@ -275,6 +395,152 @@ export class AccountPool {
     this.routingStrategy = strategy;
   }
 
+  private waiterLane(waiter: Pick<AccountWaiter, 'sessionKey' | 'family'>): string {
+    const binding = waiter.sessionKey ? this.getSessionBinding(waiter.sessionKey, waiter.family)
+      ?? this.getSessionBinding(waiter.sessionKey) : undefined;
+    const account = binding ? this.accounts.get(binding.accountId) : undefined;
+    return account && this.isEligible(account, waiter.family) ? account.id : '*';
+  }
+
+  private isEligible(account: Account, family?: ModelFamily, now = Date.now()): boolean {
+    return (account.status === 'active' || (account.status === 'cooldown' && account.cooldownUntil <= now))
+      && hasFamilyQuota(account, family, now);
+  }
+
+  private queueDepth(accountId: string): number {
+    return this.waiters.filter(waiter => this.waiterLane(waiter) === accountId).length;
+  }
+
+  private hasQueuedPriority(sessionKey?: string, family?: ModelFamily): boolean {
+    const lane = sessionKey && (this.getSessionBinding(sessionKey, family) ?? this.getSessionBinding(sessionKey))?.accountId;
+    return this.waiters.some(waiter => this.waiterLane(waiter) === '*' || (lane && this.waiterLane(waiter) === lane));
+  }
+
+  private finishWaiter(waiter: AccountWaiter, error?: Error, account?: Account | null): void {
+    const index = this.waiters.indexOf(waiter);
+    if (index < 0) return;
+    this.waiters.splice(index, 1);
+    clearTimeout(waiter.timer);
+    if (waiter.onAbort) waiter.signal?.removeEventListener('abort', waiter.onAbort);
+    if (error) {
+      console.warn('[Scheduler] rejected req=' + (waiter.requestId ?? 'unknown') + ' reason='
+        + (error instanceof AccountSchedulingError ? error.code : 'cancelled')
+        + ' wait=' + (Date.now() - waiter.createdAt) + 'ms');
+      waiter.reject(error);
+    } else waiter.resolve(account ?? null);
+    if (this.waiters.length === 0) {
+      if (this.queueTimer) clearInterval(this.queueTimer);
+      this.queueTimer = undefined;
+      this.readyRoots.clear();
+    }
+  }
+
+  /** FIFO within a root conversation; round robin between roots on each account. */
+  private drainQueue(): void {
+    if (this.draining || this.disposed || !this.waiters.length) return;
+    this.draining = true;
+    try {
+      const lanes = new Map<string, AccountWaiter[]>();
+      for (const waiter of [...this.waiters]) {
+        if (waiter.signal?.aborted) {
+          this.finishWaiter(waiter, new Error('Request aborted by client.'));
+          continue;
+        }
+        if (Date.now() >= waiter.deadline) {
+          this.finishWaiter(waiter, new AccountSchedulingError('queue_timeout', '账号并发等待超时，本次请求未因繁忙而切换账号。'));
+          continue;
+        }
+        const unavailable = accountUnavailableError(this.getAllAccounts(), waiter.family, waiter.excludeIds);
+        if (unavailable.code !== 'account_busy') {
+          this.finishWaiter(waiter, unavailable);
+          continue;
+        }
+        const lane = this.waiterLane(waiter);
+        const group = lanes.get(lane) ?? [];
+        if (group.length >= waiter.maxAccountQueue
+          || group.filter(item => item.root === waiter.root).length >= waiter.maxConversationQueue) {
+          this.finishWaiter(waiter, new AccountSchedulingError('queue_full', '绑定变化后的账号或对话等待队列已满，请稍后重试。'));
+          continue;
+        }
+        group.push(waiter);
+        lanes.set(lane, group);
+      }
+      for (const lane of this.readyRoots.keys()) if (!lanes.has(lane)) this.readyRoots.delete(lane);
+      // Bound queues have priority over cold conversations seeking any account.
+      for (const [lane, group] of [...lanes].sort(([a], [b]) => a === '*' ? 1 : b === '*' ? -1 : 0)) {
+        const roots = [...new Set(group.map(waiter => waiter.root))];
+        const ring = (this.readyRoots.get(lane) ?? []).filter(root => roots.includes(root));
+        for (const root of roots) if (!ring.includes(root)) ring.push(root);
+        this.readyRoots.set(lane, ring);
+        let misses = 0;
+        while (ring.length && misses < ring.length) {
+          const root = ring.shift()!;
+          ring.push(root);
+          const waiter = group.find(item => item.root === root && this.waiters.includes(item));
+          if (!waiter) {
+            ring.pop();
+            continue;
+          }
+          // A cold first request may have established the binding for its siblings.
+          if (lane === '*' && this.waiterLane(waiter) !== '*') { misses++; continue; }
+          const excluded = new Set(waiter.excludeIds);
+          if (lane === '*') {
+            for (const [boundLane, boundGroup] of lanes) {
+              if (boundLane !== '*' && boundGroup.some(item => this.waiters.includes(item))) excluded.add(boundLane);
+            }
+          }
+          const account = this.tryAcquireAccount(excluded, waiter.family, waiter.sessionKey);
+          if (!account) { misses++; continue; }
+          misses = 0;
+          console.info('[Scheduler] acquired req=' + (waiter.requestId ?? 'unknown')
+            + ' account=' + account.id + ' family=' + waiter.family + ' root=' + crypto.createHash('sha256').update(root).digest('hex').slice(0, 12)
+            + ' wait=' + (Date.now() - waiter.createdAt) + 'ms queued=' + (this.waiters.length - 1));
+          this.finishWaiter(waiter, undefined, account);
+        }
+      }
+    } finally {
+      this.draining = false;
+    }
+  }
+
+  public acquireAccountAsync(excludeIds: Set<string>, family: ModelFamily, sessionKey?: string,
+    options: AccountAcquireOptions = {}): Promise<Account | null> {
+    if (options.signal?.aborted) return Promise.reject(new Error('Request aborted by client.'));
+    if (this.disposed) return Promise.reject(new AccountSchedulingError('unavailable', '账号池已停止。'));
+    this.drainQueue();
+    const immediate = this.acquireAccount(excludeIds, family, sessionKey);
+    if (immediate) return Promise.resolve(immediate);
+    const unavailable = accountUnavailableError(this.getAllAccounts(), family, excludeIds);
+    if (unavailable.code !== 'account_busy') return Promise.reject(unavailable);
+    const lane = this.waiterLane({ sessionKey, family });
+    const root = sessionKey || 'request:' + crypto.randomUUID();
+    const inLane = this.waiters.filter(waiter => this.waiterLane(waiter) === lane);
+    const own = inLane.filter(waiter => waiter.root === root).length;
+    if (this.waiters.length >= (options.maxTotalQueue ?? 1000)
+      || inLane.length >= (options.maxAccountQueue ?? 100)
+      || own >= (options.maxConversationQueue ?? 32)) {
+      return Promise.reject(new AccountSchedulingError('queue_full', '账号或对话等待队列已满，请稍后重试。'));
+    }
+    const timeoutMs = Math.max(1, options.timeoutMs ?? 120000);
+    return new Promise((resolve, reject) => {
+      const waiter: AccountWaiter = { excludeIds: new Set(excludeIds), family, sessionKey, root,
+        createdAt: Date.now(), deadline: Date.now() + timeoutMs, requestId: options.requestId,
+        signal: options.signal, maxAccountQueue: options.maxAccountQueue ?? 100,
+        maxConversationQueue: options.maxConversationQueue ?? 32, resolve, reject };
+      waiter.onAbort = () => { this.finishWaiter(waiter, new Error('Request aborted by client.')); this.drainQueue(); };
+      waiter.timer = setTimeout(() => {
+        this.finishWaiter(waiter, new AccountSchedulingError('queue_timeout', '账号并发等待超时（' + timeoutMs + 'ms），本次请求未因繁忙而切换账号。'));
+        this.drainQueue();
+      }, timeoutMs);
+      this.waiters.push(waiter);
+      options.signal?.addEventListener('abort', waiter.onAbort, { once: true });
+      console.info('[Scheduler] queued req=' + (options.requestId ?? 'unknown') + ' reason=account_busy'
+        + ' account=' + lane + ' family=' + family + ' depth=' + (inLane.length + 1));
+      this.queueTimer ??= setInterval(() => this.drainQueue(), 100);
+      this.drainQueue();
+    });
+  }
+
   /**
    * 获取下一个可用的账号（支持零浪费智能调度、会话粘性防 Cache 穿透、临期抢救、流水线耗尽与故障转移）
    */
@@ -283,13 +549,29 @@ export class AccountPool {
     requiredFamily?: 'claude' | 'gemini',
     sessionKey?: string
   ): Account | null {
+    if (this.disposed || this.hasQueuedPriority(sessionKey, requiredFamily)) return null;
+    const excluded = new Set(excludeIds);
+    if (!sessionKey || !this.getSessionBinding(sessionKey, requiredFamily)) {
+      for (const waiter of this.waiters) {
+        const lane = this.waiterLane(waiter);
+        if (lane !== '*') excluded.add(lane);
+      }
+    }
+    return this.tryAcquireAccount(excluded, requiredFamily, sessionKey);
+  }
+
+  private tryAcquireAccount(excludeIds: Set<string>, requiredFamily?: ModelFamily, sessionKey?: string): Account | null {
     const now = Date.now();
-    const existingBinding = sessionKey ? this.sessionBindings.get(sessionKey) : undefined;
+    let existingBinding = sessionKey ? this.getSessionBinding(sessionKey, requiredFamily) : undefined;
     if (existingBinding) {
       const boundAccount = this.accounts.get(existingBinding.accountId);
-      if (!boundAccount || boundAccount.status === 'dead' || boundAccount.status === 'disabled') {
-        this.sessionBindings.delete(sessionKey!);
-      } else if (boundAccount.status === 'active' && !excludeIds.has(boundAccount.id) && boundAccount.activeConcurrency >= boundAccount.maxConcurrency) {
+      if (!boundAccount || !this.isEligible(boundAccount, requiredFamily, now)) {
+        const reason = !boundAccount ? 'account_removed'
+          : !hasFamilyQuota(boundAccount, requiredFamily, now) ? 'quota_exhausted' : 'account_' + boundAccount.status;
+        this.clearSessionBinding(sessionKey, existingBinding.accountId, existingBinding.version, requiredFamily, reason);
+        existingBinding = undefined;
+      } else if (!excludeIds.has(boundAccount.id)
+        && hasFamilyQuota(boundAccount, requiredFamily, now) && boundAccount.activeConcurrency >= boundAccount.maxConcurrency) {
         // A bound conversation waits for its own lease. Never borrow another
         // account merely because the bound account is momentarily full.
         return null;
@@ -300,6 +582,14 @@ export class AccountPool {
         return null;
       }
     }
+
+    // A family's first request also waits for the conversation's usable home.
+    // Do not create a cold binding until a real lease is acquired.
+    const relatedBinding = !existingBinding && sessionKey ? this.getSessionBinding(sessionKey) : undefined;
+    const related = relatedBinding ? this.accounts.get(relatedBinding.accountId) : undefined;
+    const relatedAccount = related && !excludeIds.has(related.id) && this.isEligible(related, requiredFamily, now) ? related : undefined;
+    if (relatedAccount && relatedAccount.activeConcurrency >= relatedAccount.maxConcurrency) return null;
+
     const candidates: Account[] = [];
 
     for (const acc of this.accounts.values()) {
@@ -312,50 +602,9 @@ export class AccountPool {
         console.log(`[AccountPool] Account ${acc.email} (${acc.id}) cooldown expired, returned to active.`);
       }
 
-      // 筛选健康且未满并发的账号
-      if (acc.status === 'active' && acc.activeConcurrency < acc.maxConcurrency) {
-        // 如果账号具备额度监控信息，检查对应模型组的额度是否已耗尽
-        if (acc.quota && requiredFamily) {
-          if (requiredFamily === 'claude') {
-            const isWeeklyExhausted = (acc.quota.claudeWeeklyFraction <= 0.005);
-            const is5hExhausted = (acc.quota.claude5hFraction <= 0.01);
-            const resetTime = acc.quota.claudeWeeklyResetTime ? new Date(acc.quota.claudeWeeklyResetTime).getTime() : 0;
-            const reset5hTime = acc.quota.claudeResetTime ? new Date(acc.quota.claudeResetTime).getTime() : 0;
-
-            if (isWeeklyExhausted && resetTime > now) {
-              continue;
-            }
-            if (is5hExhausted && reset5hTime > now) {
-              continue;
-            }
-          } else if (requiredFamily === 'gemini') {
-            const isWeeklyExhausted = (acc.quota.geminiWeeklyFraction <= 0.005);
-            const is5hExhausted = (acc.quota.gemini5hFraction <= 0.01);
-            const resetTime = acc.quota.geminiWeeklyResetTime ? new Date(acc.quota.geminiWeeklyResetTime).getTime() : 0;
-            const reset5hTime = acc.quota.geminiResetTime ? new Date(acc.quota.geminiResetTime).getTime() : 0;
-
-            if (isWeeklyExhausted && resetTime > now) {
-              continue;
-            }
-            if (is5hExhausted && reset5hTime > now) {
-              continue;
-            }
-          }
-        }
-
+      if (acc.status === 'active' && acc.activeConcurrency < acc.maxConcurrency
+        && hasFamilyQuota(acc, requiredFamily, now)) {
         candidates.push(acc);
-      }
-    }
-
-    // 兜底策略：只有在账号尚未拉取过额度信息 (!acc.quota) 时才允许兜底尝试，
-    // 如果已知该家族额度已用尽 (如 claude5hFraction <= 0.01 且未到重置时间)，坚决不兜底送去撞 Google 429！
-    if (candidates.length === 0 && requiredFamily) {
-      for (const acc of this.accounts.values()) {
-        if (!excludeIds.has(acc.id) && acc.status === 'active' && acc.activeConcurrency < acc.maxConcurrency) {
-          if (!acc.quota) {
-            candidates.push(acc);
-          }
-        }
       }
     }
 
@@ -363,7 +612,38 @@ export class AccountPool {
       return null;
     }
 
-    let chosen: Account | null = null;
+    // Reserve unused conversation homes first. Once all homes are shared,
+    // actual capacity pressure precedes conversation counts.
+    if (!existingBinding && !relatedAccount && sessionKey) {
+      const sessionsByAccount = new Map<string, Set<string>>();
+      for (const [key, binding] of this.sessionBindings) {
+        // Match the cleaner's idle window; request-scoped preflight leases
+        // are not persistent conversations.
+        if (binding.sessionKey.startsWith('request:')) continue;
+        if (now - binding.lastUsedAt > this.activeConversationTtlMs
+          && !this.sessionLeases.has(key) && !this.waiters.some(waiter => waiter.sessionKey === binding.sessionKey && waiter.family === binding.family)) continue;
+        const sessions = sessionsByAccount.get(binding.accountId) ?? new Set<string>();
+        sessions.add(binding.sessionKey);
+        sessionsByAccount.set(binding.accountId, sessions);
+      }
+      const sessionCounts = new Map([...sessionsByAccount].map(([id, sessions]) => [id, sessions.size]));
+      const load = (acc: Account) => (acc.activeConcurrency + this.queueDepth(acc.id)) / Math.max(1, acc.maxConcurrency);
+      if (candidates.some(acc => !sessionCounts.get(acc.id))) {
+        for (let i = candidates.length - 1; i >= 0; i--) {
+          if (sessionCounts.get(candidates[i].id)) candidates.splice(i, 1);
+        }
+      }
+      const minLoad = Math.min(...candidates.map(load));
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        if (load(candidates[i]) > minLoad + Number.EPSILON) candidates.splice(i, 1);
+      }
+      const minBoundSessions = Math.min(...candidates.map(acc => sessionCounts.get(acc.id) ?? 0));
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        if ((sessionCounts.get(candidates[i].id) ?? 0) > minBoundSessions) candidates.splice(i, 1);
+      }
+    }
+
+    let chosen: Account | null = relatedAccount ?? null;
 
     // ==================== 统一阶段 1: 会话粘性 (Pure Session Affinity - Cache First) ====================
     // 只要绑定账号仍健康且有空闲并发，就复用该账号。缓存命中率
@@ -374,11 +654,11 @@ export class AccountPool {
       const candidateAcc = candidates.find(c => c.id === bound.accountId);
       if (candidateAcc) {
         chosen = candidateAcc;
-        this.sessionBindings.set(sessionKey, { accountId: chosen.id, lastUsedAt: now });
+        existingBinding.lastUsedAt = now;
       }
     }
 
-    // ==================== 阶段 2: 仅全新会话或旧账号满载失效时，才执行调度分配 ====================
+    // ==================== 阶段 2: 仅全新会话或旧账号不可用时，才执行调度分配 ====================
     if (!chosen) {
       if (this.routingStrategy === 'zero-waste') {
         // ==================== 策略 1: 零浪费智能调度 (新会话临期抢救 + 流水线耗尽) ====================
@@ -478,12 +758,16 @@ export class AccountPool {
         chosen = candidates[0];
       }
 
-      // 新会话首次分配，立刻建立强粘性绑定，锁死后续所有连续请求
-      if (sessionKey) {
-        this.sessionBindings.set(sessionKey, { accountId: chosen.id, lastUsedAt: now });
-      }
     }
 
+    // Each family binds once, including when it shares the sibling's account.
+    if (sessionKey && !existingBinding) {
+      this.sessionBindings.set(this.sessionBindingKey(sessionKey, requiredFamily), { sessionKey, family: requiredFamily,
+        accountId: chosen.id, lastUsedAt: now,
+        version: ++this.bindingVersion, generationStarted: false });
+      console.info('[Scheduler] bound root=' + crypto.createHash('sha256').update(sessionKey).digest('hex').slice(0, 12)
+        + ' family=' + (requiredFamily ?? 'any') + ' account=' + chosen.id + ' reason=new_placement');
+    }
     chosen.activeConcurrency++;
     chosen.lastUsedAt = now;
     chosen.totalRequests++;
@@ -493,35 +777,20 @@ export class AccountPool {
   }
 
   /**
-   * Quota exhaustion is remembered as a zeroed fraction plus a reset time.
-   * When upstream never said when the window resets, the account would be
-   * selected again on the very next request; fall back to the cooldown window.
-   */
-  private ensureFamilyBlockedUntil(acc: Account, family: 'claude' | 'gemini', retryMs: number): void {
-    if (!acc.quota) return;
-    const resetField = family === 'claude' ? 'claudeResetTime' : 'geminiResetTime';
-    const current = acc.quota[resetField];
-    const currentMs = current ? new Date(current).getTime() : 0;
-    if (!Number.isFinite(currentMs) || currentMs <= Date.now()) {
-      // Floor at the quota poll period: a shorter window would expire before
-      // the next poll can confirm whether the quota really came back.
-      acc.quota[resetField] = new Date(Date.now() + Math.max(retryMs, 3 * 60_000)).toISOString();
-    }
-  }
-
-  /**
    * 释放借出的账号，并处理错误与状态更新
    */
   public releaseAccount(
     accId: string,
     error?: { code: number; message: string; retryAfterMs?: number; recoverable?: boolean },
     family?: 'claude' | 'gemini',
-    sessionKey?: string
+    sessionKey?: string,
+    bindingVersion?: number
   ): void {
     const acc = this.accounts.get(accId);
     if (!acc) return;
 
     acc.activeConcurrency = Math.max(0, acc.activeConcurrency - 1);
+    queueMicrotask(() => this.drainQueue());
     // A completed request proves the account is usable again: clear the
     // escalation counter used for unrecognised 403s.
     if (!error) acc.forbiddenCount = 0;
@@ -541,38 +810,34 @@ export class AccountPool {
         // A plain rate-limit response must cool the whole account.
         const isQuotaExhausted = classifyUpstreamError(error.code, error.message).kind === 'quota';
         const retryMs = error.retryAfterMs ?? retryAfterMs(undefined, error.message, 60 * 1000);
+        if (isQuotaExhausted && family) {
+          const resetTime = family === 'claude' ? acc.quota?.claudeResetTime : acc.quota?.geminiResetTime;
+          const waitMs = Date.parse(resetTime || '') > Date.now() ? retryMs : Math.max(retryMs, 3 * 60_000);
+          acc.quotaBlockedUntil = { ...acc.quotaBlockedUntil,
+            // Keep the previous three-minute probe floor without inventing a
+            // quota reset timestamp. Polling cannot confirm recovery sooner.
+            [family]: Math.max(acc.quotaBlockedUntil?.[family] ?? 0, Date.now() + waitMs) };
+        }
 
         if (isTerminal) {
+          reconcileQuotaState(acc);
           console.warn(`[CircuitBreaker] 账号 ${acc.email} 已处于终态 (${acc.status})，忽略其迟到请求的 429，不会自动复活。`);
-          this.clearSessionBinding(sessionKey, accId);
+          this.clearSessionBinding(sessionKey, accId, bindingVersion, family, 'terminal_429');
           this.saveAccounts();
           return;
         }
 
         if (isQuotaExhausted && family === 'claude') {
-          // 仅 Claude / 3p 额度耗尽：精准置零 Claude 5h 额度，账号全局状态依然保持 active，Gemini 请求不受任何影响！
+          // Keep the effective balance at zero until the rejection expires.
           if (acc.quota) {
             acc.quota.claude5hFraction = 0.0;
-            // 只有 5h 分数的账号在重置时间缺失或已过期时会被立刻重新选中，
-            // 于是反复撞上已耗尽的账号。补一个兜底重置时间，等下一次额度
-            // 轮询给出真实时间再覆盖。
-            this.ensureFamilyBlockedUntil(acc, 'claude', retryMs);
           }
-          if (!acc.quota) {
-            acc.status = 'cooldown';
-            acc.cooldownUntil = Math.max(acc.cooldownUntil, Date.now() + retryMs);
-          }
-          console.warn(`[CircuitBreaker] 账号 ${acc.email} Claude/GPT 5h 额度耗尽，已标记 Claude 耗尽，账号保持 Active 供 Gemini 继续使用。`);
+          console.warn(`[CircuitBreaker] 账号 ${acc.email} Claude/GPT 额度受限，已暂停该家族调度，账号保持 Active 供 Gemini 继续使用。`);
         } else if (isQuotaExhausted && family === 'gemini') {
           if (acc.quota) {
             acc.quota.gemini5hFraction = 0.0;
-            this.ensureFamilyBlockedUntil(acc, 'gemini', retryMs);
           }
-          if (!acc.quota) {
-            acc.status = 'cooldown';
-            acc.cooldownUntil = Math.max(acc.cooldownUntil, Date.now() + retryMs);
-          }
-          console.warn(`[CircuitBreaker] 账号 ${acc.email} Gemini 5h 额度耗尽，已标记 Gemini 耗尽，账号保持 Active 供 Claude 继续使用。`);
+          console.warn(`[CircuitBreaker] 账号 ${acc.email} Gemini 额度受限，已暂停该家族调度，账号保持 Active 供 Claude 继续使用。`);
         } else {
           // 通用 RPM 频率限制（非特定模型额度用尽），遵守上游给出的冷却时间。
           // 取最大值：并发返回的多个 429 不能用一个更短的窗口覆盖更长的冷却。
@@ -581,11 +846,12 @@ export class AccountPool {
           console.warn(`[CircuitBreaker] 账号 ${acc.email} 触发通用 429 限频，进入冷却 ${Math.ceil(retryMs / 1000)} 秒。`);
         }
 
+        reconcileQuotaState(acc);
         this.saveAccounts();
 
         // 只清理触发此次失败的会话。一个账号上的其他会话不能因为
         // 某个模型或某个会话的 429 全部失去粘性。
-        this.clearSessionBinding(sessionKey, accId);
+        this.clearSessionBinding(sessionKey, accId, bindingVersion, family, isQuotaExhausted ? 'quota_429' : 'rate_limit_429');
       } else if (error.code === 401) {
         if (error.recoverable) {
           // A freshly minted token was rejected (auth replication lag, a
@@ -608,7 +874,7 @@ export class AccountPool {
           acc.status = 'dead';
           console.warn(`[CircuitBreaker] Account ${acc.email} returned 401 and was isolated until manual re-authentication.`);
         }
-        this.clearSessionBinding(sessionKey, accId);
+        this.clearSessionBinding(sessionKey, accId, bindingVersion, family, 'authentication_401');
         this.saveAccounts();
       } else if (error.code === 403) {
         const classified = classifyUpstreamError(error.code, error.message);
@@ -616,7 +882,7 @@ export class AccountPool {
           acc.status = 'dead';
           acc.lastError = `[POLICY_BLOCKED] ${error.message}`;
           console.error(`[CircuitBreaker] Account ${acc.email} marked as POLICY_BLOCKED; automatic retries are disabled.`);
-          this.clearSessionBinding(sessionKey, accId);
+          this.clearSessionBinding(sessionKey, accId, bindingVersion, family, 'policy_403');
           this.saveAccounts();
           return;
         }
@@ -641,7 +907,7 @@ export class AccountPool {
           acc.status = 'dead';
           console.error(`[CircuitBreaker] Account ${acc.email} marked as DEAD due to 403 Forbidden.`);
         }
-        this.clearSessionBinding(sessionKey, accId);
+        this.clearSessionBinding(sessionKey, accId, bindingVersion, family, 'permission_403');
         this.saveAccounts();
       }
     }

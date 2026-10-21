@@ -154,7 +154,7 @@ export function sendGatewayError(
   } else if (protocol === 'responses') {
     reply.raw.write(`event: error\ndata: ${JSON.stringify({
       type: 'error',
-      code: payload.error?.type ?? 'api_error',
+      code: payload.error?.code ?? payload.error?.type ?? 'api_error',
       message: payload.error?.message ?? 'Upstream request failed',
       param: null,
       ...upstreamStatus,

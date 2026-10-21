@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { test } from 'node:test';
+import { AccountSchedulingError } from '../src/pool/scheduling.js';
 import { createServer } from '../src/gateway/server.js';
 
 // The executor falls back to the ambient proxy env vars when no proxy is
@@ -116,7 +117,7 @@ test('countTokens acquires the supplied session binding key', async () => {
   }
 });
 
-test('a 429 is cooled down and returned without rotating to another account', async () => {
+test('an unclassified 429 is cooled down without rotating or returning Google 429', async () => {
   let calls = 0;
   const upstream = await withUpstream((_req, res) => {
     calls++;
@@ -145,7 +146,7 @@ test('a 429 is cooled down and returned without rotating to another account', as
   try {
     await assert.rejects(
       executor.executeWithRetry(payload, 3),
-      (error: any) => error?.statusCode === 429
+      (error: any) => error?.statusCode === 503 && error?.code === 'rate_limited'
     );
     assert.equal(calls, 1);
     assert.equal(acc.status, 'cooldown');
@@ -184,7 +185,7 @@ test('an invalid countTokens success body releases its lease exactly once', asyn
   }
 });
 
-test('429 Retry-After is returned to API clients', async () => {
+test('a rate limit becomes a local 503 and preserves Retry-After for API clients', async () => {
   const app = await createServer(config('http://127.0.0.1:1/v1internal:streamGenerateContent?alt=sse'), {
     releaseAccount() {},
     recordTokenUsage() {},
@@ -193,7 +194,7 @@ test('429 Retry-After is returned to API clients', async () => {
   } as any, {} as any, {
     fetchAvailableModels: async () => ({ models: { 'gemini-3.8-flash': {} }, agentModelSorts: [{ groups: [{ modelIds: ['gemini-3.8-flash'] }] }] }),
     executeWithRetry: async () => {
-      throw new UpstreamRequestError(429, '{"error":"rate limited"}', { 'retry-after': '11' });
+      throw new AccountSchedulingError('rate_limited', 'Upstream temporarily limited request frequency.', 11);
     }
   } as any);
 
@@ -203,7 +204,8 @@ test('429 Retry-After is returned to API clients', async () => {
       url: '/v1/chat/completions',
       payload: { model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'hello' }] }
     });
-    assert.equal(response.statusCode, 429, response.body);
+    assert.equal(response.statusCode, 503, response.body);
+    assert.equal(response.json().error.code, 'rate_limited');
     assert.equal(response.headers['retry-after'], '11');
   } finally {
     await app.close();

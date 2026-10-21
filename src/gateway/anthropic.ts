@@ -4,6 +4,7 @@ import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { AppConfig, GoogleCloudCodePayload, GoogleContent } from '../types.js';
 import { AccountPool, mergeUsageMetadata } from '../pool/account-pool.js';
 import { ContextOverflowError, getRetryAfterHeader, LocationNotSupportedError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
+import { AccountSchedulingError } from '../pool/scheduling.js';
 import {
   ModelRequestError,
   ResolvedModel,
@@ -11,7 +12,7 @@ import {
   resolveFrameworkThinking,
   resolveThinkingConfig,
 } from './models.js';
-import { attachUpstreamSessionId, extractSessionKey } from './session.js';
+import { attachUpstreamSessionId, extractSessionKey, extractSessionIdentity, logSessionIdentity } from './session.js';
 import { anthropicErrorType, prepareSseResponse, sendGatewayError, startRequestLifecycle } from './streaming.js';
 
 interface AnthropicMessageParam {
@@ -230,7 +231,7 @@ function convertAnthropicMessages(
  * （如 $schema, propertyNames, exclusiveMinimum, anyOf/oneOf/allOf, patternProperties 等），
  * 转换为 Google Protobuf Schema 严格兼容的 OpenAPI 3.0 子集。
  */
-function sanitizeGoogleSchema(schema: any): any {
+export function sanitizeGoogleSchema(schema: any): any {
   if (!schema || typeof schema !== 'object') return schema;
   // Google Schema requires array.items to be a concrete Schema object. JSON
   // Schema may omit it or provide tuple items, so use the first item and a
@@ -284,7 +285,8 @@ function sanitizeGoogleSchema(schema: any): any {
   if (!s.type) {
     if (s.properties) s.type = 'object';
     else if (s.items) s.type = 'array';
-    else s.type = 'object';
+    else if (s.enum) s.type = 'string';
+    else s.type = 'string';
   }
 
   // 7. Google Schema Proto 允许字段白名单
@@ -395,11 +397,16 @@ export function registerAnthropicRoutes(
       const counted = await executor.countTokens({ project: 'aicode-consumers', model: modelDef.upstreamModel, request }, 3, sessionKey, lifecycle.signal, req.id);
       return reply.send({ input_tokens: counted.totalTokens });
     } catch (err: any) {
+      if (err instanceof ContextOverflowError) {
+        return sendGatewayError(reply, 400, { type: 'error',
+          error: { type: 'invalid_request_error', code: err.code, message: err.clientMessage } }, 'anthropic');
+      }
       const statusCode = err.statusCode && err.statusCode >= 400 && err.statusCode < 500 ? err.statusCode : 503;
       applyRetryAfter(reply, err);
       return sendGatewayError(reply, statusCode, {
         type: 'error',
-        error: { type: anthropicErrorType(statusCode), message: `Unable to count request tokens: ${err.message}` }
+        error: { type: anthropicErrorType(statusCode), message: `Unable to count request tokens: ${err.message}`,
+          ...(err instanceof AccountSchedulingError ? { code: err.code } : {}) }
       }, 'anthropic', { retryAfterSeconds: getRetryAfterHeader(err) });
     }
   };
@@ -474,7 +481,8 @@ export function registerAnthropicRoutes(
       generationConfig
     };
 
-    // 3. 转换 Tools & ToolConfig
+    // 3. 转换 Tools & ToolConfig。CloudCode v1internal 支持
+    // 原生函数调用策略（放在 innerRequest.toolConfig 内部）。
     const toolNameMapping = new Map<string, string>();
     if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
       const functionDeclarations = body.tools.map((t: any) => {
@@ -490,7 +498,6 @@ export function registerAnthropicRoutes(
       if (functionDeclarations.length > 0) {
         innerRequest.tools = [{ functionDeclarations }];
       }
-
       if (body.tool_choice) {
         if (body.tool_choice.type === 'any') {
           innerRequest.toolConfig = { functionCallingConfig: { mode: 'ANY' } };
@@ -502,7 +509,7 @@ export function registerAnthropicRoutes(
             }
           };
         } else if (body.tool_choice.type === 'none') {
-          innerRequest.toolConfig = { functionCallingConfig: { mode: 'NONE' } };
+          delete innerRequest.tools;
         } else {
           innerRequest.toolConfig = { functionCallingConfig: { mode: 'AUTO' } };
         }
@@ -537,7 +544,9 @@ export function registerAnthropicRoutes(
     const messageId = `msg_${crypto.randomBytes(12).toString('hex')}`;
 
     // 提取稳定会话唯一指纹（用于强会话粘性，最大化利用 Google 上游 Prompt Cache）
-    const sessionKey = extractSessionKeyFromAnthropic(req, body);
+    const sessionIdentity = extractSessionIdentity(req.headers as Record<string, unknown>, body, 'anthropic');
+    const sessionKey = sessionIdentity?.rootKey;
+    logSessionIdentity(sessionIdentity, req.id);
     // Even clients without a conversation identifier must use one account for
     // the countTokens preflight and the following generation request. The
     // ephemeral lease key is only used by the local account pool; it is never
@@ -548,61 +557,20 @@ export function registerAnthropicRoutes(
     };
     attachUpstreamSessionId(payload, sessionKey);
 
-    // Anthropic clients use message_start.usage.input_tokens to decide when to
-    // run their native context compaction. Count the exact Google request before
-    // generation so custom endpoints get the same signal as api.anthropic.com.
-    let inputTokenCount = 0;
-    try {
-      const counted = await executor.countTokens(payload, 3, accountLeaseKey, lifecycle.signal, req.id);
-      inputTokenCount = counted.totalTokens;
-      console.info(`[AnthropicGateway] Preflight countTokens: ${inputTokenCount} input tokens (session ${sessionKey || 'none'})`);
-    } catch (countErr: any) {
-      if (lifecycle.signal.aborted) {
-        // The client is gone: drop the ephemeral lease instead of leaving a
-        // dead binding behind for this request key.
-        clearEphemeralAccountLease();
-        return;
-      }
-      // The preflight is an auxiliary control-plane call. Only an upstream
-      // decision that already condemns this request (quota, policy, region,
-      // auth) may block generation; a transport blip must not turn a valid
-      // request into a client-visible failure, and must not cost Google a
-      // second generation request just to learn the same error twice.
-      // 5xx is transient: the generation path itself retries 503, so a flaky
-      // count endpoint must not cancel the whole turn.
-      const isUpstreamDecision = countErr instanceof UpstreamRequestError && countErr.statusCode < 500;
-      if (!isUpstreamDecision) {
-        console.warn(`[AnthropicGateway] Preflight countTokens unavailable (${countErr.message}); continuing with an unknown input token count.`);
-        inputTokenCount = 0;
-      } else {
-        const statusCode = countErr instanceof LocationNotSupportedError ? 400 : countErr.statusCode;
-        const message = countErr instanceof LocationNotSupportedError
-          ? 'Google Upstream 拒绝访问：当前代理出口 IP 地区不受支持 (User location is not supported for the API use)。'
-          : countErr.message;
-        console.error(`[AnthropicGateway] Preflight countTokens rejected by upstream; generation was blocked: ${countErr.message}`);
-        applyRetryAfter(reply, countErr);
-        clearEphemeralAccountLease();
-        return sendGatewayError(reply, statusCode, {
-          type: 'error',
-          error: { type: anthropicErrorType(statusCode), message }
-        }, 'anthropic', { retryAfterSeconds: getRetryAfterHeader(countErr) });
-      }
-    }
-
     let upstreamRes: any;
     try {
-      upstreamRes = await executor.executeWithRetry(payload, 3, accountLeaseKey, lifecycle.signal, req.id);
+      // Hold one concurrency slot through preflight, generation and response consumption.
+      upstreamRes = await executor.executeWithRetry(payload, 3, accountLeaseKey, lifecycle.signal, req.id, true);
     } catch (err: any) {
       clearEphemeralAccountLease();
       if (lifecycle.signal.aborted) return;
       if (err instanceof ContextOverflowError) {
-        // Claude Code owns conversation compaction. Never rewrite the history
-        // here: returning the native upstream error lets the client compact its
-        // local transcript and issue the next request with the compacted state.
+        // Claude Code recognizes native prompt-too-long wording in both main
+        // and child sessions. A custom instruction to compact is not recognized.
         applyRetryAfter(reply, err);
         return sendGatewayError(reply, 400, {
           type: 'error',
-          error: { type: 'invalid_request_error', message: 'Request context exceeds the upstream limit. Claude Code must compact the conversation and retry.' }
+          error: { type: 'invalid_request_error', code: err.code, message: err.clientMessage }
         }, 'anthropic', { retryAfterSeconds: getRetryAfterHeader(err) });
       }
       if (err instanceof LocationNotSupportedError) {
@@ -620,11 +588,12 @@ export function registerAnthropicRoutes(
       applyRetryAfter(reply, err);
       return sendGatewayError(reply, statusCode, {
         type: 'error',
-        error: { type: anthropicErrorType(statusCode), message }
+        error: { type: anthropicErrorType(statusCode), message, ...(err instanceof AccountSchedulingError ? { code: err.code } : {}) }
       }, 'anthropic', { retryAfterSeconds: getRetryAfterHeader(err) });
     }
 
     const { bodyStream, accountUsed } = upstreamRes;
+    const inputTokenCount = upstreamRes.inputTokenCount ?? 0;
 
     if (isStream) {
       // Anthropic SSE 流式协议
@@ -634,7 +603,8 @@ export function registerAnthropicRoutes(
       const cleanup = (err?: any) => {
         if (released) return;
         released = true;
-        pool.releaseAccount(accountUsed.id, err);
+        if (upstreamRes.release) upstreamRes.release(err);
+        else pool.releaseAccount(accountUsed.id, err);
         clearEphemeralAccountLease();
       };
       try {
@@ -837,7 +807,10 @@ export function registerAnthropicRoutes(
             stop_reason: hasToolUse ? 'tool_use' : 'end_turn',
             stop_sequence: null
           },
-          usage: { output_tokens: lastUsageMetadata?.candidatesTokenCount ?? 0 }
+          // Preflight can fail transiently. Correct the initial zero/estimate
+          // with upstream usage so clients can trigger automatic compaction.
+          usage: { input_tokens: lastUsageMetadata?.promptTokenCount ?? inputTokenCount,
+            output_tokens: lastUsageMetadata?.candidatesTokenCount ?? 0 }
         };
         reply.raw.write(`event: message_delta\ndata: ${JSON.stringify(msgDelta)}\n\n`);
 
@@ -866,7 +839,8 @@ export function registerAnthropicRoutes(
       const releaseNonStream = (err?: any) => {
         if (nonStreamReleased) return;
         nonStreamReleased = true;
-        pool.releaseAccount(accountUsed.id, err);
+        if (upstreamRes.release) upstreamRes.release(err);
+        else pool.releaseAccount(accountUsed.id, err);
         clearEphemeralAccountLease();
       };
       let fullText = '';
@@ -943,7 +917,7 @@ export function registerAnthropicRoutes(
           stop_reason: hasToolUse ? 'tool_use' : 'end_turn',
           stop_sequence: null,
           usage: {
-            input_tokens: lastUsageMetadata?.promptTokenCount ?? 0,
+            input_tokens: lastUsageMetadata?.promptTokenCount ?? inputTokenCount,
             output_tokens: lastUsageMetadata?.candidatesTokenCount ?? 0
           }
         });
