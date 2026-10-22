@@ -541,10 +541,18 @@ export async function createServer(
       max_tokens: input.max_output_tokens,
       reasoning_effort: input.reasoning?.effort || input.reasoning_effort,
       tools: Array.isArray(input.tools)
-        ? input.tools.filter((t: any) => t?.type === 'function' && t.name).map((t: any) => ({
-          type: 'function' as const,
-          function: { name: t.name, description: t.description, parameters: t.parameters }
-        }))
+        ? input.tools.map((t: any) => {
+          const name = t?.name || t?.function?.name || (t?.type && String(t.type).startsWith('web_search') ? 'web_search' : undefined);
+          if (!name) return null;
+          return {
+            type: 'function' as const,
+            function: {
+              name,
+              description: t.description || t.function?.description,
+              parameters: t.parameters || t.function?.parameters || { type: 'object', properties: {} }
+            }
+          };
+        }).filter(Boolean) as any
         : undefined,
       tool_choice: input.tool_choice
     };

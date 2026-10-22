@@ -140,24 +140,37 @@ export function convertOpenAIToCloudCode(req: OpenAIChatCompletionRequest, catal
   }
 
   if (Array.isArray(req.tools) && req.tools.length) {
-    innerRequest.tools = [{
-      functionDeclarations: req.tools
-        .filter(tool => tool?.type === 'function' && tool.function?.name)
-        .map(tool => ({
-          name: normalizeToolName(tool.function.name),
-          description: tool.function.description || '',
-          parameters: sanitizeGoogleSchema(tool.function.parameters || { type: 'object', properties: {} })
-        }))
-    }];
+    const functionDeclarations: any[] = [];
+    for (const tool of req.tools) {
+      const t = tool as any;
+      const rawName = t?.function?.name || t?.name || (typeof t?.type === 'string' && t.type.startsWith('web_search') ? 'web_search' : '');
+      if (!rawName) continue;
+      const name = normalizeToolName(rawName);
+      const rawDesc = t?.function?.description || t?.description;
+      const description = (typeof rawDesc === 'string' && rawDesc.trim()) || `Tool ${name}`;
+      const rawParams = t?.function?.parameters || t?.parameters || t?.input_schema || { type: 'object', properties: {} };
+      functionDeclarations.push({
+        name,
+        description,
+        parameters: sanitizeGoogleSchema(rawParams)
+      });
+    }
+    if (functionDeclarations.length > 0) {
+      innerRequest.tools = [{ functionDeclarations }];
+    }
   }
   if (req.tool_choice && req.tool_choice !== 'auto') {
     if (req.tool_choice === 'none') {
       delete innerRequest.tools;
     } else {
+      const targetName = req.tool_choice?.function?.name || req.tool_choice?.name;
+      const mode = isGemini
+        ? (req.tool_choice === 'required' ? 'ANY' : 'AUTO')
+        : 'VALIDATED';
       innerRequest.toolConfig = {
         functionCallingConfig: {
-          mode: req.tool_choice === 'required' ? 'ANY' : 'AUTO',
-          ...(req.tool_choice?.function?.name ? { allowedFunctionNames: [normalizeToolName(req.tool_choice.function.name)] } : {})
+          mode,
+          ...(targetName ? { allowedFunctionNames: [normalizeToolName(targetName)] } : {})
         }
       };
     }

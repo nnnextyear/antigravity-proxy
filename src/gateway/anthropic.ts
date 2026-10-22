@@ -329,7 +329,7 @@ export function sanitizeGoogleSchema(schema: any): any {
     }
   }
 
-  if (result.type === 'object' && !result.properties) {
+  if ((result.type === 'object' || result.type === 'OBJECT') && !result.properties) {
     result.properties = {};
   }
   if (!result.type) {
@@ -385,11 +385,15 @@ export function registerAnthropicRoutes(
     const request: any = { contents: converted.contents };
     if (systemTexts.length) request.systemInstruction = { parts: [{ text: systemTexts.join('\n\n') }] };
     if (Array.isArray(body.tools) && body.tools.length) {
-      request.tools = [{ functionDeclarations: body.tools.map((tool: any) => ({
-        name: sanitizeToolName(tool.name),
-        description: tool.description || '',
-        parameters: sanitizeGoogleSchema(tool.input_schema || tool.parameters || { type: 'object', properties: {} })
-      })) }];
+      request.tools = [{ functionDeclarations: body.tools.map((tool: any) => {
+        const cleanName = sanitizeToolName(tool.name || (tool.type && String(tool.type).startsWith('web_search') ? 'web_search' : 'tool'));
+        const desc = (typeof tool.description === 'string' && tool.description.trim()) || `Tool ${cleanName}`;
+        return {
+          name: cleanName,
+          description: desc,
+          parameters: sanitizeGoogleSchema(tool.input_schema || tool.parameters || { type: 'object', properties: {} })
+        };
+      }) }];
     }
 
     try {
@@ -485,33 +489,42 @@ export function registerAnthropicRoutes(
     // 原生函数调用策略（放在 innerRequest.toolConfig 内部）。
     const toolNameMapping = new Map<string, string>();
     if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
-      const functionDeclarations = body.tools.map((t: any) => {
-        const cleanName = sanitizeToolName(t.name);
-        toolNameMapping.set(cleanName, t.name);
-        return {
+      const functionDeclarations: any[] = [];
+
+      for (const t of body.tools) {
+        const rawName = t.name || (typeof t.type === 'string' && t.type.startsWith('web_search') ? 'web_search' : 'tool');
+        const cleanName = sanitizeToolName(rawName);
+        toolNameMapping.set(cleanName, t.name || cleanName);
+        const desc = (typeof t.description === 'string' && t.description.trim()) || `Tool ${cleanName}`;
+        functionDeclarations.push({
           name: cleanName,
-          description: t.description || '',
+          description: desc,
           parameters: sanitizeGoogleSchema(t.input_schema || t.parameters || { type: 'object', properties: {} })
-        };
-      });
+        });
+      }
 
       if (functionDeclarations.length > 0) {
         innerRequest.tools = [{ functionDeclarations }];
       }
+
       if (body.tool_choice) {
-        if (body.tool_choice.type === 'any') {
-          innerRequest.toolConfig = { functionCallingConfig: { mode: 'ANY' } };
-        } else if (body.tool_choice.type === 'tool' && body.tool_choice.name) {
+        const mode = isGemini
+          ? (body.tool_choice.type === 'any' ? 'ANY' : 'AUTO')
+          : 'VALIDATED';
+        const targetName = body.tool_choice.type === 'tool' && body.tool_choice.name
+          ? sanitizeToolName(body.tool_choice.name)
+          : undefined;
+        if (targetName) {
           innerRequest.toolConfig = {
             functionCallingConfig: {
-              mode: 'ANY',
-              allowedFunctionNames: [sanitizeToolName(body.tool_choice.name)]
+              mode,
+              allowedFunctionNames: [targetName]
             }
           };
         } else if (body.tool_choice.type === 'none') {
           delete innerRequest.tools;
         } else {
-          innerRequest.toolConfig = { functionCallingConfig: { mode: 'AUTO' } };
+          innerRequest.toolConfig = { functionCallingConfig: { mode } };
         }
       }
     }
