@@ -1624,6 +1624,7 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
 }
 
 .card-action-btn {
@@ -1642,6 +1643,8 @@ body {
   gap: 5px;
   transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
   user-select: none;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .card-action-btn:active {
