@@ -940,9 +940,14 @@ export class AccountPool {
       if (acc.status === 'cooldown' && now >= acc.cooldownUntil) {
         acc.status = 'active';
       }
-      if (acc.status === 'active') active++;
-      else if (acc.status === 'cooldown') cooldown++;
-      else if (acc.status === 'dead') dead++;
+      const isDead = acc.status === 'dead' || acc.status === 'disabled';
+      const claudeUsable = hasFamilyQuota(acc, 'claude', now);
+      const geminiUsable = hasFamilyQuota(acc, 'gemini', now);
+      const isExhausted = !claudeUsable && !geminiUsable;
+
+      if (isDead) dead++;
+      else if (acc.status === 'cooldown' || isExhausted) cooldown++;
+      else active++;
 
       currentConcurrency += acc.activeConcurrency;
     }

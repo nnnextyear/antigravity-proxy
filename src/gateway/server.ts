@@ -389,6 +389,10 @@ export async function createServer(
         // 发送终止标志
         reply.raw.write('data: [DONE]\n\n');
         reply.raw.end();
+        const inTokens = usageMetadata?.promptTokenCount ?? 0;
+        const outTokens = usageMetadata?.candidatesTokenCount ?? 0;
+        const cachedTokens = usageMetadata?.cachedContentTokenCount ?? 0;
+        console.info(`[OpenAIGateway] ✅ 流式响应交付 (req: ${req.id}, 输入: ${inTokens} tokens, 产出: ${outTokens} tokens, 缓存命中: ${cachedTokens} tokens)`);
         if (usageMetadata) pool.recordTokenUsage(usageMetadata);
       } catch (e: any) {
         console.error('[Gateway] SSE Streaming error:', e.message);
@@ -440,6 +444,10 @@ export async function createServer(
 
         cleanup();
         if (usageMetadata) pool.recordTokenUsage(usageMetadata);
+        const inTokens = usageMetadata?.promptTokenCount ?? 0;
+        const outTokens = usageMetadata?.candidatesTokenCount ?? 0;
+        const cachedTokens = usageMetadata?.cachedContentTokenCount ?? 0;
+        console.info(`[OpenAIGateway] ✅ 响应交付 (req: ${req.id}, 输入: ${inTokens} tokens, 产出: ${outTokens} tokens, 缓存命中: ${cachedTokens} tokens)`);
 
         return reply.send({
           id: completionId,

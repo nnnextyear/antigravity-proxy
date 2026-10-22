@@ -364,11 +364,27 @@ async function loadAllData() {
 
     cachedAccounts = accountsData.accounts || [];
 
+    // 计算各分类计数 (必须先于大盘卡片渲染，保证大盘数字与标签数字 100% 严格一致)
+    let deadCount = 0, cooldownCount = 0, activeCount = 0;
+    for (const acc of cachedAccounts) {
+      if (acc.status === 'dead' || acc.status === 'disabled') deadCount++;
+      else if (isAccountCoolingDown(acc)) cooldownCount++;
+      else activeCount++;
+    }
+    const cAll = document.getElementById('count-all');
+    const cActive = document.getElementById('count-active');
+    const cCooldown = document.getElementById('count-cooldown');
+    const cDead = document.getElementById('count-dead');
+    if (cAll) cAll.innerText = cachedAccounts.length;
+    if (cActive) cActive.innerText = activeCount;
+    if (cCooldown) cCooldown.innerText = cooldownCount;
+    if (cDead) cDead.innerText = deadCount;
+
     // 更新大盘基础指标
-    if (statTotal) statTotal.innerText = stats.totalAccounts;
-    if (statActive) statActive.innerText = stats.activeAccounts;
-    if (statCooldown) statCooldown.innerText = stats.cooldownAccounts;
-    if (statDead) statDead.innerText = stats.deadAccounts;
+    if (statTotal) statTotal.innerText = cachedAccounts.length;
+    if (statActive) statActive.innerText = activeCount;
+    if (statCooldown) statCooldown.innerText = cooldownCount;
+    if (statDead) statDead.innerText = deadCount;
     if (statConcurrency) statConcurrency.innerText = stats.currentTotalConcurrency;
     if (statRequests) statRequests.innerText = stats.totalRequestsServed;
     if (statTokens) {
@@ -391,27 +407,11 @@ async function loadAllData() {
     if (statTokensCacheHit) statTokensCacheHit.innerText = cacheHitRate;
 
     const badgeTextEl = document.getElementById('stat-active-badge-text');
-    if (badgeTextEl) badgeTextEl.innerText = `${stats.activeAccounts} 活跃`;
+    if (badgeTextEl) badgeTextEl.innerText = `${activeCount} 正常`;
 
     if (stats && stats.routingStrategy && !strategySaving) {
       syncStrategyDropdown(stats.routingStrategy);
     }
-
-    // 计算各分类计数
-    let deadCount = 0, cooldownCount = 0, activeCount = 0;
-    for (const acc of cachedAccounts) {
-      if (acc.status === 'dead' || acc.status === 'disabled') deadCount++;
-      else if (isAccountCoolingDown(acc)) cooldownCount++;
-      else activeCount++;
-    }
-    const cAll = document.getElementById('count-all');
-    const cActive = document.getElementById('count-active');
-    const cCooldown = document.getElementById('count-cooldown');
-    const cDead = document.getElementById('count-dead');
-    if (cAll) cAll.innerText = cachedAccounts.length;
-    if (cActive) cActive.innerText = activeCount;
-    if (cCooldown) cCooldown.innerText = cooldownCount;
-    if (cDead) cDead.innerText = deadCount;
 
     // 计算全局可用率与平均额度
     const cSummary = summarizeFamilyQuota(cachedAccounts, 'claude');

@@ -817,7 +817,10 @@ export function registerAnthropicRoutes(
         // 5. message_stop
         reply.raw.write(`event: message_stop\ndata: {"type":"message_stop"}\n\n`);
         reply.raw.end();
-        console.info(`[AnthropicGateway] ✅ 流式响应成功交付 (req: ${req.id}, 产出: ${lastUsageMetadata?.candidatesTokenCount ?? 0} tokens)`);
+        const inTokens = lastUsageMetadata?.promptTokenCount ?? inputTokenCount;
+        const outTokens = lastUsageMetadata?.candidatesTokenCount ?? 0;
+        const cachedTokens = lastUsageMetadata?.cachedContentTokenCount ?? 0;
+        console.info(`[AnthropicGateway] ✅ 流式响应成功交付 (req: ${req.id}, 输入: ${inTokens} tokens, 产出: ${outTokens} tokens, 缓存命中: ${cachedTokens} tokens)`);
 
         if (lastUsageMetadata) pool.recordTokenUsage(lastUsageMetadata);
       } catch (err: any) {
@@ -891,6 +894,11 @@ export function registerAnthropicRoutes(
         releaseNonStream();
 
         if (lastUsageMetadata) pool.recordTokenUsage(lastUsageMetadata);
+
+        const inTokens = lastUsageMetadata?.promptTokenCount ?? inputTokenCount;
+        const outTokens = lastUsageMetadata?.candidatesTokenCount ?? 0;
+        const cachedTokens = lastUsageMetadata?.cachedContentTokenCount ?? 0;
+        console.info(`[AnthropicGateway] ✅ 响应成功交付 (req: ${req.id}, 输入: ${inTokens} tokens, 产出: ${outTokens} tokens, 缓存命中: ${cachedTokens} tokens)`);
 
         if (fullThinking && clientRequestedThinking) {
           contentParts.push({
