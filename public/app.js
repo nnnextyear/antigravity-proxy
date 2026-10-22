@@ -167,7 +167,7 @@ function init() {
   if (apiBadge) {
     apiBadge.addEventListener('click', () => {
       const fullUrl = `${window.location.origin}/v1`;
-      navigator.clipboard.writeText(fullUrl).then(() => {
+      copyToClipboard(fullUrl).then(() => {
         showToast(`已复制 Base URL: ${fullUrl}`, 'success');
       }).catch(() => {
         prompt('请复制 API 地址:', fullUrl);
@@ -181,8 +181,10 @@ function init() {
     apiKeyBadge.addEventListener('click', () => {
       const codeEl = document.getElementById('api-key-text');
       const key = codeEl ? codeEl.innerText.trim() : 'sk-antigravity';
-      navigator.clipboard.writeText(key).then(() => {
+      copyToClipboard(key).then(() => {
         showToast(`已复制 API Key: ${key}`, 'success');
+      }).catch(() => {
+        prompt('请复制 API Key:', key);
       });
     });
   }
@@ -1347,9 +1349,48 @@ window.deleteAccount = async function(id, btn) {
   }
 };
 
+function copyToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text).catch(() => copyWithExecCommand(text));
+  }
+  return copyWithExecCommand(text);
+}
+
+function copyWithExecCommand(text) {
+  return new Promise((resolve, reject) => {
+    let textArea;
+    try {
+      textArea = document.createElement('textarea');
+      textArea.value = text;
+      textArea.style.position = 'fixed';
+      textArea.style.left = '-9999px';
+      textArea.style.top = '-9999px';
+      textArea.style.opacity = '0';
+      textArea.setAttribute('readonly', '');
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      const successful = document.execCommand('copy');
+      if (successful) {
+        resolve();
+      } else {
+        reject(new Error('execCommand copy returned false'));
+      }
+    } catch (err) {
+      reject(err);
+    } finally {
+      if (textArea && textArea.parentNode) {
+        document.body.removeChild(textArea);
+      }
+    }
+  });
+}
+
 function copyText(text, label) {
-  navigator.clipboard.writeText(text).then(() => {
+  copyToClipboard(text).then(() => {
     showToast(`已复制 ${label}: ${text}`, 'success');
+  }).catch(() => {
+    prompt(`请复制 ${label}:`, text);
   });
 }
 
