@@ -591,16 +591,12 @@ function formatResetTime(isoStr) {
 function quotaResetHint(q) {
   if (q.weekly === 0) {
     const weeklyTime = q.weeklyReset ? formatResetTime(q.weeklyReset) : '';
-    return { text: weeklyTime ? `⏳ 周额度 ${weeklyTime}重置` : '⏸ 周额度限制', full: false };
-  }
-  if (q.blockedUntil > Date.now()) {
-    const waitTime = formatDurationCompact(q.blockedUntil - Date.now());
-    return { text: waitTime ? `⏳ 冷却 ${waitTime}后` : '⏸ 限额等待', full: false };
+    return { text: weeklyTime ? `⏳ ${weeklyTime}重置` : '⏸ 周额度限制', full: false };
   }
   if (q.short === null) return { text: '未检测', full: false };
   if (q.short === 1) return { text: '✅ 满格', full: true };
   const time = formatResetTime(q.reset);
-  return { text: time ? `⏳ ${time}` : '重置时间未知', full: false };
+  return { text: time ? `⏳ ${time}重置` : '重置时间未知', full: false };
 }
 
 function formatDurationCompact(diffMs) {
@@ -684,20 +680,7 @@ function getStatusPill(acc) {
   } else if (acc.validationUrl) {
     return `<span class="status-badge-pill status-badge-cooldown">需授权</span>`;
   } else if (acc.status === 'cooldown' || (isClaudeExhausted && isGeminiExhausted)) {
-    const now = Date.now();
-    let remainingMs = 0;
-    if (acc.status === 'cooldown' && acc.cooldownUntil > now) {
-      remainingMs = acc.cooldownUntil - now;
-    } else {
-      const resets = [claude.reset, claude.weeklyReset, gemini.reset, gemini.weeklyReset,
-        claude.blockedUntil, gemini.blockedUntil]
-        .map(t => typeof t === 'number' ? t : Date.parse(t || ''))
-        .filter(t => Number.isFinite(t) && t > now);
-      if (resets.length) remainingMs = Math.min(...resets) - now;
-    }
-    const timeStr = remainingMs > 0 ? formatDurationCompact(remainingMs) : '';
-    const label = timeStr ? `冷却中 (${timeStr})` : (isClaudeExhausted && isGeminiExhausted ? '双额度冷却' : '冷却中');
-    return `<span class="status-badge-pill status-badge-cooldown"><span class="pulse-dot amber"></span>${label}</span>`;
+    return `<span class="status-badge-pill status-badge-cooldown"><span class="pulse-dot amber"></span>冷却中</span>`;
   } else if (isClaudeExhausted && !isGeminiExhausted && gemini.short !== null && gemini.weekly !== null) {
     return `<span class="status-badge-pill status-badge-gemini" title="Claude 额度受限，Gemini 已知额度可用">Gemini可用</span>`;
   } else if (!isClaudeExhausted && isGeminiExhausted && claude.short !== null && claude.weekly !== null) {
