@@ -58,8 +58,6 @@ body {
 /* 顶部导航 */
 .navbar {
   display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
   justify-content: space-between;
   align-items: center;
   padding: 10px 24px;
@@ -75,7 +73,6 @@ body {
   display: flex;
   align-items: center;
   gap: 20px;
-  min-width: 0;
 }
 
 .brand {
@@ -137,8 +134,6 @@ body {
   cursor: pointer;
   transition: all 0.2s ease;
   user-select: none;
-  min-width: 0;
-  max-width: 100%;
 }
 
 .connect-capsule:hover {
@@ -159,10 +154,6 @@ body {
   font-size: 11px;
   color: #e2e8f0;
   font-weight: 500;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 230px;
 }
 
 .copy-icon {
@@ -181,7 +172,6 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-wrap: wrap;
 }
 
 /* ================= 自定义精美调度策略下拉组件 (Custom Dropdown) ================= */
@@ -1634,7 +1624,6 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: wrap;
 }
 
 .card-action-btn {
@@ -1653,8 +1642,6 @@ body {
   gap: 5px;
   transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
   user-select: none;
-  white-space: nowrap;
-  flex-shrink: 0;
 }
 
 .card-action-btn:active {
@@ -2336,17 +2323,4 @@ input[type="number"] {
 .acc-last-error::before {
   content: "最近错误：";
   color: #f5a524;
-}
-
-@media (max-width: 680px) {
-  .navbar { padding: 10px 14px; position: relative; }
-  .nav-left { flex-wrap: wrap; width: 100%; gap: 10px; }
-  .nav-right { width: 100%; }
-  .quick-connect-group { width: 100%; flex-wrap: wrap; }
-  .brand, .brand-logo, .capsule-label, .copy-icon { flex-shrink: 0; }
-  .main-container { padding: 16px 14px; }
-  .strategy-popover-menu { left: 0; right: auto; max-width: calc(100vw - 28px); }
-  .pod-track-meta { gap: 4px; }
-  .pod-track-label-group { flex-wrap: wrap; }
-  .pod-track-num { flex-shrink: 0; }
 }

@@ -8,7 +8,6 @@ let appliedDataRefreshVersion = 0;
 let dataPollingEpoch = 0;
 let confirmedRoutingStrategy = '';
 let strategySaving = false;
-let dashboardApiKey = null;
 
 // DOM 元素
 const loginOverlay = document.getElementById('login-overlay');
@@ -180,14 +179,11 @@ function init() {
   const apiKeyBadge = document.getElementById('api-key-badge');
   if (apiKeyBadge) {
     apiKeyBadge.addEventListener('click', () => {
-      const key = dashboardApiKey;
-      if (!key) {
-        showToast(key === '' ? '当前服务未设置 API Key' : 'API Key 尚未加载，请稍后重试', 'info');
-        return;
-      }
+      const codeEl = document.getElementById('api-key-text');
+      const key = codeEl ? codeEl.innerText.trim() : 'sk-antigravity';
       navigator.clipboard.writeText(key).then(() => {
-        showToast('已复制 API Key', 'success');
-      }).catch(() => showToast('复制失败，请手动复制页面中的 API Key', 'error'));
+        showToast(`已复制 API Key: ${key}`, 'success');
+      });
     });
   }
 
@@ -339,7 +335,6 @@ async function handleLogin() {
 }
 
 function startDataPolling() {
-  loadDashboardConfig();
   loadAllData();
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(loadAllData, 4000);
@@ -347,30 +342,9 @@ function startDataPolling() {
 
 function stopDataPolling() {
   dataPollingEpoch++;
-  dashboardApiKey = null;
-  const keyText = document.getElementById('api-key-text');
-  if (keyText) keyText.innerText = '未加载';
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
-  }
-}
-
-async function loadDashboardConfig() {
-  const epoch = dataPollingEpoch;
-  const endpoint = document.getElementById('api-endpoint-text');
-  if (endpoint) endpoint.innerText = `${window.location.origin}/v1`;
-  try {
-    const config = await apiRequest('/api/admin/config');
-    if (epoch !== dataPollingEpoch) return;
-    dashboardApiKey = typeof config.apiMasterKey === 'string' ? config.apiMasterKey : '';
-    const keyText = document.getElementById('api-key-text');
-    if (keyText) keyText.innerText = dashboardApiKey || '未设置';
-  } catch {
-    if (epoch !== dataPollingEpoch) return;
-    dashboardApiKey = null;
-    const keyText = document.getElementById('api-key-text');
-    if (keyText) keyText.innerText = '加载失败';
   }
 }
 
