@@ -238,11 +238,32 @@ export class QuotaManager {
       // Commit against live state so a new quota rejection cannot be overwritten.
       const current = this.pool.getAccount(account.id);
       if (!current) return null;
+      const now = Date.now();
+      const claudeEmpty = ((quota.claude5hFraction ?? 1) <= 0.01 && Date.parse(quota.claudeResetTime || '') > now)
+        || ((quota.claudeWeeklyFraction ?? 1) <= 0.005 && Date.parse(quota.claudeWeeklyResetTime || '') > now);
+      const geminiEmpty = ((quota.gemini5hFraction ?? 1) <= 0.01 && Date.parse(quota.geminiResetTime || '') > now)
+        || ((quota.geminiWeeklyFraction ?? 1) <= 0.005 && Date.parse(quota.geminiWeeklyResetTime || '') > now);
+      let newStatus = current.status;
+      let newCooldownUntil = current.cooldownUntil;
+      if (current.status !== 'dead' && current.status !== 'disabled') {
+        if (claudeEmpty && geminiEmpty) {
+          const resets = [quota.claudeResetTime, quota.claudeWeeklyResetTime, quota.geminiResetTime, quota.geminiWeeklyResetTime]
+            .map(t => Date.parse(t || '')).filter(t => Number.isFinite(t) && t > now);
+          const earliest = resets.length ? Math.min(...resets) : now + 5 * 60_000;
+          newStatus = 'cooldown';
+          newCooldownUntil = Math.max(newCooldownUntil, earliest);
+        } else if (current.status === 'cooldown' && (!claudeEmpty || !geminiEmpty) && now >= current.cooldownUntil) {
+          newStatus = 'active';
+          newCooldownUntil = 0;
+        }
+      }
       const preserveReason = current.status === 'dead' || current.status === 'disabled'
         || Object.values(current.quotaBlockedUntil ?? {}).some(until => until > Date.now());
       const updated = this.pool.updateAccount(account.id, {
         quota,
         validationUrl: undefined,
+        status: newStatus,
+        cooldownUntil: newCooldownUntil,
         ...(preserveReason ? {} : { lastError: undefined })
       });
       return updated?.quota ?? null;

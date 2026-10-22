@@ -846,6 +846,22 @@ export class AccountPool {
           console.warn(`[CircuitBreaker] 账号 ${acc.email} 触发通用 429 限频，进入冷却 ${Math.ceil(retryMs / 1000)} 秒。`);
         }
 
+        const claudeUsable = hasFamilyQuota(acc, 'claude');
+        const geminiUsable = hasFamilyQuota(acc, 'gemini');
+        if (!claudeUsable && !geminiUsable && !isTerminal) {
+          const now = Date.now();
+          const claudeReset = Date.parse(acc.quota?.claudeResetTime || '') || Date.parse(acc.quota?.claudeWeeklyResetTime || '') || (now + retryMs);
+          const geminiReset = Date.parse(acc.quota?.geminiResetTime || '') || Date.parse(acc.quota?.geminiWeeklyResetTime || '') || (now + retryMs);
+          const earliestReset = Math.min(
+            claudeReset > now ? claudeReset : Infinity,
+            geminiReset > now ? geminiReset : Infinity
+          );
+          const cooldownTime = Number.isFinite(earliestReset) ? earliestReset : now + Math.max(retryMs, 5 * 60_000);
+          acc.status = 'cooldown';
+          acc.cooldownUntil = Math.max(acc.cooldownUntil, cooldownTime);
+          console.warn(`[CircuitBreaker] 账号 ${acc.email} Claude 与 Gemini 双额度均已耗尽，已自动进入冷却状态，预计冷却至 ${new Date(cooldownTime).toLocaleTimeString()}。`);
+        }
+
         reconcileQuotaState(acc);
         this.saveAccounts();
 

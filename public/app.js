@@ -400,9 +400,9 @@ async function loadAllData() {
     // 计算各分类计数
     let deadCount = 0, cooldownCount = 0, activeCount = 0;
     for (const acc of cachedAccounts) {
-      if (acc.status === 'dead') deadCount++;
-      else if (acc.status === 'cooldown') cooldownCount++;
-      else if (acc.status === 'active') activeCount++;
+      if (acc.status === 'dead' || acc.status === 'disabled') deadCount++;
+      else if (isAccountCoolingDown(acc)) cooldownCount++;
+      else activeCount++;
     }
     const cAll = document.getElementById('count-all');
     const cActive = document.getElementById('count-active');
@@ -487,12 +487,28 @@ async function loadAllData() {
   }
 }
 
+function isAccountCoolingDown(acc) {
+  if (acc.status === 'dead' || acc.status === 'disabled') return false;
+  if (acc.status === 'cooldown') return true;
+  const claude = familyQuota(acc, 'claude');
+  const gemini = familyQuota(acc, 'gemini');
+  return familyQuotaBlocked(claude) && familyQuotaBlocked(gemini);
+}
+
+function isAccountFullyAvailable(acc) {
+  if (acc.status !== 'active') return false;
+  if (acc.validationUrl) return false;
+  const claude = familyQuota(acc, 'claude');
+  const gemini = familyQuota(acc, 'gemini');
+  return !familyQuotaBlocked(claude) || !familyQuotaBlocked(gemini);
+}
+
 function renderFilteredAccounts() {
   const filtered = cachedAccounts.filter(acc => {
     // 状态过滤
-    if (currentFilter === 'active' && acc.status !== 'active') return false;
-    if (currentFilter === 'cooldown' && acc.status !== 'cooldown') return false;
-    if (currentFilter === 'dead' && acc.status !== 'dead') return false;
+    if (currentFilter === 'active' && !isAccountFullyAvailable(acc)) return false;
+    if (currentFilter === 'cooldown' && !isAccountCoolingDown(acc)) return false;
+    if (currentFilter === 'dead' && acc.status !== 'dead' && acc.status !== 'disabled') return false;
 
     // 搜索过滤
     if (searchQuery) {
@@ -573,8 +589,14 @@ function formatResetTime(isoStr) {
 }
 
 function quotaResetHint(q) {
-  if (q.weekly === 0) return { text: '⏸ 周额度限制', full: false };
-  if (q.blockedUntil > Date.now()) return { text: '⏸ 限额等待', full: false };
+  if (q.weekly === 0) {
+    const weeklyTime = q.weeklyReset ? formatResetTime(q.weeklyReset) : '';
+    return { text: weeklyTime ? `⏳ 周额度 ${weeklyTime}重置` : '⏸ 周额度限制', full: false };
+  }
+  if (q.blockedUntil > Date.now()) {
+    const waitTime = formatDurationCompact(q.blockedUntil - Date.now());
+    return { text: waitTime ? `⏳ 冷却 ${waitTime}后` : '⏸ 限额等待', full: false };
+  }
   if (q.short === null) return { text: '未检测', full: false };
   if (q.short === 1) return { text: '✅ 满格', full: true };
   const time = formatResetTime(q.reset);
@@ -583,8 +605,9 @@ function quotaResetHint(q) {
 
 function formatDurationCompact(diffMs) {
   if (!Number.isFinite(diffMs) || diffMs <= 0) return '';
+  const totalSeconds = Math.ceil(diffMs / 1000);
+  if (totalSeconds < 60) return `${Math.max(1, totalSeconds)}s`;
   const totalMinutes = Math.ceil(diffMs / 60000);
-  if (totalMinutes <= 1) return '不足1分钟';
   const days = Math.floor(totalMinutes / (24 * 60));
   const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
   const mins = totalMinutes % 60;
@@ -623,6 +646,9 @@ function getPoolFastest5hRecoveryText(accounts, family) {
   const resets = quotas.filter(q => q.short !== null && q.short < 1 && q.weekly !== 0 && q.blockedUntil <= now)
     .map(q => Date.parse(q.reset || '') - now).filter(diff => Number.isFinite(diff) && diff > 0);
   if (resets.length) return `⏳ 5h最快 ${formatDurationCompact(Math.min(...resets))}后重置`;
+  const weeklyResets = quotas.filter(q => q.weekly === 0 && q.weeklyReset)
+    .map(q => Date.parse(q.weeklyReset || '') - now).filter(diff => Number.isFinite(diff) && diff > 0);
+  if (weeklyResets.length) return `⏸ 周额度最快 ${formatDurationCompact(Math.min(...weeklyResets))}后重置`;
   if (quotas.some(q => q.weekly === 0)) return '⏸ 部分账号受周额度限制';
   if (quotas.some(q => q.blockedUntil > now)) return '⏸ 部分账号限额等待中';
   if (quotas.every(q => q.short === null)) return '5h额度未检测';
@@ -649,9 +675,6 @@ function getStatusPill(acc) {
 
   if (acc.status === 'disabled') {
     return `<span class="status-badge-pill status-badge-disabled">已停用</span>`;
-  } else if (acc.status === 'cooldown') {
-    const remainingSec = Math.max(0, Math.ceil((Number(acc.cooldownUntil) - Date.now()) / 1000)) || 0;
-    return `<span class="status-badge-pill status-badge-cooldown"><span class="pulse-dot amber"></span>${remainingSec ? `冷却 (${remainingSec}s)` : '冷却到期待确认'}</span>`;
   } else if (acc.status === 'dead') {
     const policyBlocked = isPolicyBlockedAccount(acc);
     if (policyBlocked) {
@@ -660,12 +683,25 @@ function getStatusPill(acc) {
     return `<span class="status-badge-pill status-badge-dead">异常失效</span>`;
   } else if (acc.validationUrl) {
     return `<span class="status-badge-pill status-badge-cooldown">需授权</span>`;
+  } else if (acc.status === 'cooldown' || (isClaudeExhausted && isGeminiExhausted)) {
+    const now = Date.now();
+    let remainingMs = 0;
+    if (acc.status === 'cooldown' && acc.cooldownUntil > now) {
+      remainingMs = acc.cooldownUntil - now;
+    } else {
+      const resets = [claude.reset, claude.weeklyReset, gemini.reset, gemini.weeklyReset,
+        claude.blockedUntil, gemini.blockedUntil]
+        .map(t => typeof t === 'number' ? t : Date.parse(t || ''))
+        .filter(t => Number.isFinite(t) && t > now);
+      if (resets.length) remainingMs = Math.min(...resets) - now;
+    }
+    const timeStr = remainingMs > 0 ? formatDurationCompact(remainingMs) : '';
+    const label = timeStr ? `冷却中 (${timeStr})` : (isClaudeExhausted && isGeminiExhausted ? '双额度冷却' : '冷却中');
+    return `<span class="status-badge-pill status-badge-cooldown"><span class="pulse-dot amber"></span>${label}</span>`;
   } else if (isClaudeExhausted && !isGeminiExhausted && gemini.short !== null && gemini.weekly !== null) {
     return `<span class="status-badge-pill status-badge-gemini" title="Claude 额度受限，Gemini 已知额度可用">Gemini可用</span>`;
   } else if (!isClaudeExhausted && isGeminiExhausted && claude.short !== null && claude.weekly !== null) {
     return `<span class="status-badge-pill status-badge-claude" title="Gemini 额度受限，Claude 已知额度可用">Claude可用</span>`;
-  } else if (isClaudeExhausted && isGeminiExhausted) {
-    return `<span class="status-badge-pill status-badge-dead">双额度暂尽</span>`;
   }
   if ([claude.short, claude.weekly, gemini.short, gemini.weekly].some(value => value === null)) {
     return `<span class="status-badge-pill status-badge-cooldown">额度待检测</span>`;
