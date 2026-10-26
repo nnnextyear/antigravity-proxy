@@ -218,6 +218,15 @@ export class QuotaManager {
         }
       }
 
+      // 当周额度耗尽时，上游 5h 限额暂停适用（upstream 返回 "the 5-hour limit does not currently apply"）
+      // 此时可用 5h 额度实质归零，不能将未经调用的 5h 剩余量当作 100% 满格展示或调度
+      if (geminiWeekly === 0) {
+        gemini5h = 0;
+      }
+      if (claudeWeekly === 0) {
+        claude5h = 0;
+      }
+
       const quota: AccountQuota = {
         geminiWeeklyFraction: geminiWeekly,
         gemini5hFraction: gemini5h,

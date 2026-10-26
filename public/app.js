@@ -549,12 +549,18 @@ function quotaFraction(value) {
 
 function familyQuota(acc, family) {
   const quota = acc.quota || {};
+  const weekly = quotaFraction(quota[family + 'WeeklyFraction']);
+  const rawShort = quotaFraction(quota[family + '5hFraction']);
+  // 当周额度耗尽 (0) 时，5h 限额暂停适用（上游说明 the 5-hour limit does not currently apply），实质可用额度为 0
+  const short = weekly === 0 ? 0 : rawShort;
   return {
-    short: quotaFraction(quota[family + '5hFraction']),
-    weekly: quotaFraction(quota[family + 'WeeklyFraction']),
+    short,
+    rawShort,
+    weekly,
     reset: quota[family + 'ResetTime'],
     weeklyReset: quota[family + 'WeeklyResetTime'],
     description: quota[family + '5hDesc'] || '',
+    weeklyDescription: quota[family + 'WeeklyDesc'] || '',
     blockedUntil: Number(acc.quotaBlockedUntil?.[family]) || 0
   };
 }
@@ -590,8 +596,7 @@ function formatResetTime(isoStr) {
 
 function quotaResetHint(q) {
   if (q.weekly === 0) {
-    const weeklyTime = q.weeklyReset ? formatResetTime(q.weeklyReset) : '';
-    return { text: weeklyTime ? `⏳ ${weeklyTime}重置` : '⏸ 周额度限制', full: false };
+    return { text: '⏸ 周额度耗尽', full: false };
   }
   if (q.short === null) return { text: '未检测', full: false };
   if (q.short === 1) return { text: '✅ 满格', full: true };
@@ -951,11 +956,18 @@ function renderPodHtml(family, acc) {
 
   const hint = quotaResetHint(q);
   const details = [q.description];
-  if (q.weekly === 0) details.push('周额度耗尽；5h重置不代表账号恢复。');
+  if (q.weekly === 0) {
+    details.push('周额度已耗尽，5h限额已暂停适用；需等待周额度刷新。');
+    if (q.rawShort !== null && q.rawShort > 0) {
+      details.push(`(5h水仓原值: ${(q.rawShort * 100).toFixed(1)}%，但因周额度耗尽当前无法调用)`);
+    }
+  }
   if (q.blockedUntil > Date.now()) details.push(`限额等待 ${formatResetTime(q.blockedUntil)}再检查；此时间不代表5h重置或恢复保证。`);
   const time5hTag = `<span class="pod-time-tag${hint.full ? ' full' : ''}" title="${escapeHtml(details.filter(Boolean).join(' '))}">${hint.text}</span>`;
   const timeW = q.weekly === null ? '未检测' : formatResetTime(q.weeklyReset);
-  const timeWTag = `<span class="pod-time-tag">${q.weekly === 1 ? '✅ 满格' : `🔄 ${timeW || '重置时间未知'}`}</span>`;
+  const weeklyDetails = [q.weeklyDescription];
+  if (q.weekly === 0) weeklyDetails.push('周额度耗尽，需等待周度额度重置。');
+  const timeWTag = `<span class="pod-time-tag" title="${escapeHtml(weeklyDetails.filter(Boolean).join(' '))}">${q.weekly === 1 ? '✅ 满格' : `🔄 ${timeW || '重置时间未知'}`}</span>`;
 
   return `
     <div class="quota-pod ${isClaude ? 'pod-claude' : 'pod-gemini'}">
