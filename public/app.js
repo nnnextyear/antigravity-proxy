@@ -552,7 +552,13 @@ function familyQuota(acc, family) {
   const weekly = quotaFraction(quota[family + 'WeeklyFraction']);
   const rawShort = quotaFraction(quota[family + '5hFraction']);
   // 当周额度耗尽 (0) 时，5h 限额暂停适用（上游说明 the 5-hour limit does not currently apply），实质可用额度为 0
-  const short = weekly === 0 ? 0 : rawShort;
+  // 当上游仅返回周额度（该账号等级无 5h 限制桶）且已完成检测时，5h 水位视为无限制/满格 (1.0)
+  let short = rawShort;
+  if (weekly === 0) {
+    short = 0;
+  } else if (short === null && weekly !== null) {
+    short = 1;
+  }
   return {
     short,
     rawShort,

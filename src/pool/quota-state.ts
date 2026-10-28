@@ -32,6 +32,8 @@ export function reconcileQuotaState(account: Account, now = Date.now()): void {
       // A retry deadline is not the upstream's 5h quota reset time. Keep it in
       // quotaBlockedUntil so dashboards never mistake a daily/weekly block for 5h.
       account.quota = { ...account.quota, [fractionField]: 0 };
+    } else if (account.quota[fractionField] === undefined && weekly !== undefined) {
+      account.quota = { ...account.quota, [fractionField]: 1 };
     }
   }
 }
