@@ -612,6 +612,8 @@ body {
   padding: 3px 8px;
   border-radius: 6px;
   letter-spacing: 0.3px;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .badge-claude {
   background: var(--claude-bg);
@@ -1461,6 +1463,8 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .pod-brand-dot {
@@ -1484,6 +1488,7 @@ body {
   font-weight: 700;
   color: #e2e8f0;
   letter-spacing: 0.2px;
+  white-space: nowrap;
 }
 
 .pod-time-tag {
