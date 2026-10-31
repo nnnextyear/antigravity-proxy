@@ -20,7 +20,8 @@ export const DEFAULT_CONFIG: AppConfig = {
   tokenRefreshIntervalMs: envInt('TOKEN_REFRESH_INTERVAL_MS', 3 * 60 * 1000), // 3 分钟检查一次
   streamKeepaliveMs: envInt('STREAM_KEEPALIVE_MS', 15 * 1000),
   upstreamTimeoutMs: envInt('UPSTREAM_TIMEOUT_MS', 15 * 60 * 1000), // 单次生成等首字节/等下一块的上限
-  minRequestIntervalMs: envInt('MIN_REQUEST_INTERVAL_MS', 1000), // 同账号两次生成的启动间隔，避免瞬时并发被风控
+  minRequestIntervalMs: envInt('MIN_REQUEST_INTERVAL_MS', 1000), // 同账号两次生成的启动基础间隔，避免瞬时并发
+  requestJitterMs: envInt('REQUEST_JITTER_MS', 1200), // 动态拟人随机抖动（毫秒），打乱固定时钟周期
   accountQueueTimeoutMs: envInt('ACCOUNT_QUEUE_TIMEOUT_MS', 120000),
   maxAccountQueue: envInt('MAX_ACCOUNT_QUEUE', 100),
   maxConversationQueue: envInt('MAX_CONVERSATION_QUEUE', 32),

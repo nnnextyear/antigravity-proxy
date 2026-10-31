@@ -118,6 +118,8 @@ export class RequestExecutor {
   private readonly countTimeoutMs = 120000;
   /** Minimum spacing between two generation starts on the same account. */
   private readonly minStartIntervalMs: number;
+  /** Dynamic human-like random jitter to eliminate mechanical periodic timing. */
+  private readonly requestJitterMs: number;
   private readonly lastGenerationStartAt = new Map<string, number>();
   private readonly pacingTails = new Map<string, Promise<void>>();
 
@@ -129,6 +131,7 @@ export class RequestExecutor {
   ) {
     this.upstreamTimeoutMs = Math.max(60000, Number(config.upstreamTimeoutMs) || 900000);
     this.minStartIntervalMs = Math.max(0, Number(config.minRequestIntervalMs ?? 1000));
+    this.requestJitterMs = Math.max(0, Number(config.requestJitterMs ?? 1200));
   }
 
   /**
@@ -157,7 +160,7 @@ export class RequestExecutor {
    * Requests already started retain their concurrency; a cancelled waiter is removed.
    */
   private async paceAccount(account: Account, signal?: AbortSignal): Promise<void> {
-    if (this.minStartIntervalMs <= 0) return;
+    if (this.minStartIntervalMs <= 0 && this.requestJitterMs <= 0) return;
     // Queue gates describe ordering only; request failures must stay local.
     const previous = (this.pacingTails.get(account.id) ?? Promise.resolve()).catch(() => {});
     let unlock!: () => void;
@@ -175,7 +178,11 @@ export class RequestExecutor {
         previous.then(resolve, reject);
       });
       if (signal?.aborted) throw new Error('Request aborted by client.');
-      const wait = (this.lastGenerationStartAt.get(account.id) ?? 0) + this.minStartIntervalMs - Date.now();
+      const last = this.lastGenerationStartAt.get(account.id) ?? 0;
+      // 基础安全间隔 + 拟人化动态抖动（打乱固定时钟周期，杜绝机械化特征）
+      const jitter = this.requestJitterMs > 0 ? Math.floor(Math.random() * this.requestJitterMs) : 0;
+      const targetInterval = this.minStartIntervalMs + jitter;
+      const wait = last + targetInterval - Date.now();
       if (wait > 0) await waitForRetry(wait, signal);
       if (signal?.aborted) throw new Error('Request aborted by client.');
       this.lastGenerationStartAt.set(account.id, Date.now());

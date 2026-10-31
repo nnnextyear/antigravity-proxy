@@ -67,6 +67,11 @@ export interface AppConfig {
    * 0 disables the pacing.
    */
   minRequestIntervalMs?: number;
+  /**
+   * Dynamic human-like random jitter (ms) added to minRequestIntervalMs to break
+   * mechanical periodic timing patterns that trigger anti-abuse detectors.
+   */
+  requestJitterMs?: number;
   /** Local queue limits; generation holds one slot across preflight and streaming. */
   accountQueueTimeoutMs?: number;
   maxAccountQueue?: number;
