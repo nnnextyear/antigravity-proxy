@@ -32,8 +32,14 @@ export class TransportAttempt {
   sentAt?: number;
   uploadedAt?: number;
   headersAt?: number;
+  pingsSent = 0;
+  pingsAcknowledged = 0;
 
-  constructor(private dispatcher: Dispatcher | undefined, private requestId?: string) {}
+  constructor(
+    private dispatcher: Dispatcher | undefined,
+    private requestId?: string,
+    private transportName = 'undici'
+  ) {}
 
   run<T>(operation: () => T): T {
     return currentAttempt.run(this, operation);
@@ -43,10 +49,11 @@ export class TransportAttempt {
   markSent(): void { this.sentAt ??= Date.now(); }
   markUploaded(): void { this.uploadedAt ??= Date.now(); }
   markHeaders(): void { this.headersAt ??= Date.now(); }
+  markPingSent(): void { this.pingsSent++; }
+  markPingAcknowledged(): void { this.pingsAcknowledged++; }
 
-  // A generation can be replayed only when its body was never fully sent.
-  // `sendHeaders` alone means the request may still be in the upload phase.
-  get requestSent(): boolean { return this.uploadedAt !== undefined; }
+  // A lost upload acknowledgement does not prove the server received nothing.
+  get requestSent(): boolean { return this.sentAt !== undefined || this.uploadedAt !== undefined; }
 
   describe(): string {
     const phase = this.headersAt ? 'reading-body'
@@ -54,7 +61,7 @@ export class TransportAttempt {
         : this.sentAt ? 'uploading'
           : this.connectedAt ? 'connected' : 'connecting';
     const elapsed = (time?: number) => time === undefined ? 'pending' : `${time - this.startedAt}ms`;
-    return `req=${this.requestId ?? 'unknown'}, dispatcher=${getDispatcherId(this.dispatcher)}, phase=${phase}, elapsed=${Date.now() - this.startedAt}ms, connected=${elapsed(this.connectedAt)}, sent=${elapsed(this.sentAt)}, uploaded=${elapsed(this.uploadedAt)}, headers=${elapsed(this.headersAt)}`;
+    return `req=${this.requestId ?? 'unknown'}, transport=${this.transportName}, dispatcher=${this.dispatcher ? getDispatcherId(this.dispatcher) : 'none'}, phase=${phase}, elapsed=${Date.now() - this.startedAt}ms, connected=${elapsed(this.connectedAt)}, sent=${elapsed(this.sentAt)}, uploaded=${elapsed(this.uploadedAt)}, headers=${elapsed(this.headersAt)}, pings=${this.pingsAcknowledged}/${this.pingsSent}`;
   }
 }
 

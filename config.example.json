@@ -14,6 +14,7 @@
   "oauthClientSecret": "",
   "upstreamTimeoutMs": 900000,
   "minRequestIntervalMs": 1000,
+  "globalMinRequestIntervalMs": 1000,
   "accountQueueTimeoutMs": 120000,
   "maxAccountQueue": 100,
   "maxConversationQueue": 32,

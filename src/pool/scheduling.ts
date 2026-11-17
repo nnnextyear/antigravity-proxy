@@ -31,13 +31,21 @@ export function hasFamilyQuota(account: Account, family?: ModelFamily, now = Dat
   const shortReset = family === 'claude' ? quota.claudeResetTime : quota.geminiResetTime;
   // Small positive balances are still usable; only an exhausted window or
   // an explicit upstream rejection may displace an established conversation.
-  return !((weekly ?? 1) <= 0 && Date.parse(weeklyReset || '') > now)
-    && !((short ?? 1) <= 0 && Date.parse(shortReset || '') > now);
+  const exhausted = (fraction: number | undefined, reset: string | undefined) =>
+    (fraction ?? 1) <= 0 && (!Number.isFinite(Date.parse(reset || '')) || Date.parse(reset!) > now);
+  return !exhausted(weekly, weeklyReset) && !exhausted(short, shortReset);
+}
+
+export function isAccountEligible(account: Account, family?: ModelFamily, now = Date.now()): boolean {
+  return !account.validationRequired && !account.validationUrl
+    && (account.status === 'active' || (account.status === 'cooldown' && account.cooldownUntil <= now))
+    && hasFamilyQuota(account, family, now);
 }
 
 export function accountUnavailableError(accounts: Account[], family: ModelFamily, excludeIds = new Set<string>()): AccountSchedulingError {
   const now = Date.now();
   const healthy = accounts.filter(account => !excludeIds.has(account.id)
+    && !account.validationRequired && !account.validationUrl
     && (account.status === 'active' || (account.status === 'cooldown' && account.cooldownUntil <= now)));
   if (healthy.some(account => hasFamilyQuota(account, family, now))) {
     return new AccountSchedulingError('account_busy', '可用账号当前并发或等待队列已满，请稍后重试。');

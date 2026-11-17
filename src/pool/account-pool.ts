@@ -4,7 +4,7 @@ import crypto from 'crypto';
 import { Account, PoolStats, AccountStatus, RoutingStrategy } from '../types.js';
 import { classifyUpstreamError, retryAfterMs } from './error-policy.js';
 import { clearLegacyQuotaResetTimes, reconcileQuotaState } from './quota-state.js';
-import { AccountAcquireOptions, AccountSchedulingError, accountUnavailableError, hasFamilyQuota, ModelFamily } from './scheduling.js';
+import { AccountAcquireOptions, AccountSchedulingError, accountUnavailableError, hasFamilyQuota, isAccountEligible, ModelFamily } from './scheduling.js';
 
 interface AccountWaiter {
   excludeIds: Set<string>;
@@ -219,6 +219,7 @@ export class AccountPool {
             acc.status = previous.status;
             acc.lastError = previous.lastError;
             acc.validationUrl = previous.validationUrl;
+            acc.validationRequired = previous.validationRequired;
           }
           // An unexpired cooldown is the main anti-ban throttle. A stale file
           // copy (an editor tab, a second process) must not erase it.
@@ -311,7 +312,7 @@ export class AccountPool {
         const current = key ? this.sessionBindings.get(key) : undefined;
         if (current && current.version === version && current.accountId === account.id) current.generationStarted = true;
       },
-      release: (error?: Parameters<AccountPool['releaseAccount']>[1]) => {
+      release: (error?: Parameters<AccountPool['releaseAccount']>[1], generationSucceeded = false) => {
         if (released) return;
         released = true;
         if (key) {
@@ -323,7 +324,7 @@ export class AccountPool {
             if (!remaining && !current.generationStarted) this.sessionBindings.delete(key);
           }
         }
-        this.releaseAccount(account.id, error, family, sessionKey, version);
+        this.releaseAccount(account.id, error, family, sessionKey, version, generationSucceeded);
       }
     };
   }
@@ -403,8 +404,7 @@ export class AccountPool {
   }
 
   private isEligible(account: Account, family?: ModelFamily, now = Date.now()): boolean {
-    return (account.status === 'active' || (account.status === 'cooldown' && account.cooldownUntil <= now))
-      && hasFamilyQuota(account, family, now);
+    return isAccountEligible(account, family, now);
   }
 
   private queueDepth(accountId: string): number {
@@ -602,8 +602,7 @@ export class AccountPool {
         console.log(`[AccountPool] Account ${acc.email} (${acc.id}) cooldown expired, returned to active.`);
       }
 
-      if (acc.status === 'active' && acc.activeConcurrency < acc.maxConcurrency
-        && hasFamilyQuota(acc, requiredFamily, now)) {
+      if (this.isEligible(acc, requiredFamily, now) && acc.activeConcurrency < acc.maxConcurrency) {
         candidates.push(acc);
       }
     }
@@ -784,7 +783,8 @@ export class AccountPool {
     error?: { code: number; message: string; retryAfterMs?: number; recoverable?: boolean },
     family?: 'claude' | 'gemini',
     sessionKey?: string,
-    bindingVersion?: number
+    bindingVersion?: number,
+    generationSucceeded = false
   ): void {
     const acc = this.accounts.get(accId);
     if (!acc) return;
@@ -793,62 +793,55 @@ export class AccountPool {
     queueMicrotask(() => this.drainQueue());
     // A completed request proves the account is usable again: clear the
     // escalation counter used for unrecognised 403s.
-    if (!error) acc.forbiddenCount = 0;
+    if (!error && generationSucceeded) {
+      acc.forbiddenCount = 0;
+      acc.rateLimitStreak = 0;
+    }
 
     if (error) {
       acc.failedRequests++;
+      // Requests already in flight may finish after an operator disables an
+      // account or a worker records a policy block. Preserve that decision.
+      if (acc.status === 'dead' || acc.status === 'disabled') {
+        this.clearSessionBinding(sessionKey, accId, bindingVersion, family, 'terminal_response');
+        this.saveAccounts();
+        return;
+      }
       acc.lastError = `[HTTP ${error.code}] ${error.message}`;
-      // A late 429 from a request that was already in flight must not downgrade
-      // an account that has since been judged terminal back into a recoverable
-      // state (cooldown expires by itself, dead does not).
-      const isTerminal = acc.status === 'dead' || acc.status === 'disabled';
-
       if (error.code === 429) {
+        const previousRateLimitAt = acc.lastRateLimitAt ?? 0;
+        const consecutiveWindow = previousRateLimitAt > 0
+          && Date.now() - previousRateLimitAt <= 10 * 60 * 1000;
         acc.rateLimitHits = (acc.rateLimitHits ?? 0) + 1;
         acc.lastRateLimitAt = Date.now();
+        acc.rateLimitStreak = consecutiveWindow ? (acc.rateLimitStreak ?? 0) + 1 : 1;
         // Only a quota exhaustion response may affect one model family.
         // A plain rate-limit response must cool the whole account.
         const isQuotaExhausted = classifyUpstreamError(error.code, error.message).kind === 'quota';
-        const retryMs = error.retryAfterMs ?? retryAfterMs(undefined, error.message, 60 * 1000);
+        const upstreamRetryMs = error.retryAfterMs ?? retryAfterMs(undefined, error.message, 60 * 1000);
+        // The executor supplies the configured fallback or Google's delay.
+        // An ambiguous 429 is not evidence for a multi-minute penalty.
+        const retryMs = Math.max(1000, upstreamRetryMs);
         if (isQuotaExhausted && family) {
-          const resetTime = family === 'claude' ? acc.quota?.claudeResetTime : acc.quota?.geminiResetTime;
-          const waitMs = Date.parse(resetTime || '') > Date.now() ? retryMs : Math.max(retryMs, 3 * 60_000);
           acc.quotaBlockedUntil = { ...acc.quotaBlockedUntil,
-            // Keep the previous three-minute probe floor without inventing a
-            // quota reset timestamp. Polling cannot confirm recovery sooner.
-            [family]: Math.max(acc.quotaBlockedUntil?.[family] ?? 0, Date.now() + waitMs) };
-        }
-
-        if (isTerminal) {
-          reconcileQuotaState(acc);
-          console.warn(`[CircuitBreaker] 账号 ${acc.email} 已处于终态 (${acc.status})，忽略其迟到请求的 429，不会自动复活。`);
-          this.clearSessionBinding(sessionKey, accId, bindingVersion, family, 'terminal_429');
-          this.saveAccounts();
-          return;
+            [family]: Math.max(acc.quotaBlockedUntil?.[family] ?? 0, Date.now() + retryMs) };
         }
 
         if (isQuotaExhausted && family === 'claude') {
-          // Keep the effective balance at zero until the rejection expires.
-          if (acc.quota) {
-            acc.quota.claude5hFraction = 0.0;
-          }
           console.warn(`[CircuitBreaker] 账号 ${acc.email} Claude/GPT 额度受限，已暂停该家族调度，账号保持 Active 供 Gemini 继续使用。`);
         } else if (isQuotaExhausted && family === 'gemini') {
-          if (acc.quota) {
-            acc.quota.gemini5hFraction = 0.0;
-          }
           console.warn(`[CircuitBreaker] 账号 ${acc.email} Gemini 额度受限，已暂停该家族调度，账号保持 Active 供 Claude 继续使用。`);
         } else {
-          // 通用 RPM 频率限制（非特定模型额度用尽），遵守上游给出的冷却时间。
+          // 未明确原因的 429：遵守等待提示，不推断为余额耗尽。
           // 取最大值：并发返回的多个 429 不能用一个更短的窗口覆盖更长的冷却。
           acc.status = 'cooldown';
           acc.cooldownUntil = Math.max(acc.cooldownUntil, Date.now() + retryMs);
-          console.warn(`[CircuitBreaker] 账号 ${acc.email} 触发通用 429 限频，进入冷却 ${Math.ceil(retryMs / 1000)} 秒。`);
+          console.warn(`[CircuitBreaker] 账号 ${acc.email} 收到通用 429，原因未明确，冷却 ${Math.ceil(retryMs / 1000)} 秒。`);
         }
 
         const claudeUsable = hasFamilyQuota(acc, 'claude');
         const geminiUsable = hasFamilyQuota(acc, 'gemini');
-        if (!claudeUsable && !geminiUsable && !isTerminal) {
+        if (!claudeUsable && !geminiUsable) {
           const now = Date.now();
           const claudeReset = Date.parse(acc.quota?.claudeResetTime || '') || Date.parse(acc.quota?.claudeWeeklyResetTime || '') || (now + retryMs);
           const geminiReset = Date.parse(acc.quota?.geminiResetTime || '') || Date.parse(acc.quota?.geminiWeeklyResetTime || '') || (now + retryMs);
@@ -856,7 +849,7 @@ export class AccountPool {
             claudeReset > now ? claudeReset : Infinity,
             geminiReset > now ? geminiReset : Infinity
           );
-          const cooldownTime = Number.isFinite(earliestReset) ? earliestReset : now + Math.max(retryMs, 5 * 60_000);
+          const cooldownTime = Number.isFinite(earliestReset) ? earliestReset : now + retryMs;
           acc.status = 'cooldown';
           acc.cooldownUntil = Math.max(acc.cooldownUntil, cooldownTime);
           console.warn(`[CircuitBreaker] 账号 ${acc.email} Claude 与 Gemini 双额度均已耗尽，已自动进入冷却状态，预计冷却至 ${new Date(cooldownTime).toLocaleTimeString()}。`);
@@ -894,6 +887,14 @@ export class AccountPool {
         this.saveAccounts();
       } else if (error.code === 403) {
         const classified = classifyUpstreamError(error.code, error.message);
+        if (classified.kind === 'validation_required') {
+          acc.validationRequired = true;
+          acc.validationUrl = classified.validationUrl;
+          acc.lastError = `[VALIDATION_REQUIRED] ${classified.message}`;
+          this.clearSessionBinding(sessionKey, accId, bindingVersion, family, 'validation_required');
+          this.saveAccounts();
+          return;
+        }
         if (classified.kind === 'policy_blocked') {
           acc.status = 'dead';
           acc.lastError = `[POLICY_BLOCKED] ${error.message}`;

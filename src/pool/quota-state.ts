@@ -14,26 +14,10 @@ export function clearLegacyQuotaResetTimes(account: Account): void {
   }
 }
 
-/** An explicit quota rejection remains authoritative until its recovery time. */
+/** Expire local admission blocks without changing Google's quota snapshot. */
 export function reconcileQuotaState(account: Account, now = Date.now()): void {
-  if (!account.quota) return;
   for (const family of ['gemini', 'claude'] as const) {
     const blockedUntil = account.quotaBlockedUntil?.[family] ?? 0;
-    const weeklyField = family === 'claude' ? 'claudeWeeklyFraction' : 'geminiWeeklyFraction';
-    const weeklyResetField = family === 'claude' ? 'claudeWeeklyResetTime' : 'geminiWeeklyResetTime';
-    const weekly = account.quota[weeklyField];
-    const weeklyReset = account.quota[weeklyResetField];
-    const fractionField = family === 'claude' ? 'claude5hFraction' : 'gemini5hFraction';
-
-    // 当周额度耗尽且重置时间在未来时，上游 5h 限额暂停适用，有效可用 5h 水位实质归零
-    const isWeeklyBlocked = weekly === 0 && (!weeklyReset || Date.parse(weeklyReset) > now);
-    if (blockedUntil > now || isWeeklyBlocked) {
-      // Clone the snapshot: callers may still hold the poll response object.
-      // A retry deadline is not the upstream's 5h quota reset time. Keep it in
-      // quotaBlockedUntil so dashboards never mistake a daily/weekly block for 5h.
-      account.quota = { ...account.quota, [fractionField]: 0 };
-    } else if (account.quota[fractionField] === undefined && weekly !== undefined) {
-      account.quota = { ...account.quota, [fractionField]: 1 };
-    }
+    if (blockedUntil && blockedUntil <= now) delete account.quotaBlockedUntil![family];
   }
 }

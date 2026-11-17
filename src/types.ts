@@ -37,9 +37,12 @@ export interface Account {
   /** Upstream rejection takes precedence over a stale quota polling snapshot. */
   quotaBlockedUntil?: Partial<Record<'claude' | 'gemini', number>>;
   validationUrl?: string;
+  validationRequired?: boolean;
   /** 429 累计次数：在被限频但还没被冷却隔离之前给出预警信号。 */
   rateLimitHits?: number;
   lastRateLimitAt?: number;
+  /** Consecutive 429 streak used for adaptive cooldown; reset after success. */
+  rateLimitStreak?: number;
   /** 连续的可恢复 403 / 新 token 被拒次数，用于逐级升级到终止状态。 */
   forbiddenCount?: number;
 }
@@ -67,11 +70,8 @@ export interface AppConfig {
    * 0 disables the pacing.
    */
   minRequestIntervalMs?: number;
-  /**
-   * Dynamic human-like random jitter (ms) added to minRequestIntervalMs to break
-   * mechanical periodic timing patterns that trigger anti-abuse detectors.
-   */
-  requestJitterMs?: number;
+  /** Minimum spacing between generation starts across the whole upstream project. */
+  globalMinRequestIntervalMs?: number;
   /** Local queue limits; generation holds one slot across preflight and streaming. */
   accountQueueTimeoutMs?: number;
   maxAccountQueue?: number;
@@ -86,8 +86,8 @@ export interface AppConfig {
 }
 
 export interface OpenAIMessage {
-  role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string | any[];
+  role: 'system' | 'developer' | 'user' | 'assistant' | 'tool';
+  content: string | any[] | null;
   name?: string;
   tool_call_id?: string;
   tool_calls?: Array<{
@@ -104,6 +104,7 @@ export interface OpenAIChatCompletionRequest {
   temperature?: number;
   top_p?: number;
   max_tokens?: number;
+  stop?: string | string[];
   presence_penalty?: number;
   frequency_penalty?: number;
   reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'auto';
@@ -144,10 +145,16 @@ export interface OpenAIChatCompletionChunk {
     };
     finish_reason: string | null;
   }[];
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  } | null;
 }
 
 export interface GooglePart {
   text?: string;
+  inlineData?: { mimeType: string; data: string };
   functionCall?: { id?: string; name: string; args?: any };
   functionResponse?: { id?: string; name: string; response: { output: string } };
   thoughtSignature?: string;
@@ -165,12 +172,16 @@ export interface GoogleCloudCodePayload {
     sessionId?: string;
     contents: GoogleContent[];
     systemInstruction?: {
+      role?: 'user';
       parts: GooglePart[];
     };
     generationConfig?: {
       temperature?: number;
       topP?: number;
       maxOutputTokens?: number;
+      stopSequences?: string[];
+      presencePenalty?: number;
+      frequencyPenalty?: number;
       thinkingConfig?: Record<string, unknown>;
     };
     tools?: any[];

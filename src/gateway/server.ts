@@ -8,7 +8,7 @@ import { AppConfig, OpenAIChatCompletionRequest } from '../types.js';
 import { AccountPool, mergeUsageMetadata } from '../pool/account-pool.js';
 import { TokenRefresher } from '../pool/refresher.js';
 import { ContextOverflowError, getRetryAfterHeader, LocationNotSupportedError, RequestExecutor, UpstreamRequestError } from '../pool/breaker.js';
-import { convertOpenAIToCloudCode, createOpenAIChunk, extractTextFromGoogleChunk } from './adapter.js';
+import { convertOpenAIToCloudCode, createOpenAIChunk, createOpenAIRoleChunk, createOpenAIUsageChunk, extractTextFromGoogleChunk, normalizeOpenAIFinishReason } from './adapter.js';
 import { ModelRequestError, toPublicModelCatalog } from './models.js';
 import { registerAdminRoutes } from '../admin/routes.js';
 import { registerAnthropicRoutes } from './anthropic.js';
@@ -274,9 +274,10 @@ export async function createServer(
     if (reply.sent) return;
 
     const chatReq = req.body as OpenAIChatCompletionRequest;
-    if (!chatReq || !chatReq.messages || !Array.isArray(chatReq.messages)) {
+    if (!chatReq || typeof chatReq.model !== 'string' || !chatReq.model.trim()
+      || !Array.isArray(chatReq.messages) || chatReq.messages.length === 0) {
       return reply.status(400).send({
-        error: { message: 'Invalid request: messages array is required', type: 'invalid_request_error' }
+        error: { message: 'Invalid request: model and a non-empty messages array are required', type: 'invalid_request_error' }
       });
     }
 
@@ -348,8 +349,10 @@ export async function createServer(
       const decoder = new StringDecoder('utf-8');
       let usageMetadata: any = null;
       const toolCalls: Array<{ id?: string; name: string; arguments: string }> = [];
+      let upstreamFinishReason: string | null = null;
 
       try {
+        reply.raw.write(createOpenAIRoleChunk(completionId, chatReq.model));
         for await (const chunk of bodyStream) {
           buffer += decoder.write(chunk);
           const lines = buffer.split('\n');
@@ -365,6 +368,7 @@ export async function createServer(
 
             const { text, functionCalls = [], finishReason, usageMetadata: chunkUsage } = extractTextFromGoogleChunk(jsonStr);
             if (chunkUsage) usageMetadata = mergeUsageMetadata(usageMetadata, chunkUsage);
+            if (finishReason) upstreamFinishReason = normalizeOpenAIFinishReason(finishReason);
             if (text) {
               const sseChunk = createOpenAIChunk(completionId, chatReq.model, text, null);
               reply.raw.write(sseChunk);
@@ -378,14 +382,21 @@ export async function createServer(
               toolCalls.push(toolCall);
               reply.raw.write(createOpenAIChunk(completionId, chatReq.model, '', null, [{ index: toolCalls.length - 1, ...toolCall }]));
             }
-            if (finishReason) {
-              const sseChunk = createOpenAIChunk(completionId, chatReq.model, '', toolCalls.length ? 'tool_calls' : finishReason);
-              reply.raw.write(sseChunk);
-            }
           }
         }
         buffer += decoder.end();
 
+        const finishReason = toolCalls.length ? 'tool_calls' : (upstreamFinishReason || 'stop');
+        reply.raw.write(createOpenAIChunk(completionId, chatReq.model, '', finishReason));
+        if (chatReq.stream_options?.include_usage) {
+          const promptTokens = Number(usageMetadata?.promptTokenCount) || 0;
+          const completionTokens = Number(usageMetadata?.candidatesTokenCount) || 0;
+          reply.raw.write(createOpenAIUsageChunk(completionId, chatReq.model, {
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+            total_tokens: Number(usageMetadata?.totalTokenCount) || promptTokens + completionTokens
+          }));
+        }
         // 发送终止标志
         reply.raw.write('data: [DONE]\n\n');
         reply.raw.end();
@@ -396,6 +407,7 @@ export async function createServer(
         if (usageMetadata) pool.recordTokenUsage(usageMetadata);
       } catch (e: any) {
         console.error('[Gateway] SSE Streaming error:', e.message);
+        cleanup({ code: lifecycle.signal.aborted ? 499 : 502, message: e.message });
         const statusCode = e instanceof UpstreamRequestError ? e.statusCode : 502;
         sendGatewayError(reply, statusCode, {
           error: { message: `Upstream stream failed: ${e.message}`, type: statusCode === 400 ? 'invalid_request_error' : 'api_error' }
@@ -413,6 +425,7 @@ export async function createServer(
       const decoder = new StringDecoder('utf-8');
       let usageMetadata: any = null;
       const toolCalls: Array<{ id?: string; name: string; arguments: string }> = [];
+      let upstreamFinishReason: string | null = null;
 
       try {
         for await (const chunk of bodyStream) {
@@ -426,8 +439,9 @@ export async function createServer(
             const jsonStr = trimmed.substring(5).trim();
             if (!jsonStr || jsonStr === '[DONE]') continue;
 
-            const { text, functionCalls = [], usageMetadata: chunkUsage } = extractTextFromGoogleChunk(jsonStr);
+            const { text, functionCalls = [], finishReason, usageMetadata: chunkUsage } = extractTextFromGoogleChunk(jsonStr);
             if (chunkUsage) usageMetadata = mergeUsageMetadata(usageMetadata, chunkUsage);
+            if (finishReason) upstreamFinishReason = normalizeOpenAIFinishReason(finishReason);
             if (text) {
               fullText += text;
             }
@@ -468,7 +482,7 @@ export async function createServer(
                   }))
                 } : {})
               },
-              finish_reason: toolCalls.length ? 'tool_calls' : 'stop'
+          finish_reason: toolCalls.length ? 'tool_calls' : (upstreamFinishReason || 'stop')
             }
           ],
           usage: {
@@ -507,18 +521,36 @@ export async function createServer(
     }
 
     const messages: any[] = [];
-    if (typeof input.instructions === 'string' && input.instructions.trim()) {
-      messages.push({ role: 'system', content: input.instructions });
+    const instructionParts = Array.isArray(input.instructions)
+      ? input.instructions
+        .map((part: any) => part?.text ?? part?.input_text ?? part?.output_text)
+        .filter((text: unknown): text is string => typeof text === 'string' && text.length > 0)
+      : typeof input.instructions === 'string' && input.instructions.trim()
+        ? [input.instructions]
+        : [];
+    if (instructionParts.length) {
+      messages.push({ role: 'system', content: instructionParts.join('\n') });
     }
     const responseInput = input.input;
-    const items = Array.isArray(responseInput) ? responseInput : [{ role: 'user', content: responseInput ?? '' }];
+    const items = Array.isArray(responseInput)
+      ? responseInput
+      : responseInput && typeof responseInput === 'object'
+        ? [responseInput]
+        : [{ role: 'user', content: responseInput ?? '' }];
     for (const item of items) {
       if (typeof item === 'string') {
         messages.push({ role: 'user', content: item });
       } else if (item?.type === 'message' || item?.role) {
         const role = item.role === 'developer' ? 'system' : (item.role || 'user');
         const content = Array.isArray(item.content)
-          ? item.content.map((part: any) => part?.text ?? part?.input_text ?? part?.output_text ?? '').join('\n')
+          ? item.content.map((part: any) => {
+            if (part?.type === 'input_image' || part?.type === 'image_url') {
+              const imageUrl = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+              return imageUrl ? { type: 'image_url', image_url: { url: imageUrl } } : null;
+            }
+            const text = part?.text ?? part?.input_text ?? part?.output_text;
+            return typeof text === 'string' ? { type: 'text', text } : null;
+          }).filter(Boolean)
           : (item.content ?? '');
         messages.push({ role, content });
       } else if (item?.type === 'function_call_output') {

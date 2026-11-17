@@ -5,8 +5,8 @@ import { Agent, ProxyAgent, Dispatcher } from 'undici';
  * 避免高频请求或后台定时轮询中不断 new ProxyAgent 造成连接池未关闭、socket 泄漏和本地端口耗尽
  */
 const proxyAgentCache = new Map<string, ProxyAgent>();
-const directAgents = new Set<Agent>();
-const drainingDispatchers = new Set<ProxyAgent>();
+const directAgents = new Map<string, Agent>();
+const drainingDispatchers = new Set<Dispatcher>();
 const dispatcherIds = new WeakMap<Dispatcher, number>();
 let nextDispatcherId = 1;
 
@@ -46,46 +46,37 @@ export interface DispatcherOptions {
  */
 export function getOrCreateDispatcher(proxyUrl?: string, options?: DispatcherOptions): Dispatcher | undefined {
   const trimmed = proxyUrl?.trim();
+  const timeoutMs = options?.timeoutMs ?? 60000;
+  const keepAliveTimeoutMs = options?.keepAliveTimeoutMs ?? 10000;
+  const keepAliveMaxTimeoutMs = options?.keepAliveMaxTimeoutMs ?? 30000;
+  const cacheKey = `${trimmed || 'direct'}__timeout_${timeoutMs}__ka_${keepAliveTimeoutMs}_${keepAliveMaxTimeoutMs}`;
   if (!trimmed) {
-    // Clash TUN and other transparent routes still need a long-lived TCP
-    // socket for generations that stay silent before response headers arrive.
-    // Undici's default direct connector does not enable TCP keepalive.
-    // A TUN/proxy path may corrupt a reused H2 TLS session after a long
-    // silent generation. Create one isolated H2 session per upstream request
-    // instead of allowing later generations to reuse that session.
-    const agent = new Agent({
-      allowH2: true,
-      maxRequestsPerClient: 1,
-      connect: { keepAlive: true, keepAliveInitialDelay: 15_000 },
-      keepAliveTimeout: Math.min(1000, options?.keepAliveTimeoutMs ?? 10_000),
-      keepAliveMaxTimeout: Math.min(3000, options?.keepAliveMaxTimeoutMs ?? 30_000),
-      keepAliveTimeoutThreshold: 1000
-    });
-    directAgents.add(agent);
-    dispatcherIds.set(agent, nextDispatcherId++);
+    let agent = directAgents.get(cacheKey);
+    if (!agent) {
+      agent = new Agent({
+        allowH2: false,
+        connect: { timeout: timeoutMs, keepAlive: true, keepAliveInitialDelay: 15_000 },
+        keepAliveTimeout: keepAliveTimeoutMs,
+        keepAliveMaxTimeout: keepAliveMaxTimeoutMs,
+        keepAliveTimeoutThreshold: 1000
+      });
+      directAgents.set(cacheKey, agent);
+      dispatcherIds.set(agent, nextDispatcherId++);
+    }
     return agent;
   }
   assertSupportedProxyUrl(trimmed);
 
-  const timeoutMs = options?.timeoutMs ?? 60000;
   // A proxy can silently retire an idle CONNECT tunnel while undici still
   // has it in its pool. Keep the reuse window bounded so a later long-lived
   // request does not inherit a stale tunnel from an earlier request.
-  const keepAliveTimeoutMs = options?.keepAliveTimeoutMs ?? 10000;
-  const keepAliveMaxTimeoutMs = options?.keepAliveMaxTimeoutMs ?? 30000;
-  const cacheKey = `${trimmed}__timeout_${timeoutMs}__ka_${keepAliveTimeoutMs}_${keepAliveMaxTimeoutMs}`;
 
   let dispatcher = proxyAgentCache.get(cacheKey);
   if (!dispatcher) {
     dispatcher = new ProxyAgent({
       uri: trimmed,
-      allowH2: true,
-      maxRequestsPerClient: 1,
-      // maxCachedSessions: 0 disables TLS session resumption. Accounts that
-      // share one proxy also share this ProxyAgent, and a resumed ticket is a
-      // cross-account correlation signal; correctness beats the handshake
-      // saving here.
-      requestTls: { timeout: timeoutMs, keepAlive: true, keepAliveInitialDelay: 15000, maxCachedSessions: 0, ALPNProtocols: ['h2', 'http/1.1'] },
+      allowH2: false,
+      requestTls: { timeout: timeoutMs, keepAlive: true, keepAliveInitialDelay: 15000, ALPNProtocols: ['http/1.1'] },
       proxyTls: { timeout: timeoutMs, keepAlive: true, keepAliveInitialDelay: 15000 },
       connect: { timeout: timeoutMs },
       keepAliveTimeout: keepAliveTimeoutMs,
@@ -102,17 +93,17 @@ export function getOrCreateDispatcher(proxyUrl?: string, options?: DispatcherOpt
 /** Retire a specific pool without interrupting requests already using it. */
 export function resetDispatcher(proxyUrl: string | undefined, options: DispatcherOptions | undefined, expectedDispatcher: Dispatcher): void {
   const trimmed = proxyUrl?.trim();
-  if (!trimmed) return;
 
   const timeoutMs = options?.timeoutMs ?? 60000;
   const keepAliveTimeoutMs = options?.keepAliveTimeoutMs ?? 10000;
   const keepAliveMaxTimeoutMs = options?.keepAliveMaxTimeoutMs ?? 30000;
-  const cacheKey = `${trimmed}__timeout_${timeoutMs}__ka_${keepAliveTimeoutMs}_${keepAliveMaxTimeoutMs}`;
-  const dispatcher = proxyAgentCache.get(cacheKey);
+  const cacheKey = `${trimmed || 'direct'}__timeout_${timeoutMs}__ka_${keepAliveTimeoutMs}_${keepAliveMaxTimeoutMs}`;
+  const dispatcher = trimmed ? proxyAgentCache.get(cacheKey) : directAgents.get(cacheKey);
   // A late failure from an old pool must never retire its replacement.
   if (!dispatcher || dispatcher !== expectedDispatcher) return;
 
   proxyAgentCache.delete(cacheKey);
+  directAgents.delete(cacheKey);
   drainingDispatchers.add(dispatcher);
   void Promise.resolve()
     .then(() => dispatcher.close())
@@ -124,7 +115,7 @@ export function resetDispatcher(proxyUrl: string | undefined, options: Dispatche
  * 服务退出时关闭当前和正在排空的连接池
  */
 export function destroyAllDispatchers(): void {
-  for (const dispatcher of new Set<Dispatcher>([...directAgents, ...proxyAgentCache.values(), ...drainingDispatchers])) {
+  for (const dispatcher of new Set<Dispatcher>([...directAgents.values(), ...proxyAgentCache.values(), ...drainingDispatchers])) {
     void Promise.resolve().then(() => dispatcher.destroy()).catch(() => {});
   }
   directAgents.clear();

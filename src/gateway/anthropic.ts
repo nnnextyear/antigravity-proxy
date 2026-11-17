@@ -11,12 +11,13 @@ import {
   resolveDynamicUpstreamModel,
   resolveFrameworkThinking,
   resolveThinkingConfig,
+  isGemini3Model,
 } from './models.js';
 import { attachUpstreamSessionId, extractSessionKey, extractSessionIdentity, logSessionIdentity } from './session.js';
 import { anthropicErrorType, prepareSseResponse, sendGatewayError, startRequestLifecycle } from './streaming.js';
 
 interface AnthropicMessageParam {
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system' | 'developer';
   content: string | any[];
 }
 
@@ -153,13 +154,11 @@ function convertAnthropicMessages(
 
   // 2. 转换各轮次消息为 Google CloudCode contents
   for (const msg of messages) {
-    if ((msg.role as any) === 'system') {
-      const sysText = typeof msg.content === 'string'
-        ? msg.content
-        : Array.isArray(msg.content)
-          ? msg.content.map(p => (typeof p === 'string' ? p : p.text || '')).join('\n')
-          : String(msg.content || '');
-      if (sysText.trim()) systemFromMessages.push(sysText);
+    if (msg.role === 'system' || msg.role === 'developer') {
+      const systemParts = typeof msg.content === 'string' ? [msg.content]
+        : Array.isArray(msg.content) ? msg.content.map(part => typeof part === 'string' ? part : part.text || '')
+          : [];
+      systemFromMessages.push(...systemParts.filter(text => text.trim()));
       continue;
     }
 
@@ -217,10 +216,6 @@ function convertAnthropicMessages(
     if (parts.length > 0) {
       contents.push({ role, parts });
     }
-  }
-
-  if (contents.length === 0) {
-    contents.push({ role: 'user', parts: [{ text: 'Hello' }] });
   }
 
   return { contents, systemFromMessages };
@@ -342,6 +337,79 @@ export function sanitizeGoogleSchema(schema: any): any {
   return result;
 }
 
+const DEFAULT_CALLER_IDENTITY_SCRUB: Array<[string, string]> = [
+  ['Nous Research', 'the assistant team'],
+  ['Hermes Agent', 'the assistant'],
+  ['Hermes', 'the assistant'],
+  ['Claude Code', 'the assistant'],
+  ['Anthropic', 'the vendor']
+];
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getCallerIdentityScrubRules(): Array<[RegExp, string]> {
+  const customRules = (process.env.ANTIGRAVITY_SCRUB_IDENTITY || '')
+    .split(',')
+    .map(pair => {
+      const separator = pair.indexOf('=>');
+      return separator < 0 ? undefined : [pair.slice(0, separator).trim(), pair.slice(separator + 2).trim()] as [string, string];
+    })
+    .filter((rule): rule is [string, string] => Boolean(rule?.[0]));
+
+  return [...DEFAULT_CALLER_IDENTITY_SCRUB, ...customRules]
+    .map(([term, replacement]) => [new RegExp(`\\b${escapeRegExp(term)}\\b`, 'g'), replacement]);
+}
+
+const CALLER_IDENTITY_SCRUB_RULES = getCallerIdentityScrubRules();
+
+function scrubCallerIdentity(text: string): string {
+  let scrubbed = text;
+  for (const [pattern, replacement] of CALLER_IDENTITY_SCRUB_RULES) {
+    scrubbed = scrubbed.replace(pattern, () => replacement);
+  }
+  return scrubbed;
+}
+
+/** CloudCode can reject caller-supplied system text in systemInstruction with a generic 429. */
+function prependCallerSystemPrompt(contents: GoogleContent[], systemTexts: string[]): void {
+  const text = scrubCallerIdentity(systemTexts.filter(value => typeof value === 'string' && value.trim()).join('\n\n'));
+  if (!text) return;
+
+  const part = { text: `<system-instructions>\n${text}\n</system-instructions>` };
+  const first = contents[0];
+  const hasFunctionResponse = first?.parts.some((item: any) => Boolean(item?.functionResponse));
+
+  if (first?.role === 'user' && !hasFunctionResponse) {
+    first.parts.unshift(part);
+  } else {
+    contents.unshift({ role: 'user', parts: [part] });
+  }
+}
+
+function collectSystemTexts(system: AnthropicMessageRequest['system'], fromMessages: string[]): string[] {
+  const texts = [...fromMessages];
+  if (typeof system === 'string') texts.push(system);
+  else if (Array.isArray(system)) texts.push(...system.map(part => typeof part === 'string' ? part : part.text));
+  return texts;
+}
+
+function requestValidationError(body: any): string | undefined {
+  if (!body || typeof body.model !== 'string' || !body.model.trim()) return 'model must be a non-empty string';
+  if (!Array.isArray(body.messages) || !body.messages.length) return 'messages must be a non-empty array';
+  if (body.messages.some((message: any) => !message || !['user', 'assistant', 'system', 'developer'].includes(message.role)
+    || !(typeof message.content === 'string' || Array.isArray(message.content)))) return 'messages contain an unsupported role or content type';
+  if (body.messages.some((message: any) => Array.isArray(message.content) && message.content.some((part: any) => !part || typeof part !== 'object' || typeof part.type !== 'string'))) return 'message content blocks must be typed objects';
+  if (body.max_tokens !== undefined && (!Number.isSafeInteger(body.max_tokens) || body.max_tokens <= 0)) return 'max_tokens must be a positive integer';
+  if (body.stream !== undefined && typeof body.stream !== 'boolean') return 'stream must be a boolean';
+  if (body.system !== undefined && typeof body.system !== 'string'
+    && !(Array.isArray(body.system) && body.system.every((part: any) => part?.type === 'text' && typeof part.text === 'string'))) return 'system must be a string or an array of text blocks';
+  if (body.tools !== undefined && (!Array.isArray(body.tools) || body.tools.some((tool: any) => !tool
+    || (typeof tool.name !== 'string' && !(typeof tool.type === 'string' && tool.type.startsWith('web_search')))))) return 'tools must be an array of named tool definitions';
+  return undefined;
+}
+
 export function registerAnthropicRoutes(
   app: FastifyInstance,
   config: AppConfig,
@@ -360,8 +428,9 @@ export function registerAnthropicRoutes(
     verifyAuth(req, reply);
     if (reply.sent) return;
     const body = req.body as AnthropicMessageRequest;
-    if (!body || !Array.isArray(body.messages)) {
-      return reply.status(400).send({ type: 'error', error: { type: 'invalid_request_error', message: 'messages is required and must be an array' } });
+    const invalid = requestValidationError(body);
+    if (invalid) {
+      return reply.status(400).send({ type: 'error', error: { type: 'invalid_request_error', message: invalid } });
     }
 
     // Start the lifecycle before model discovery: that wait must be covered
@@ -369,21 +438,17 @@ export function registerAnthropicRoutes(
     const lifecycle = startRequestLifecycle(req, reply, false);
     let modelDef: ResolvedModel;
     try {
-      modelDef = resolveDynamicUpstreamModel(body.model, await executor.fetchAvailableModels(3, {}, lifecycle.signal));
+      const { effort } = resolveFrameworkThinking(body);
+      modelDef = resolveDynamicUpstreamModel(body.model, await executor.fetchAvailableModels(3, {}, lifecycle.signal), effort);
     } catch (err: any) {
       const statusCode = err instanceof ModelRequestError ? 400 : err instanceof UpstreamRequestError ? err.statusCode : 503;
       applyRetryAfter(reply, err);
       return reply.status(statusCode).send({ type: 'error', error: { type: statusCode === 400 ? 'invalid_request_error' : 'api_error', message: err.message } });
     }
     const converted = convertAnthropicMessages(body.messages, modelDef.upstreamModel.startsWith('gemini'));
-    const systemTexts = [...converted.systemFromMessages];
-    if (body.system) {
-      systemTexts.push(typeof body.system === 'string'
-        ? body.system
-        : body.system.map((part: any) => typeof part === 'string' ? part : part.text || '').join('\n'));
-    }
+    if (!converted.contents.length) return reply.status(400).send({ type: 'error', error: { type: 'invalid_request_error', message: 'messages contain no supported content' } });
     const request: any = { contents: converted.contents };
-    if (systemTexts.length) request.systemInstruction = { parts: [{ text: systemTexts.join('\n\n') }] };
+    prependCallerSystemPrompt(request.contents, collectSystemTexts(body.system, converted.systemFromMessages));
     if (Array.isArray(body.tools) && body.tools.length) {
       request.tools = [{ functionDeclarations: body.tools.map((tool: any) => {
         const cleanName = sanitizeToolName(tool.name || (tool.type && String(tool.type).startsWith('web_search') ? 'web_search' : 'tool'));
@@ -420,10 +485,11 @@ export function registerAnthropicRoutes(
     if (reply.sent) return;
 
     const body = req.body as AnthropicMessageRequest;
-    if (!body || !body.messages || !Array.isArray(body.messages)) {
+    const invalid = requestValidationError(body);
+    if (invalid) {
       return reply.status(400).send({
         type: 'error',
-        error: { type: 'invalid_request_error', message: 'messages is required and must be an array' }
+        error: { type: 'invalid_request_error', message: invalid }
       });
     }
 
@@ -437,7 +503,7 @@ export function registerAnthropicRoutes(
     let modelDef: ResolvedModel;
     try {
       thinking = resolveFrameworkThinking(body);
-      modelDef = resolveDynamicUpstreamModel(body.model, await executor.fetchAvailableModels(3, {}, lifecycle.signal));
+      modelDef = resolveDynamicUpstreamModel(body.model, await executor.fetchAvailableModels(3, {}, lifecycle.signal), thinking.effort);
     } catch (err: any) {
       const statusCode = err instanceof ModelRequestError ? 400 : err instanceof UpstreamRequestError ? err.statusCode : 503;
       applyRetryAfter(reply, err);
@@ -454,13 +520,18 @@ export function registerAnthropicRoutes(
     // 2. 转换模型与消息
     const isGemini = modelDef.upstreamModel.startsWith('gemini');
     const { contents, systemFromMessages } = convertAnthropicMessages(body.messages, isGemini);
+    if (!contents.length) return sendGatewayError(reply, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages contain no supported content' } }, 'anthropic');
 
     const defaultMaxOutput = Number(modelDef.info?.maxOutputTokens ?? modelDef.info?.outputTokenLimit)
       || (isGemini ? 65536 : 64000);
     const generationConfig: any = {
-      temperature: body.temperature ?? 0.7,
       maxOutputTokens: body.max_tokens ? Math.min(body.max_tokens, defaultMaxOutput) : defaultMaxOutput
     };
+    // Gemini 3+ removed the legacy temperature parameter. Keep it for
+    // Claude/Gemini 2.x compatibility, but omit it from Gemini 3.8 requests.
+    if (!isGemini3Model(modelDef.upstreamModel)) {
+      generationConfig.temperature = body.temperature ?? 0.7;
+    }
 
     const thinkingConfig = resolveThinkingConfig(modelDef.upstreamModel, effort, budgetTokens, modelDef.info, generationConfig.maxOutputTokens);
     if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
@@ -529,24 +600,8 @@ export function registerAnthropicRoutes(
       }
     }
 
-    // 4. 系统提示词
-    const sysParts: string[] = [];
-    if (systemFromMessages.length > 0) {
-      sysParts.push(...systemFromMessages);
-    }
-    if (body.system) {
-      const sysText = typeof body.system === 'string'
-        ? body.system
-        : Array.isArray(body.system)
-          ? body.system.map(s => (typeof s === 'string' ? s : s.text || '')).join('\n')
-          : String(body.system);
-      if (sysText.trim()) sysParts.push(sysText);
-    }
-    if (sysParts.length > 0) {
-      innerRequest.systemInstruction = {
-        parts: [{ text: sysParts.join('\n\n') }]
-      };
-    }
+    // 4. Keep the caller prompt intact while avoiding CloudCode's systemInstruction rejection.
+    prependCallerSystemPrompt(innerRequest.contents, collectSystemTexts(body.system, systemFromMessages));
 
     const payload: GoogleCloudCodePayload = {
       project: 'aicode-consumers',
@@ -838,6 +893,7 @@ export function registerAnthropicRoutes(
         if (lastUsageMetadata) pool.recordTokenUsage(lastUsageMetadata);
       } catch (err: any) {
         console.error('[AnthropicGateway] Stream error:', err.message);
+        cleanup({ code: lifecycle.signal.aborted ? 499 : 502, message: err.message });
         const statusCode = err instanceof UpstreamRequestError ? err.statusCode : 502;
         sendGatewayError(reply, statusCode, {
           type: 'error',

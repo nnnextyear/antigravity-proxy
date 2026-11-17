@@ -8,6 +8,7 @@ import {
   resolveDynamicUpstreamModel,
   resolveFrameworkThinking,
   resolveThinkingConfig,
+  isGemini3Model,
   LiveModelCatalog
 } from './models.js';
 
@@ -24,10 +25,10 @@ export function convertOpenAIToCloudCode(req: OpenAIChatCompletionRequest, catal
 } {
   // 1. 动态检测客户端随请求传入的思考强度控制
   const { effort, budgetTokens } = resolveFrameworkThinking(req);
-  const modelDef = resolveDynamicUpstreamModel(req.model, catalog);
+  const modelDef = resolveDynamicUpstreamModel(req.model, catalog, effort);
   const isGemini = modelDef.upstreamModel.startsWith('gemini');
   const contents: GoogleContent[] = [];
-  let systemInstruction: { parts: { text: string }[] } | undefined = undefined;
+  let systemInstruction: { role: 'user'; parts: { text: string }[] } | undefined = undefined;
   const toolCallIds = new Map<string, string>();
 
   const normalizeToolName = (name: string) =>
@@ -36,36 +37,51 @@ export function convertOpenAIToCloudCode(req: OpenAIChatCompletionRequest, catal
   const appendContentPart = (parts: any[], part: any) => {
     if (typeof part === 'string') {
       if (part) parts.push({ text: part });
-    } else if (part?.type === 'text' && typeof part.text === 'string') {
+    } else if (part && ['text', 'input_text', 'output_text'].includes(part.type) && typeof part.text === 'string') {
       if (part.text) parts.push({ text: part.text });
-    } else if (part?.type === 'image_url') {
-      // Google CloudCode models used by this adapter do not accept OpenAI image
-      // blocks reliably; preserve a clear textual marker instead of silently
-      // dropping the user's input.
-      parts.push({ text: `[image input: ${part.image_url?.url || 'unavailable'}]` });
+    } else if (part?.type === 'image_url' || part?.type === 'input_image') {
+      const image = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+      const dataUri = typeof image === 'string'
+        ? image.match(/^data:([^;,]+);base64,(.+)$/s)
+        : null;
+      if (dataUri) {
+        parts.push({ inlineData: { mimeType: dataUri[1], data: dataUri[2] } });
+      } else if (image) {
+        // The CloudCode payload cannot dereference arbitrary remote URLs. Keep
+        // the URL visible to the model instead of silently dropping the part.
+        parts.push({ text: `[image input URL: ${image}]` });
+      }
     }
   };
 
+  const contentToParts = (content: unknown): any[] => {
+    const parts: any[] = [];
+    if (typeof content === 'string') appendContentPart(parts, content);
+    else if (Array.isArray(content)) content.forEach(part => appendContentPart(parts, part));
+    return parts;
+  };
+
   for (const msg of req.messages) {
-    if (msg.role === 'system') {
-      const textContent = typeof msg.content === 'string'
-        ? msg.content
-        : Array.isArray(msg.content)
-          ? msg.content.map(p => (typeof p === 'string' ? p : p.text || '')).join('\n')
-          : String(msg.content || '');
+    if (msg.role === 'system' || msg.role === 'developer') {
+      const systemParts = contentToParts(msg.content);
       systemInstruction = {
-        parts: [{ text: textContent }]
+        role: 'user',
+        parts: systemParts.length ? systemParts : [{ text: '' }]
       };
     } else if (msg.role === 'assistant') {
       const parts: any[] = [];
-      if (typeof msg.content === 'string') appendContentPart(parts, msg.content);
-      else if (Array.isArray(msg.content)) msg.content.forEach(part => appendContentPart(parts, part));
+      contentToParts(msg.content).forEach(part => parts.push(part));
       for (const call of msg.tool_calls || []) {
         const name = normalizeToolName(call.function?.name);
         const id = call.id || `call_${contents.length}_${parts.length}`;
         toolCallIds.set(id, name);
         let args: any = {};
-        try { args = JSON.parse(call.function?.arguments || '{}'); } catch { args = { raw_arguments: call.function?.arguments || '' }; }
+        const rawArguments: any = call.function?.arguments;
+        if (rawArguments && typeof rawArguments === 'object') {
+          args = rawArguments;
+        } else {
+          try { args = JSON.parse(String(rawArguments || '{}')); } catch { args = { raw_arguments: String(rawArguments || '') }; }
+        }
         // Gemini 3.x rejects a functionCall in a later turn unless the part
         // carries the thought signature from the original model response.
         // OpenAI/Codex does not expose that field in its chat-shaped history,
@@ -89,9 +105,7 @@ export function convertOpenAIToCloudCode(req: OpenAIChatCompletionRequest, catal
         parts: [{ functionResponse: { id: msg.tool_call_id, name: normalizeToolName(name), response: { output } } }]
       });
     } else {
-      const parts: any[] = [];
-      if (typeof msg.content === 'string') appendContentPart(parts, msg.content);
-      else if (Array.isArray(msg.content)) msg.content.forEach(part => appendContentPart(parts, part));
+      const parts = contentToParts(msg.content);
       contents.push({
         role: 'user',
         parts: parts.length ? parts : [{ text: '' }]
@@ -110,10 +124,20 @@ export function convertOpenAIToCloudCode(req: OpenAIChatCompletionRequest, catal
   const defaultMaxOutput = Number(modelDef.info?.maxOutputTokens ?? modelDef.info?.outputTokenLimit)
     || (isGemini ? 65536 : 64000);
   const generationConfig: any = {
-    temperature: req.temperature ?? 0.7,
-    topP: req.top_p ?? 0.95,
-    maxOutputTokens: req.max_tokens ? Math.min(req.max_tokens, defaultMaxOutput) : defaultMaxOutput
+    maxOutputTokens: req.max_tokens === undefined
+      ? defaultMaxOutput
+      : Math.min(Math.max(1, Math.floor(req.max_tokens)), defaultMaxOutput)
   };
+  // Gemini 3+ removed the legacy sampling controls. Sending them to 3.8
+  // causes compatibility failures even when they have their default values.
+  if (!isGemini3Model(modelDef.upstreamModel)) {
+    generationConfig.temperature = typeof req.temperature === 'number' ? req.temperature : 1;
+    generationConfig.topP = typeof req.top_p === 'number' ? req.top_p : 1;
+  }
+  if (typeof req.presence_penalty === 'number') generationConfig.presencePenalty = req.presence_penalty;
+  if (typeof req.frequency_penalty === 'number') generationConfig.frequencyPenalty = req.frequency_penalty;
+  if (typeof req.stop === 'string' && req.stop) generationConfig.stopSequences = [req.stop];
+  else if (Array.isArray(req.stop)) generationConfig.stopSequences = req.stop.filter((value): value is string => typeof value === 'string' && value.length > 0);
 
   // Responses API structured output, used by Codex's automatic approval
   // reviewer, maps to Gemini's JSON MIME type and response schema.
@@ -223,6 +247,49 @@ export function createOpenAIChunk(
   return `data: ${JSON.stringify(chunk)}\n\n`;
 }
 
+/** Standard first SSE frame for Chat Completions clients. */
+export function createOpenAIRoleChunk(id: string, model: string): string {
+  const chunk: OpenAIChatCompletionChunk = {
+    id,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+    usage: null
+  };
+  return `data: ${JSON.stringify(chunk)}\n\n`;
+}
+
+/** Optional usage frame requested by OpenAI's stream_options.include_usage. */
+export function createOpenAIUsageChunk(
+  id: string,
+  model: string,
+  usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number }
+): string {
+  const chunk: OpenAIChatCompletionChunk = {
+    id,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [],
+    usage
+  };
+  return `data: ${JSON.stringify(chunk)}\n\n`;
+}
+
+export function normalizeOpenAIFinishReason(reason?: string | null): string | null {
+  switch (String(reason || '').toUpperCase()) {
+    case 'STOP': return 'stop';
+    case 'MAX_TOKENS': return 'length';
+    case 'SAFETY':
+    case 'BLOCKLIST':
+    case 'PROHIBITED_CONTENT':
+    case 'SPII': return 'content_filter';
+    case 'RECITATION': return 'content_filter';
+    default: return reason || null;
+  }
+}
+
 /**
  * 解析 Google 上游返回的单行 SSE 数据，提取文本片段
  */
@@ -267,7 +334,7 @@ export function extractTextFromGoogleChunk(rawJson: string): {
     }
 
     const finishReason = candidate.finishReason || null;
-    return { text, functionCalls, finishReason: finishReason === 'STOP' ? 'stop' : finishReason, usageMetadata };
+    return { text, functionCalls, finishReason, usageMetadata };
   } catch {
     return { text: '', functionCalls: [] };
   }

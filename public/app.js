@@ -497,7 +497,7 @@ function isAccountCoolingDown(acc) {
 
 function isAccountFullyAvailable(acc) {
   if (acc.status !== 'active') return false;
-  if (acc.validationUrl) return false;
+  if (acc.validationRequired || acc.validationUrl) return false;
   const claude = familyQuota(acc, 'claude');
   const gemini = familyQuota(acc, 'gemini');
   return !familyQuotaBlocked(claude) || !familyQuotaBlocked(gemini);
@@ -585,7 +585,7 @@ function summarizeFamilyQuota(accounts, family) {
   const average = values => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length * 100 : null;
   return {
     total: eligible.length,
-    ready: eligible.filter((acc, i) => acc.status === 'active' && !acc.validationUrl
+    ready: eligible.filter((acc, i) => acc.status === 'active' && !acc.validationRequired && !acc.validationUrl
       && quotas[i].short !== null && quotas[i].weekly !== null && !familyQuotaBlocked(quotas[i])).length,
     shortAverage: average(quotas.map(q => q.short).filter(value => value !== null)),
     weeklyAverage: average(quotas.map(q => q.weekly).filter(value => value !== null))
@@ -688,7 +688,7 @@ function getStatusPill(acc) {
       return `<span class="status-badge-pill status-badge-dead" title="上游报告账号服务被停用，需要人工处理">政策限制</span>`;
     }
     return `<span class="status-badge-pill status-badge-dead">异常失效</span>`;
-  } else if (acc.validationUrl) {
+  } else if (acc.validationRequired || acc.validationUrl) {
     return `<span class="status-badge-pill status-badge-cooldown">需授权</span>`;
   } else if (acc.status === 'cooldown' || (isClaudeExhausted && isGeminiExhausted)) {
     return `<span class="status-badge-pill status-badge-cooldown"><span class="pulse-dot amber"></span>冷却中</span>`;
@@ -899,7 +899,7 @@ function renderPodHtml(family, acc) {
   const isClaude = family === 'claude';
   const quota = acc.quota;
 
-  if (acc.validationUrl) {
+  if (acc.validationRequired || acc.validationUrl) {
     return `
       <div class="quota-pod ${isClaude ? 'pod-claude' : 'pod-gemini'} pod-alert">
         <div class="pod-head">
@@ -907,10 +907,10 @@ function renderPodHtml(family, acc) {
             <span class="pod-brand-dot ${isClaude ? 'dot-purple' : 'dot-cyan'}"></span>
             <span class="pod-title">${isClaude ? 'Claude / GPT' : 'Google Gemini'}</span>
           </div>
-          <span class="badge-alert-tag">需授权</span>
+          <span class="badge-alert-tag">需验证</span>
         </div>
         <div class="pod-alert-body">
-          ${safeHttpUrl(acc.validationUrl) ? `<a href="${escapeHtml(safeHttpUrl(acc.validationUrl))}" target="_blank" rel="noopener noreferrer" class="card-action-btn card-action-compact action-authorize">前往授权</a>` : '<span>授权地址无效，请重新拉取</span>'}
+          ${safeHttpUrl(acc.validationUrl) ? `<a href="${escapeHtml(safeHttpUrl(acc.validationUrl))}" target="_blank" rel="noopener noreferrer" class="card-action-btn card-action-compact action-authorize">前往验证</a>` : '<span>Google 要求账号验证，暂未提供有效验证链接</span>'}
           <button type="button" class="card-action-btn card-action-compact action-quota" onclick="checkQuota('${acc.id}', this)">拉取额度</button>
         </div>
       </div>

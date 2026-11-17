@@ -16,14 +16,23 @@ export class ModelRequestError extends Error {
   readonly statusCode = 400;
 }
 
-const THINKING_SUFFIX = /-(?:extra-low|minimal|low|medium|high|xhigh|max|tiered|thinking)$/i;
+const THINKING_SUFFIX = /-(?:extra-low|minimal|low|medium|high|xhigh|max|thinking)$/i;
 const INTERNAL_MODEL = /^(?:chat_|tab_)/i;
+
+export function isGemini3Model(model: string): boolean {
+  return /^gemini-3(?:[.\-]|$)/i.test(model);
+}
+
+function isGemini38FlashModel(model: string): boolean {
+  return /^gemini-3\.8-flash(?:[.\-]|$)/i.test(model);
+}
 
 function cleanModelId(id: string): string {
   return String(id || '').trim().replace(/^models\//i, '').replace(/\[.*?\]/g, '').trim();
 }
 
-/** Presets are one selectable model; the request controls its thinking. */
+/** Strip only thinking presets. Google model variants such as -tiered remain
+ * part of the upstream model ID. */
 export function normalizePublicModelId(input: string): string {
   let id = cleanModelId(input);
   if (/^(?:gemini-|claude-|gpt-oss-)/i.test(id)) {
@@ -66,33 +75,53 @@ export function toPublicModelCatalog(catalog: LiveModelCatalog): Array<{
     }).map(normalizePublicModelId))];
 
   return publicIds.map(id => {
-    const candidates = entries.filter(entry => normalizePublicModelId(entry.sourceId) === id
+    const candidates = entries.filter(entry => visible.includes(entry.sourceId) && normalizePublicModelId(entry.sourceId) === id
       && entry.info.hidden !== true && entry.info.isHidden !== true);
     candidates.sort((a, b) => sourceRank(a.sourceId) - sourceRank(b.sourceId)
       || a.sourceId.localeCompare(b.sourceId));
     const source = candidates[0];
-    const levels = [...new Set(candidates.flatMap(entry => {
-      const suffix = entry.sourceId.slice(id.length);
-      return suffix === '-extra-low' || suffix === '-minimal' ? ['minimal']
-        : /^-(low|medium|high)$/.test(suffix) ? [suffix.slice(1)] : [];
-    }))];
-    const info = /^gemini-3(?:[.\-]|$)/i.test(id) && levels.length && !source.info.supportedThinkingLevels
-      ? { ...source.info, supportedThinkingLevels: levels } : source.info;
-    return { id, info, sourceId: source.sourceId };
+    // Picker preset names do not establish the model's supported thinking levels.
+    return { id, info: source.info, sourceId: source.sourceId };
   });
 }
 
-/** Select only an ID present in the current catalog; never alias model families. */
-export function resolveDynamicUpstreamModel(input: string, catalog?: LiveModelCatalog): ResolvedModel {
+function thinkingPresetForPicker(effort?: ThinkingSetting): 'low' | 'medium' | 'high' {
+  if (effort === 'low' || effort === 'minimal' || effort === 'none') return 'low';
+  if (effort === 'high' || effort === 'xhigh' || effort === 'max') return 'high';
+  return 'medium';
+}
+
+/** Select a visible live model, matching Gemini 3.8 Flash's picker preset to the requested effort. */
+export function resolveDynamicUpstreamModel(input: string, catalog?: LiveModelCatalog, effort?: ThinkingSetting): ResolvedModel {
+  if (typeof input !== 'string' || !input.trim()) throw new ModelRequestError('model must be a non-empty string');
   const id = normalizePublicModelId(input);
   const entry = catalog && toPublicModelCatalog(catalog).find(model => model.id === id);
   if (!id) throw new ModelRequestError('model is required');
   if (catalog && !entry) throw new ModelRequestError(`Model '${id}' is not available in the live Antigravity model picker.`);
-  const upstreamModel = entry?.sourceId || cleanModelId(input);
+  let upstreamModel = entry?.sourceId || cleanModelId(input);
+  let info = entry?.info;
+
+  // The current Antigravity picker exposes only effort presets for this model.
+  // Keep a public base ID while sending the exact visible upstream preset.
+  if (catalog && entry && /^gemini-3\.8-flash$/i.test(id) && upstreamModel.toLowerCase() !== id.toLowerCase()) {
+    const preferredId = `${id}-${thinkingPresetForPicker(effort)}`;
+    const visibleIds = catalog.agentModelSorts?.flatMap(sort =>
+      (sort.groups || []).flatMap(group => group.modelIds || [])).map(cleanModelId);
+    const preferred = Object.entries(catalog.models).find(([sourceId]) => {
+      const cleanId = cleanModelId(sourceId);
+      return cleanId.toLowerCase() === preferredId.toLowerCase()
+        && (visibleIds === undefined || visibleIds.some(visibleId => visibleId.toLowerCase() === cleanId.toLowerCase()));
+    });
+    if (preferred) {
+      upstreamModel = cleanModelId(preferred[0]);
+      info = preferred[1] && typeof preferred[1] === 'object' ? preferred[1] as Record<string, any> : {};
+    }
+  }
+
   return {
     upstreamModel,
     pool: /^(?:claude-|gpt-oss-)/i.test(upstreamModel) ? 'sandbox' : 'cli',
-    info: entry?.info
+    info
   };
 }
 
@@ -149,7 +178,7 @@ export function resolveThinkingConfig(
 ): Record<string, unknown> | undefined {
   if (info?.supportsThinking === false || (effort === undefined && explicitBudget === undefined)) return undefined;
   const setting = effort ?? (explicitBudget === undefined ? undefined : thinkingEffortFromBudget(explicitBudget));
-  const isGemini3 = /^gemini-3(?:[.\-]|$)/i.test(model);
+  const isGemini3 = isGemini3Model(model);
   const isPro = isGemini3 && /(?:^|-)pro(?:$|-)/i.test(model);
 
   if (isGemini3) {
@@ -159,7 +188,8 @@ export function resolveThinkingConfig(
       : setting === 'xhigh' || setting === 'max' ? 'high' : setting;
     const supported = Array.isArray(info?.supportedThinkingLevels)
       ? info.supportedThinkingLevels.filter((value: string) => ['minimal', 'low', 'medium', 'high'].includes(value))
-      : isPro ? ['low', 'high'] : ['minimal', 'low', 'medium', 'high'];
+      : isGemini38FlashModel(model) ? ['low', 'medium', 'high']
+        : isPro ? ['low', 'high'] : ['minimal', 'low', 'medium', 'high'];
     if (!supported.length) return undefined;
     const levels = ['minimal', 'low', 'medium', 'high'];
     const target = levels.indexOf(level!);

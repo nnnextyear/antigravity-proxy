@@ -1,6 +1,7 @@
 export type UpstreamErrorKind =
   | 'policy_blocked'
   | 'authentication'
+  | 'validation_required'
   | 'quota'
   | 'rate_limit'
   | 'location'
@@ -12,6 +13,7 @@ export interface ClassifiedUpstreamError {
   kind: UpstreamErrorKind;
   reason?: string;
   message: string;
+  validationUrl?: string;
 }
 
 function parseJson(body: string): any {
@@ -32,6 +34,13 @@ function errorFields(body: string): { reason?: string; message?: string; status?
     message: error?.message || parsed?.error_description || parsed?.message,
     status: error?.status || parsed?.status
   };
+}
+
+function errorDetails(body: string): any[] {
+  const parsed = parseJson(body);
+  const error = parsed?.error && typeof parsed.error === 'object' ? parsed.error : parsed;
+  return Array.isArray(error?.details) ? error.details
+    : Array.isArray(parsed?.details) ? parsed.details : [];
 }
 
 export function isLocationError(statusCode: number, body: string): boolean {
@@ -104,6 +113,15 @@ export function classifyUpstreamError(statusCode: number, body: string): Classif
   if (isPolicyBlockedError(statusCode, body)) {
     return { kind: 'policy_blocked', reason: fields.reason || 'TOS_VIOLATION', message };
   }
+  if (statusCode === 403 && (fields.reason === 'VALIDATION_REQUIRED' || /Verify your account to continue/i.test(message))) {
+    const rawUrl = errorDetails(body).find((detail: any) => detail?.metadata?.validation_url)?.metadata.validation_url;
+    let validationUrl: string | undefined;
+    try {
+      const url = new URL(rawUrl);
+      if (url.protocol === 'https:' && (url.hostname === 'google.com' || url.hostname.endsWith('.google.com'))) validationUrl = url.href;
+    } catch { /* A verification error can omit its link. */ }
+    return { kind: 'validation_required', reason: fields.reason, message, validationUrl };
+  }
   if (isLocationError(statusCode, body)) {
     return { kind: 'location', reason: fields.reason, message };
   }
@@ -128,18 +146,29 @@ export function classifyUpstreamError(statusCode: number, body: string): Classif
 }
 
 function parseDelay(value: unknown): number | undefined {
+  if (Array.isArray(value)) {
+    const delays = value.map(parseDelay).filter((delay): delay is number => delay !== undefined);
+    return delays.length ? Math.max(...delays) : undefined;
+  }
+  if (value && typeof value === 'object') {
+    const duration = value as { seconds?: unknown; nanos?: unknown };
+    if (duration.seconds === undefined && duration.nanos === undefined) return undefined;
+    const ms = Number(duration.seconds ?? 0) * 1000 + Number(duration.nanos ?? 0) / 1e6;
+    return Number.isFinite(ms) ? Math.max(0, ms) : undefined;
+  }
   if (typeof value === 'number' && Number.isFinite(value)) return Math.max(0, value * 1000);
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   if (!trimmed) return undefined;
   const numeric = Number(trimmed);
   if (Number.isFinite(numeric)) return Math.max(0, numeric * 1000);
-  const dateMs = Date.parse(trimmed);
-  if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
   const parts = [...trimmed.matchAll(/(\d+(?:\.\d+)?)(ms|s|m|h)/gi)];
-  if (!parts.length || parts.map(part => part[0]).join('') !== trimmed) return undefined;
-  return parts.reduce((sum, part) => sum + Number(part[1]) *
-    ({ ms: 1, s: 1000, m: 60000, h: 3600000 }[part[2].toLowerCase()] ?? 0), 0);
+  if (parts.length && parts.map(part => part[0]).join('') === trimmed) {
+    return parts.reduce((sum, part) => sum + Number(part[1]) *
+      ({ ms: 1, s: 1000, m: 60000, h: 3600000 }[part[2].toLowerCase()] ?? 0), 0);
+  }
+  const dateMs = Date.parse(trimmed);
+  return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : undefined;
 }
 
 /** Quota resets are a lower bound even when Retry-After asks for a shorter wait. */
@@ -150,17 +179,21 @@ export function retryAfterMs(
 ): number {
   const headerValue = headers?.['retry-after'] ?? headers?.['Retry-After'];
   const headerDelay = parseDelay(headerValue);
-  const explicitQuota = !!body && classifyUpstreamError(429, body).kind === 'quota';
-  if (headerDelay !== undefined && !explicitQuota) return Math.min(Math.max(headerDelay, 1000), 24 * 60 * 60 * 1000);
 
-  const parsed = body ? parseJson(body) : undefined;
-  const details = parsed?.error?.details || parsed?.details;
+  const details = body ? errorDetails(body) : [];
   if (Array.isArray(details)) {
-    const delays = details.flatMap((detail: any) => [detail?.retryDelay, detail?.quotaResetDelay,
-      detail?.metadata?.quotaResetTimeStamp, detail?.metadata?.quotaResetDelay])
+    const delays = details.flatMap((detail: any) => [
+      detail?.retryDelay,
+      detail?.quotaResetDelay,
+      detail?.retryInfo?.retryDelay,
+      detail?.metadata?.quotaResetTimeStamp,
+      detail?.metadata?.quotaResetTimestamp,
+      detail?.metadata?.quotaResetDelay,
+      detail?.metadata?.retryDelay
+    ])
       .map(parseDelay).filter((delay: number | undefined): delay is number => delay !== undefined);
-    if (delays.length) return Math.min(Math.max(...delays, headerDelay ?? 0, 1000), 24 * 60 * 60 * 1000);
+    if (delays.length) return Math.max(...delays, headerDelay ?? 0, 0);
   }
 
-  return Math.min(Math.max(headerDelay ?? fallbackMs, 1000), 24 * 60 * 60 * 1000);
+  return Math.max(headerDelay ?? fallbackMs, 0);
 }

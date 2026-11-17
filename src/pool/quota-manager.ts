@@ -2,7 +2,7 @@ import { request } from 'undici';
 import { Account, AccountQuota, AppConfig } from '../types.js';
 import { AccountPool } from './account-pool.js';
 import { getOrCreateDispatcher } from './dispatcher.js';
-import { isPolicyBlockedError, retryAfterMs } from './error-policy.js';
+import { classifyUpstreamError, isPolicyBlockedError, retryAfterMs } from './error-policy.js';
 import { jittered } from './transport.js';
 
 /** How often a validation-flagged account is re-probed before giving up. */
@@ -37,7 +37,7 @@ export function shouldPollQuota(acc: Account, now: number, gate: QuotaPollGate =
   if (!gate.force) {
     if (acc.status === 'cooldown' && now < acc.cooldownUntil) return false;
     if (now < (gate.pausedUntil ?? 0)) return false;
-    if (acc.validationUrl && now - (gate.lastAttemptAt ?? 0) < VALIDATION_RECHECK_MS) return false;
+    if ((acc.validationRequired || acc.validationUrl) && now - (gate.lastAttemptAt ?? 0) < VALIDATION_RECHECK_MS) return false;
   }
   if (!acc.accessToken || now >= acc.accessTokenExpiresAt) return false;
   return true;
@@ -150,13 +150,11 @@ export class QuotaManager {
         }
         try {
           const errJson = JSON.parse(errText);
-          const validationDetail = errJson.error?.details?.find((d: any) => d.reason === 'VALIDATION_REQUIRED' || d.metadata?.validation_url);
-          const validationUrl = validationDetail?.metadata?.validation_url || (errJson.error?.message?.includes('Verify your account') ? errJson.error?.details?.[0]?.metadata?.validation_url : undefined);
-
-          if (validationUrl) {
-            account.validationUrl = validationUrl;
+          const classified = classifyUpstreamError(res.statusCode, errText);
+          if (classified.kind === 'validation_required') {
+            account.validationUrl = classified.validationUrl;
             account.lastError = '需要完成 Google 账号验证';
-            this.pool.updateAccount(account.id, { validationUrl, lastError: account.lastError });
+            this.pool.updateAccount(account.id, { validationUrl: classified.validationUrl, validationRequired: true, lastError: account.lastError });
           } else {
             account.lastError = `HTTP ${res.statusCode}: ${errJson.error?.message || errText.substring(0, 60)}`;
             this.pool.updateAccount(account.id, { lastError: account.lastError });
@@ -276,6 +274,7 @@ export class QuotaManager {
       const updated = this.pool.updateAccount(account.id, {
         quota,
         validationUrl: undefined,
+        validationRequired: false,
         status: newStatus,
         cooldownUntil: newCooldownUntil,
         ...(preserveReason ? {} : { lastError: undefined })

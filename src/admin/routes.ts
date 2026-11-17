@@ -10,6 +10,7 @@ import { AppConfig } from '../types.js';
 import { saveConfig } from '../config.js';
 import { DEFAULT_OAUTH_CLIENT_ID, DEFAULT_OAUTH_CLIENT_SECRET } from '../config.js';
 import { extractFromWindowsCredential } from '../pool/local-extractor.js';
+import { publicAccount } from './account-view.js';
 
 export function registerAdminRoutes(
   app: FastifyInstance,
@@ -69,15 +70,7 @@ export function registerAdminRoutes(
 
   // 2. 获取所有账号
   app.get('/api/admin/accounts', { preHandler: [requireAdminAuth] }, async () => {
-    const list = pool.getAllAccounts().map(acc => ({
-      ...acc,
-      refreshTokenMasked: acc.refreshToken
-        ? `${acc.refreshToken.substring(0, 6)}...${acc.refreshToken.substring(acc.refreshToken.length - 4)}`
-        : '',
-      accessTokenMasked: acc.accessToken
-        ? `${acc.accessToken.substring(0, 10)}...`
-        : ''
-    }));
+    const list = pool.getAllAccounts().map(publicAccount);
     return { accounts: list };
   });
 
@@ -100,7 +93,7 @@ export function registerAdminRoutes(
     // 自动尝试触发一次刷新
     refresher.refreshSingleAccount(newAcc).catch(() => {});
 
-    return { message: 'Account added successfully', account: newAcc };
+    return { message: 'Account added successfully', account: publicAccount(newAcc) };
   });
 
   // 4. 删除账号
@@ -148,7 +141,7 @@ export function registerAdminRoutes(
     }
 
     const updated = pool.updateAccount(params.id, updates);
-    return { success: true, message: '账号配置已成功更新', account: updated };
+    return { success: true, message: '账号配置已成功更新', account: publicAccount(updated) };
   });
 
   // 5. 手动刷新指定账号
@@ -160,7 +153,7 @@ export function registerAdminRoutes(
     }
 
     const ok = await refresher.refreshSingleAccount(acc);
-    return { success: ok, account: acc };
+    return { success: ok, account: publicAccount(acc) };
   });
 
   // 6. 重置账号状态为 active
@@ -179,9 +172,10 @@ export function registerAdminRoutes(
     // A manual reset must also clear the validation flag, otherwise the quota
     // worker would keep waiting out its recheck window.
     acc.validationUrl = undefined;
+    acc.validationRequired = false;
     pool.saveAccounts();
 
-    return { message: 'Account status reset to active', account: acc };
+    return { message: 'Account status reset to active', account: publicAccount(acc) };
   });
 
   // 6.1 手动启用或停用账号。停用账号保留凭据与历史数据，但不会再参与调度。
@@ -212,9 +206,10 @@ export function registerAdminRoutes(
     if (body.status === 'active') {
       acc.lastError = undefined;
       acc.validationUrl = undefined;
+      acc.validationRequired = false;
     }
     pool.saveAccounts();
-    return { success: true, message: body.status === 'disabled' ? '账号已停用，不会参与后续调度' : '账号已重新启用', account: acc };
+    return { success: true, message: body.status === 'disabled' ? '账号已停用，不会参与后续调度' : '账号已重新启用', account: publicAccount(acc) };
   });
 
   // 7. 查询/刷新指定账号真实额度 (从 Google 官方实时拉取)
@@ -232,7 +227,7 @@ export function registerAdminRoutes(
       await refresher.refreshSingleAccount(acc);
     }
     const quota = await quotaManager.fetchQuotaForAccount(acc, { forceRefresh: true });
-    return { success: Boolean(quota), quota, account: pool.getAccount(params.id) ?? null };
+    return { success: Boolean(quota), quota, account: publicAccount(pool.getAccount(params.id)) };
   });
 
   // 8. 一键刷新全池所有账号的真实额度
@@ -269,8 +264,8 @@ export function registerAdminRoutes(
       networkMode: proxy ? 'explicit-proxy' : 'system-network',
       accountProxyCount,
       networkDescription: proxy
-        ? `生成与 countTokens 使用 HTTP CONNECT 隧道、原生 HTTP/2，每 15 秒 PING 保活。账号专属代理优先；当前有 ${accountProxyCount} 个账号配置了专属代理。`
-        : `未配置全局 HTTP 代理，连接由系统路由接管（例如 TUN/VPN）；传统系统代理开关不会被 Node 自动读取。长请求每 15 秒发送 HTTP/2 PING。当前有 ${accountProxyCount} 个账号配置了专属代理。`,
+        ? `生成与 countTokens 通过配置的 HTTP CONNECT 代理连接。账号专属代理优先；当前有 ${accountProxyCount} 个账号配置了专属代理。`
+        : `未配置全局 HTTP 代理，连接由系统路由接管（例如 TUN/VPN）；传统系统代理开关不会被 Node 自动读取。当前有 ${accountProxyCount} 个账号配置了专属代理。`,
       hasOauthCredentials: Boolean(config.oauthClientId)
     };
   });
@@ -333,7 +328,7 @@ export function registerAdminRoutes(
 
     return {
       message: '成功从本机 Antigravity 提取并同步账号',
-      account: targetAcc
+      account: publicAccount(targetAcc)
     };
   });
 
